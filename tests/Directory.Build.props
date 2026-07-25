@@ -10,10 +10,24 @@
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
 
-  <!-- Suppressed warnings for tests -->
+  <!-- Suppressed warnings for tests (the repo-wide ones live in the root Directory.Build.props) -->
   <PropertyGroup>
-    <NoWarn>$(NoWarn);CA1515;CA1707;CA1812;CA1822;CA1852;CA1861;CA2007;MA0002;MA0004;MA0011;MA0051</NoWarn>
-    <NoWarn>$(NoWarn);MA0016;CA1305;CA1307;xUnit1030;xUnit1031</NoWarn>
+    <!-- CA1032: exception ctor overloads; CA1052: static holder type; CA1303: literal string passed to Console -->
+    <!-- CA1305/CA1307/CA1310/CA1862: culture/comparison overloads -->
+    <!-- CA1515: types can be internal; CA1721: property confusing given a Get* method -->
+    <!-- CA1812: internal class apparently never instantiated; CA1822: member can be static -->
+    <!-- CA1852: type can be sealed; CA1861: prefer 'static readonly' over constant array arguments -->
+    <NoWarn>$(NoWarn);CA1032;CA1052;CA1303;CA1305;CA1307;CA1310;CA1515;CA1721;CA1812;CA1822;CA1852;CA1861;CA1862</NoWarn>
+    <!-- CA2002: lock on weak identity; CA2007: ConfigureAwait; CA2016: forward CancellationToken -->
+    <!-- CA2201: reserved exception type; CA2237: [Serializable] -->
+    <NoWarn>$(NoWarn);CA2002;CA2007;CA2016;CA2201;CA2237</NoWarn>
+    <!-- MA0002/MA0006/MA0011/MA0074: comparer/provider/comparison overloads; MA0004: ConfigureAwait(false) -->
+    <NoWarn>$(NoWarn);MA0002;MA0004;MA0006;MA0011;MA0074</NoWarn>
+    <!-- IL2060/IL2111: reflection over annotated members (test-only, nothing here is trimmed) -->
+    <!-- NU1510: unpruned PackageReference -->
+    <!-- RCS1059: lock on private field instead of 'this'; RCS1155: StringComparison when comparing strings -->
+    <!-- xUnit1030/xUnit1031: ConfigureAwait / sync-blocking in tests -->
+    <NoWarn>$(NoWarn);IL2060;IL2111;NU1510;RCS1059;RCS1155;xUnit1030;xUnit1031</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

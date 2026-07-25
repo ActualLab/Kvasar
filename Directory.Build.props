@@ -87,10 +87,19 @@
     <!-- CS1591: Missing XML comment for publicly visible type or member -->
     <!-- CA1873/CA2254: logging perf/template -->
     <NoWarn>$(NoWarn);CA1062;CS1591;CA1873;CA2254</NoWarn>
-    <!-- MA0009;MA0018;MA0048: Meziantou style rules we opt out of -->
     <!-- RCS1047: Non-asynchronous method name should not end with 'Async' -->
-    <!-- VSTHRD002/003/103/110/200: VS threading analyzer rules -->
-    <NoWarn>$(NoWarn);MA0009;MA0018;MA0048;RCS1047;VSTHRD002;VSTHRD003;VSTHRD103;VSTHRD110;VSTHRD200</NoWarn>
+    <!-- VSTHRD002/003/103/110: VS threading analyzer rules -->
+    <!-- VSTHRD200: Use 'Async' suffix in names of methods that return an awaitable type.
+         Suppressed repo-wide (src, tests, benchmarks, tools): CODING_STYLE.md bans the 'Async' suffix. -->
+    <NoWarn>$(NoWarn);RCS1047;VSTHRD002;VSTHRD003;VSTHRD103;VSTHRD110;VSTHRD200</NoWarn>
+    <!-- MA0009: regex DoS; MA0015/MA0046: parameter/delegate shape; MA0016: return collection abstraction -->
+    <!-- MA0018: static members on generic types; MA0026: TODO comments; MA0048: file name must match type name -->
+    <!-- MA0051: method is too long; MA0056: overridable member in ctor; MA0064: lock on public instance -->
+    <!-- MA0084: local hides parameter (misfires on primary ctors); MA0097: IComparable => comparison operators -->
+    <NoWarn>$(NoWarn);MA0009;MA0015;MA0016;MA0018;MA0026;MA0046;MA0048;MA0051;MA0056;MA0064;MA0084;MA0097</NoWarn>
+    <!-- CA2263: prefer the generic overload -->
+    <!-- CS8669: nullable annotation outside a '#nullable' context (generated code) -->
+    <NoWarn>$(NoWarn);CA2263;CS8669</NoWarn>
     <!-- Design-rule opt-outs matching ActualLab conventions -->
     <NoWarn>$(NoWarn);CA1001;CA1002;CA1003;CA1030;CA1031;CA1033;CA1034;CA1040;CA1043</NoWarn>
     <NoWarn>$(NoWarn);CA1051;CA1054;CA1055;CA1056;CA1063;CA1065;CA1308;CA1508;CA1510</NoWarn>
