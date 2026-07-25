@@ -28,6 +28,7 @@ public sealed class KvasarStore : IAsyncDisposable
     private volatile HashIndex _index = null!;
     private FileStream? _kidxDelta;   // held open across the store's life so each delta is one buffered write, not a file open
     private long _deltaCount;
+    private bool _checkpointDue;
     private bool _disposed;
 
     public KvasarStats Stats
@@ -184,6 +185,7 @@ public sealed class KvasarStore : IAsyncDisposable
             // Seal the tail so the published locator points at an immutable page.
             await _segments.Flush(false, cancellationToken).ConfigureAwait(false);
             await Publish(key, appended, cancellationToken).ConfigureAwait(false);
+            await MaybeCheckpoint(cancellationToken).ConfigureAwait(false);
         }
         finally {
             _writeLock.Release();
@@ -216,6 +218,7 @@ public sealed class KvasarStore : IAsyncDisposable
             await _segments.Flush(false, cancellationToken).ConfigureAwait(false); // seal once for the whole batch
             foreach (var p in pending)
                 await Publish(p.Key, p.Appended, cancellationToken).ConfigureAwait(false);
+            await MaybeCheckpoint(cancellationToken).ConfigureAwait(false);
         }
         finally {
             _writeLock.Release();
@@ -427,11 +430,24 @@ public sealed class KvasarStore : IAsyncDisposable
             if (_kidxDelta != null)
                 await IndexFile.AppendDelta(_kidxDelta, entry, cancellationToken).ConfigureAwait(false);
             if (++_deltaCount > (_index.Count / 2) + 64)
-                await WriteCheckpoint(cancellationToken).ConfigureAwait(false);
+                _checkpointDue = true; // deferred — see MaybeCheckpoint
         }
         catch {
             // .kidx is a rebuildable hint; a failed lazy delta is non-fatal.
         }
+    }
+
+    private ValueTask MaybeCheckpoint(CancellationToken cancellationToken)
+    {
+        // A checkpoint stamps the log HWM alongside the index, so it must never run while a batch is
+        // only half-published. SetMany and compaction seal the *whole* batch before publishing any of
+        // it, so a checkpoint taken mid-loop would pair an end-of-batch HWM with an index missing the
+        // rest of the batch — and recovery, which replays only past the HWM, would never re-read those
+        // records. They would be lost permanently despite the write having been acknowledged.
+        if (!_checkpointDue)
+            return default;
+        _checkpointDue = false;
+        return WriteCheckpoint(cancellationToken);
     }
 
     private void OpenDeltaStream()
@@ -465,6 +481,7 @@ public sealed class KvasarStore : IAsyncDisposable
         var hwm = (_segments.ActiveSegmentId, checked((uint)_segments.ActiveLogicalHwm));
         await IndexFile.WriteCheckpoint(_kidxPath, live, hwm, _formatVer, cancellationToken).ConfigureAwait(false);
         _deltaCount = 0;
+        _checkpointDue = false;
         OpenDeltaStream();
     }
 
@@ -504,6 +521,9 @@ public sealed class KvasarStore : IAsyncDisposable
             await AppendDelta(p.Hash, p.NewLoc, p.NewLen, false, cancellationToken).ConfigureAwait(false);
         }
         _segments.RemoveSegment(target);
+        // Only now is the index fully repointed off the drained segment; checkpointing mid-loop would
+        // pair an end-of-compaction HWM with stale locators into a file this line just deleted.
+        await MaybeCheckpoint(cancellationToken).ConfigureAwait(false);
         return true;
     }
 

@@ -256,6 +256,7 @@ public class HashIndexTests
     }
 
     [Fact]
+    [Trait("Category", "Slow")]
     public void ConcurrentReadersSingleWriterNoTornReads()
     {
         // The writer only ever (re)sets a key to its ONE deterministic locator/length, or removes it.

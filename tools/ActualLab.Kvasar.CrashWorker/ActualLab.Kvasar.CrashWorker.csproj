@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFrameworks Condition="$(UseMultitargeting)">net10.0;net9.0</TargetFrameworks>
+    <RootNamespace>ActualLab.Kvasar.CrashWorker</RootNamespace>
+    <AssemblyName>ActualLab.Kvasar.CrashWorker</AssemblyName>
+    <IsPackable>false</IsPackable>
+    <IsPublishable>false</IsPublishable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\ActualLab.Kvasar\ActualLab.Kvasar.csproj" />
+    <!-- Kept out of tests/ on purpose: that folder's Directory.Build.props injects the test SDK, whose
+         generated entry point would collide with this console app's top-level statements. -->
+  </ItemGroup>
+
+</Project>

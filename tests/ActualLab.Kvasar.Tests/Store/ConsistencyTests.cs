@@ -15,6 +15,7 @@ namespace ActualLab.Kvasar.Tests.Store;
 /// Values are self-describing payloads so any torn/garbage read is detectable from the bytes.
 /// Worker-thread failures are surfaced to the test thread via a <see cref="ConcurrentQueue{T}"/>.
 /// </summary>
+[Trait("Category", "Slow")]
 public sealed class ConsistencyTests : IDisposable
 {
     private const int PageSize = 512; // small ⇒ "large" values span multiple pages; segments roll quickly

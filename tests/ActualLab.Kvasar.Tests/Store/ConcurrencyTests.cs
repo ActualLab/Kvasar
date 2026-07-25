@@ -10,6 +10,7 @@ namespace ActualLab.Kvasar.Tests.Store;
 /// read (a mix of two versions, truncation, or garbage) is detectable from the value's own bytes.
 /// Worker-thread failures are surfaced to the test thread via a <see cref="ConcurrentQueue{T}"/>.
 /// </summary>
+[Trait("Category", "Slow")]
 public sealed class ConcurrencyTests : IDisposable
 {
     private const int PageSize = 512; // small ⇒ values routinely span pages; segments roll quickly

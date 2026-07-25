@@ -217,6 +217,7 @@ public class HashIndexReviewTests
     }
 
     [Fact]
+    [Trait("Category", "Slow")]
     public void StableKeysAreNeverMissedWhileTheWriterResizes()
     {
         // The stable keys are never touched by the writer, so a lock-free reader must find every one of

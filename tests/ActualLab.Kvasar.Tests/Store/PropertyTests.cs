@@ -8,6 +8,7 @@ namespace ActualLab.Kvasar.Tests.Store;
 /// is continuously checked against the oracle — per-op point reads, periodic full <c>Scan()</c> equality,
 /// and dispose/reopen invariance — with encryption both on and off.
 /// </summary>
+[Trait("Category", "Slow")]
 public class PropertyTests : IDisposable
 {
     private const int KeyCount = 200;

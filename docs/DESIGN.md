@@ -286,6 +286,17 @@ gaps remain, both correctness-neutral for the target scenario:
 An adversarial review of every module found these; each now has a regression test in
 `Store/HardeningTests.cs`, `Paging/PagedSegmentWriteBehindTests.cs`, or the per-module `*ReviewTests.cs`.
 
+- **A checkpoint fired mid-batch permanently lost acknowledged writes** (critical; found by the crash
+  fuzzer). `AppendDelta` checkpointed inline once the delta count crossed its threshold, and `SetMany`
+  (and compaction) seal the *whole* batch before publishing any of it. A checkpoint taken from inside
+  the publish loop therefore stamped an **end-of-batch HWM onto an index containing only the entries
+  published so far**. The remaining entries' deltas went to a freshly reopened, never-fsynced buffer,
+  and `LoadIndex` replays only `ScanFrom(hwm)` — from the end of the batch — so their records were
+  never re-read. The writes were gone for good even though `SetMany` had returned and the `.klog` held
+  them. Reproducer: 128 single `Set`s then one 24-key `SetMany` → 23 of 24 keys missing after an abort.
+  Compaction had the same shape and was worse, since it also deletes the drained segment. Fixed by
+  deferring the checkpoint (`MaybeCheckpoint`) until after the publish/repoint loop, where the index is
+  once again consistent with the sealed log.
 - **AES-GCM nonce reuse after a torn tail** (critical). `PagedSegment.Open` floors `PageCount`, discarding
   a half-written trailing page, so the next append reused that `pageId` — and the nonce is a pure function
   of `(fileSalt, pageId)`. Two different plaintexts under one `(key, nonce)` leaks their XOR and enables

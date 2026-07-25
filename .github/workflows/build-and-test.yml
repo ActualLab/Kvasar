@@ -1,0 +1,92 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore: [ '**.md', 'docs/**' ]
+  pull_request:
+    branches: [ main ]
+    paths-ignore: [ '**.md', 'docs/**' ]
+  workflow_dispatch:
+    inputs:
+      run-slow-tests:
+        description: 'Also run the slow tests (stress, crash recovery, fuzz)'
+        type: boolean
+        default: false
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/Directory.Packages.props', '**/*.csproj') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      - name: Restore
+        run: dotnet restore ActualLab.Kvasar.slnx
+
+      - name: Build
+        run: dotnet build ActualLab.Kvasar.slnx -c Release --no-restore
+
+      # The slow tests (multi-second concurrency/consistency stress, randomized crash fuzz, and the
+      # process-kill recovery suite that spawns child processes) are excluded by default: they are
+      # wall-clock bound rather than CPU bound, so they buy little on a 2-core runner. Run them on
+      # demand via workflow_dispatch.
+      - name: Test
+        if: ${{ !inputs.run-slow-tests }}
+        run: dotnet test ActualLab.Kvasar.slnx -c Release --no-build --filter "Category!=Slow"
+
+      - name: Test (including slow)
+        if: ${{ inputs.run-slow-tests }}
+        run: dotnet test ActualLab.Kvasar.slnx -c Release --no-build
+
+  multitarget:
+    name: Build net10.0 + net9.0
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          # net9.0 is the floor target, so its runtime pack has to be present to build against it.
+          dotnet-version: 9.0.x
+
+      - name: Setup .NET (pinned SDK)
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ubuntu-latest-nuget-${{ hashFiles('**/Directory.Packages.props', '**/*.csproj') }}
+          restore-keys: ubuntu-latest-nuget-
+
+      # Compile-only: this exists to catch code that builds on net10.0 but not on the net9.0 floor
+      # (newer BCL APIs needing a #if NET10_0_OR_GREATER guard). The tests already ran above.
+      - name: Build both target frameworks
+        run: dotnet build ActualLab.Kvasar.slnx -c Release -p:UseMultitargeting=true

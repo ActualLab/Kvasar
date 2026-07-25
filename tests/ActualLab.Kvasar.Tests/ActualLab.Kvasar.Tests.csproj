@@ -9,6 +9,10 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\ActualLab.Kvasar\ActualLab.Kvasar.csproj" />
+    <!-- Build-order only (no assembly reference): guarantees the crash worker exists before the
+         process-kill recovery tests go looking for it. -->
+    <ProjectReference Include="..\..\tools\ActualLab.Kvasar.CrashWorker\ActualLab.Kvasar.CrashWorker.csproj"
+                      ReferenceOutputAssembly="false" Private="false" />
   </ItemGroup>
 
 </Project>
