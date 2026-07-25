@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="latest" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+
+  <PropertyGroup>
+    <UseArtifactsOutput>true</UseArtifactsOutput>
+    <ArtifactsPath>$(RepoRoot)artifacts\tests</ArtifactsPath>
+    <IsPackable>false</IsPackable>
+    <IsPublishable>false</IsPublishable>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <!-- Suppressed warnings for tests -->
+  <PropertyGroup>
+    <NoWarn>$(NoWarn);CA1515;CA1707;CA1812;CA1822;CA1852;CA1861;CA2007;MA0002;MA0004;MA0011;MA0051</NoWarn>
+    <NoWarn>$(NoWarn);MA0016;CA1305;CA1307;xUnit1030;xUnit1031</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" PrivateAssets="all" />
+    <PackageReference Include="xunit.analyzers" PrivateAssets="all" />
+    <PackageReference Include="AwesomeAssertions" />
+    <PackageReference Include="coverlet.collector" PrivateAssets="all" />
+    <PackageReference Include="Roslynator.Analyzers" PrivateAssets="all" />
+    <PackageReference Include="Meziantou.Analyzer" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!-- Global usings -->
+  <ItemGroup>
+    <Using Include="System.Buffers" />
+    <Using Include="System.Collections.Generic" />
+    <Using Include="System.Diagnostics" />
+    <Using Include="System.Runtime.CompilerServices" />
+    <Using Include="System.Runtime.InteropServices" />
+    <Using Include="ActualLab.Kvasar" />
+    <Using Include="AwesomeAssertions" />
+    <Using Include="Xunit" />
+    <Using Include="Xunit.Abstractions" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,16 @@
+<Solution>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/ActualLab.Kvasar.Benchmarks/ActualLab.Kvasar.Benchmarks.csproj" />
+  </Folder>
+  <Folder Name="/docs/">
+    <File Path="docs/BENCHMARKS.md" />
+    <File Path="docs/DESIGN.md" />
+    <File Path="docs/SPEC.md" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/ActualLab.Kvasar/ActualLab.Kvasar.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ActualLab.Kvasar.Tests/ActualLab.Kvasar.Tests.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks Condition="$(UseMultitargeting)">net10.0;net9.0</TargetFrameworks>
+    <RootNamespace>ActualLab.Kvasar</RootNamespace>
+    <AssemblyName>ActualLab.Kvasar</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.IO.Hashing" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="ActualLab.Kvasar.Tests" />
+  </ItemGroup>
+
+</Project>

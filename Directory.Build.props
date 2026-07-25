@@ -1,0 +1,109 @@
+<Project ToolsVersion="latest" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <!-- Key properties -->
+  <PropertyGroup>
+    <RepoRoot>$([MSBuild]::EnsureTrailingSlash('$(MSBuildThisFileDirectory)'))</RepoRoot>
+    <SolutionDir Condition="$(SolutionDir) == ''">$(RepoRoot)</SolutionDir>
+    <Authors>Actual Chat, Inc.</Authors>
+    <Company>Actual Chat, Inc.</Company>
+    <Copyright>Copyright Alex Yakunin, Actual Chat, Inc.</Copyright>
+  </PropertyGroup>
+
+  <!-- Multitargeting: single-target net10.0 by default; net10.0;net9.0 when UseMultitargeting=true -->
+  <PropertyGroup Condition="'$(UseMultitargeting)' == ''">
+    <UseMultitargeting>false</UseMultitargeting>
+<!--    <UseMultitargeting>true</UseMultitargeting>-->
+    <TargetFramework Condition="!$(UseMultitargeting)">net10.0</TargetFramework>
+  </PropertyGroup>
+
+  <!-- Common properties -->
+  <PropertyGroup>
+    <ProjectKind>Other</ProjectKind>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(MSBuildProjectExtension)' == '.csproj'">
+    <ProjectKind Condition="$(MSBuildProjectName.Contains('.Tests'))">Tests</ProjectKind>
+    <ProjectKind Condition="$(MSBuildProjectName.Contains('.Benchmarks'))">Benchmarks</ProjectKind>
+  </PropertyGroup>
+
+  <!-- Output paths -->
+  <PropertyGroup>
+    <UseArtifactsOutput>true</UseArtifactsOutput>
+    <ArtifactsPath>$(RepoRoot)artifacts</ArtifactsPath>
+    <PackageOutputPath>$(RepoRoot)artifacts\nupkg</PackageOutputPath>
+    <AppendTargetFrameworkToOutputPath>true</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+  </PropertyGroup>
+
+  <!-- Defaults for .csproj -->
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <LangVersion>preview</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Features>strict</Features>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!-- Codegen & trimming options -->
+  <PropertyGroup>
+    <IsTrimmable>false</IsTrimmable>
+    <IsAotCompatible>false</IsAotCompatible>
+    <EmitCompilerGeneratedFiles>false</EmitCompilerGeneratedFiles>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <NoDefaultLaunchSettingsFile>true</NoDefaultLaunchSettingsFile>
+  </PropertyGroup>
+
+  <!-- Packaging -->
+  <PropertyGroup>
+    <PackageProjectUrl>https://github.com/ActualLab/Kvasar</PackageProjectUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://github.com/ActualLab/Kvasar</RepositoryUrl>
+    <PackageTags>actual_chat actual_lab kvasar key-value bitcask encrypted embedded</PackageTags>
+    <Description>ActualLab.Kvasar - a pure-managed, encrypted, file-system-based key-value store for .NET (Bitcask model).</Description>
+    <DefaultLanguage>en-US</DefaultLanguage>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <DebugType>portable</DebugType>
+    <DebugSymbols>true</DebugSymbols>
+    <GenerateFullPaths Condition="'$(TERM_PROGRAM)' == 'vscode'">true</GenerateFullPaths>
+  </PropertyGroup>
+
+  <!-- Analyzers & warnings -->
+  <PropertyGroup>
+    <NoLogo>true</NoLogo>
+    <AnalysisMode>AllEnabledByDefault</AnalysisMode>
+    <AnalysisLevel>preview</AnalysisLevel>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+    <SuppressNETCoreSdkPreviewMessage>true</SuppressNETCoreSdkPreviewMessage>
+    <SuppressTfmSupportBuildWarnings>true</SuppressTfmSupportBuildWarnings>
+    <WarningLevel>4</WarningLevel>
+    <!-- NETSDK1057: You're using a preview version of .NET -->
+    <NoWarn>$(NoWarn);NETSDK1057</NoWarn>
+    <!-- NU1603/NU1901-1904/NU5105: NuGet best-match / vulnerability / SemVer2 notices -->
+    <NoWarn>$(NoWarn);NU1603;NU1901;NU1902;NU1903;NU1904;NU5105</NoWarn>
+    <!-- CA1062: Validate arguments of public methods -->
+    <!-- CS1591: Missing XML comment for publicly visible type or member -->
+    <!-- CA1873/CA2254: logging perf/template -->
+    <NoWarn>$(NoWarn);CA1062;CS1591;CA1873;CA2254</NoWarn>
+    <!-- MA0009;MA0018;MA0048: Meziantou style rules we opt out of -->
+    <!-- RCS1047: Non-asynchronous method name should not end with 'Async' -->
+    <!-- VSTHRD002/003/103/110/200: VS threading analyzer rules -->
+    <NoWarn>$(NoWarn);MA0009;MA0018;MA0048;RCS1047;VSTHRD002;VSTHRD003;VSTHRD103;VSTHRD110;VSTHRD200</NoWarn>
+    <!-- Design-rule opt-outs matching ActualLab conventions -->
+    <NoWarn>$(NoWarn);CA1001;CA1002;CA1003;CA1030;CA1031;CA1033;CA1034;CA1040;CA1043</NoWarn>
+    <NoWarn>$(NoWarn);CA1051;CA1054;CA1055;CA1056;CA1063;CA1065;CA1308;CA1508;CA1510</NoWarn>
+    <NoWarn>$(NoWarn);CA1707;CA1711;CA1720;CA1724;CA1725</NoWarn>
+    <NoWarn>$(NoWarn);CA1802;CA1805;CA1810;CA1815;CA1816;CA1819;CA1848;CA1859</NoWarn>
+    <NoWarn>$(NoWarn);CA2000;CA2213;CA2225;CA2234;CA5394</NoWarn>
+    <NoWarn>$(NoWarn);CA1000;CA1512;CA1513;CA1710;CA1716;CA1849;CA2012;CA2207;CA2227</NoWarn>
+    <!-- CA1028: enum backing type (our enums mirror on-disk byte fields) -->
+    <!-- CA1815/CA2231: struct Equals/== operators (internal blittable structs) -->
+    <!-- MA0008: Add StructLayoutAttribute to struct -->
+    <NoWarn>$(NoWarn);CA1028;CA2231;MA0008</NoWarn>
+    <!-- MA0099: explicit enum value; MA0158: prefer System.Threading.Lock -->
+    <NoWarn>$(NoWarn);MA0099;MA0158</NoWarn>
+  </PropertyGroup>
+
+</Project>

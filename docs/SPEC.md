@@ -84,29 +84,38 @@ Keys **and** values are **`ReadOnlyMemory<byte>`** — always binary. A returned
 *absent*; a present value may be empty (`ReadOnlyMemory<byte>.Empty`). String/typed conversions,
 if any, live in the caller/adapter (§13), not the store.
 
+The API is **fully async** — SQLite is synchronous for historical reasons, Kvasar deliberately is
+not: all disk I/O uses positional `RandomAccess.ReadAsync`/`WriteAsync` on handles opened with
+`FileOptions.Asynchronous`, and a `CancellationToken` flows through every path. `ValueTask` (not
+`Task`) is used throughout so that the **cache-hit fast path completes synchronously with no state
+machine and no allocation** (§6.3): `Get` is not an `async` method — it resolves a cached,
+single-page record inline and only builds a state machine on a cache miss or a page-spanning record.
+The one unavoidable blocking call is `fsync`, which has no async form in .NET; it is offloaded
+rather than run on the caller's thread.
+
 ```csharp
 namespace ActualLab.Kvasar;
 
 public sealed class KvasarStore : IAsyncDisposable
 {
-    public static KvasarStore Open(KvasarOptions options);
+    public static ValueTask<KvasarStore> Open(KvasarOptions options, CancellationToken ct = default);
 
     // --- core KV (all binary; ReadOnlyMemory<byte>) ---
-    public ReadOnlyMemory<byte>? Get(ReadOnlyMemory<byte> key);          // thread-safe, null = miss
-    public void GetMany(ReadOnlySpan<ReadOnlyMemory<byte>> keys, Span<ReadOnlyMemory<byte>?> results); // positional
-    public void Set(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte>? value); // value == null => delete
-    public void SetMany(ReadOnlySpan<(ReadOnlyMemory<byte> Key, ReadOnlyMemory<byte>? Value)> updates); // last dup wins
+    public ValueTask<ReadOnlyMemory<byte>?> Get(ReadOnlyMemory<byte> key, CancellationToken ct = default); // thread-safe, null = miss
+    public ValueTask<ReadOnlyMemory<byte>?[]> GetMany(IReadOnlyList<ReadOnlyMemory<byte>> keys, CancellationToken ct = default); // positional
+    public ValueTask Set(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte>? value, CancellationToken ct = default); // value == null => delete
+    public ValueTask SetMany(IReadOnlyList<(ReadOnlyMemory<byte> Key, ReadOnlyMemory<byte>? Value)> updates, CancellationToken ct = default); // last dup wins
 
     // --- enumeration & reset ---
-    public IEnumerable<(ReadOnlyMemory<byte> Key, ReadOnlyMemory<byte> Value)> Scan(); // enumerate ALL (unordered)
-    public void Clear();                                                 // wipe everything (fast reset)
+    public IAsyncEnumerable<(ReadOnlyMemory<byte> Key, ReadOnlyMemory<byte> Value)> Scan(CancellationToken ct = default); // ALL (unordered)
+    public ValueTask Clear(CancellationToken ct = default);              // wipe everything (fast reset)
 
     // --- lifecycle ---
-    public void Flush(bool fsync = false);
-    public void Compact();
+    public ValueTask Flush(bool fsync = false, CancellationToken ct = default);
+    public ValueTask Compact(CancellationToken ct = default);
     public ValueTask DisposeAsync();
 
-    public KvasarStats Stats { get; }                                    // entries, liveBytes, deadBytes, fileBytes
+    public KvasarStats Stats { get; }                                    // sync; best-effort snapshot
 }
 
 public sealed record KvasarOptions
