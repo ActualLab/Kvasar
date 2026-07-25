@@ -5,10 +5,13 @@ namespace ActualLab.Kvasar.Benchmarks;
 
 /// <summary>
 /// "ActualChat cold start": a ~25 MB client cache is opened cold, then 8 app threads speculatively
-/// render the UI — a short burst of batched reads with a few writes trailing behind a lazy writer.
+/// render the UI — a short burst of 800 distinct-key reads, 10% of which also write. Each engine runs
+/// in the stack it would actually ship in; the dataset, the workload and the seeds are identical.
 /// </summary>
 public static class ChatCacheScenario
 {
+    public const int DefaultPageSize = 16 * 1024; // comfortably above the p99 tile (15.5 KB)
+
     private const long TargetBytes = 25_000_000;
     private const double TileByteShare = 0.80;
     private const int ChatCount = 48;
@@ -21,14 +24,15 @@ public static class ChatCacheScenario
     private const int TileReadsPerThread = 50;
     private const int MiscReadsPerThread = 50;
     private const double WriteProbability = 0.10;
-    private const double HotSetShare = 0.20;
-    private const double HotReadShare = 0.80;
     private const int Repeats = 5; // 800 ops is a small sample; every reported row is the median run
     private const long PageCacheBytes = 16L * 1024 * 1024; // a phone-sized budget, below the 25 MB dataset
     private static readonly int[] TileLayers = [5, 20, 80];
     private static readonly double[] TileLayerWeights = [0.60, 0.30, 0.10];
+    // Kvasar's own write debounce and the harness LazyWriter's use the same value, so neither side wins on
+    // how long it may defer a write; both configurations are drained and made durable before the clock stops.
+    private static readonly TimeSpan FlushDelay = TimeSpan.FromSeconds(0.5);
 
-    public static async Task Run(string root, byte[] encryptionKey, string engines)
+    public static async Task Run(string root, byte[] encryptionKey, string engines, int pageSize)
     {
         // 8 app threads + 4 reader workers + 1 writer must all be resident, or thread injection
         // (~1 thread/sec) would land inside the measured burst.
@@ -36,17 +40,18 @@ public static class ChatCacheScenario
         ThreadPool.SetMinThreads(Math.Max(minWorkers, AppThreads + ReaderAndWriterThreads), minIoThreads);
 
         var kvasarAes = (string dir) => (IKvEngine)new KvasarEngine(
-            Path.Combine(dir, "store"), encryptionKey, true, pageCacheBytes: PageCacheBytes);
-        var kvasarPlain = (string dir) => (IKvEngine)new KvasarEngine(
-            Path.Combine(dir, "store"), encryptionKey, false, pageCacheBytes: PageCacheBytes);
-        var runs = new List<(string Tag, bool BatchedReads, Func<string, IKvEngine> Factory)>();
+            Path.Combine(dir, "store"), encryptionKey, true, pageSize, PageCacheBytes, FlushDelay);
+        var kvasarNoEnc = (string dir) => (IKvEngine)new KvasarEngine(
+            Path.Combine(dir, "store"), encryptionKey, false, pageSize, PageCacheBytes, FlushDelay);
+        var runs = new List<(string Tag, KvasStack Stack, Func<string, IKvEngine> Factory)>();
         if (engines is "sqlite" or "both")
-            runs.Add(("sq", true, dir => new SqliteEngine(Path.Combine(dir, "cache.db3"), encryptionKey)));
+            runs.Add(("sq", KvasStack.BatchingKvas,
+                dir => new SqliteEngine(Path.Combine(dir, "cache.db3"), encryptionKey)));
         if (engines is "kvasar" or "both") {
-            runs.Add(("kv", true, kvasarAes));
-            runs.Add(("kvd", false, kvasarAes));
-            runs.Add(("kvne", true, kvasarPlain));
-            runs.Add(("kvned", false, kvasarPlain));
+            runs.Add(("kv", KvasStack.BatchingKvas, kvasarAes));
+            runs.Add(("kvd", KvasStack.DirectReads, kvasarAes));
+            runs.Add(("kvp", KvasStack.Plain, kvasarAes));
+            runs.Add(("kvnep", KvasStack.Plain, kvasarNoEnc));
         }
 
         var dataset = Dataset.Generate(TargetBytes);
@@ -56,12 +61,12 @@ public static class ChatCacheScenario
         // Warm up on a 10x smaller dataset: without it, whichever engine runs first pays for jitting the
         // whole harness path and for the thread-pool ramp, which is worth ~10 ms of a ~50 ms measurement.
         var warmupDataset = Dataset.Generate(TargetBytes / 10);
-        foreach (var (tag, batchedReads, factory) in runs)
-            _ = await RunEngine(() => factory(NewDir(root, "warmup-" + tag)), warmupDataset, batchedReads);
+        foreach (var (tag, stack, factory) in runs)
+            _ = await RunEngine(() => factory(NewDir(root, "warmup-" + tag)), warmupDataset, stack);
 
         var results = new List<ChatResult>();
-        foreach (var (tag, batchedReads, factory) in runs)
-            results.Add(await RunEngine(() => factory(NewDir(root, tag)), dataset, batchedReads));
+        foreach (var (tag, stack, factory) in runs)
+            results.Add(await RunEngine(() => factory(NewDir(root, tag)), dataset, stack));
         PrintTable(results);
     }
 
@@ -73,7 +78,7 @@ public static class ChatCacheScenario
     private static async Task<ChatResult> RunEngine(
         Func<IKvEngine> factory,
         Dataset dataset,
-        bool batchedReads)
+        KvasStack stack)
     {
         var engine = factory();
 
@@ -105,7 +110,7 @@ public static class ChatCacheScenario
             var total = Stopwatch.StartNew();
             var sw = Stopwatch.StartNew();
             await engine.Open();
-            var kvas = new BatchingKvasHarness(engine, batchedReads);
+            var kvas = NewKvas(engine, stack);
             sw.Stop();
             var openMs = sw.Elapsed.TotalMilliseconds;
 
@@ -117,14 +122,13 @@ public static class ChatCacheScenario
                 var tid = t;
                 workers[t] = Task.Run(async () => {
                     var rnd = new Random(9000 + tid);
-                    var plan = ReadPlan(rnd);
+                    var plan = dataset.Plan[tid];
                     var lat = new long[plan.Length];
                     var local = 0;
                     barrier.SignalAndWait();
                     for (var i = 0; i < plan.Length; i++) {
-                        var pool = plan[i] ? dataset.Tiles : dataset.Misc;
-                        var order = plan[i] ? dataset.TileHotOrder : dataset.MiscHotOrder;
-                        var (key, value) = pool[PickHot(rnd, order)];
+                        var (isTile, index) = plan[i];
+                        var (key, value) = (isTile ? dataset.Tiles : dataset.Misc)[index];
                         var t0 = Stopwatch.GetTimestamp();
                         var read = await kvas.Get(key);
                         lat[i] = Stopwatch.GetTimestamp() - t0;
@@ -132,7 +136,7 @@ public static class ChatCacheScenario
                         if (rnd.NextDouble() < WriteProbability) {
                             var fresh = new byte[read?.Length ?? value.Length];
                             rnd.NextBytes(fresh);
-                            kvas.Set(key, fresh);
+                            await kvas.Set(key, fresh);
                         }
                     }
                     latencies[tid] = lat;
@@ -159,7 +163,7 @@ public static class ChatCacheScenario
             await kvas.DisposeAsync();
             await engine.Close();
 
-            return new ChatResult(engine.Name, batchedReads ? "BatchingKvas" : "direct", fileBytes,
+            return new ChatResult(engine.Name, StackName(stack), fileBytes,
                 total.Elapsed.TotalMilliseconds, openMs, readMs, flushMs,
                 getManyCalls, getManyCalls == 0 ? 0 : (double)kvas.GetManyKeys / getManyCalls,
                 reads == 0 ? 0 : (double)kvas.CacheHits / reads, kvas.SetManyCalls, kvas.SetManyKeys,
@@ -167,26 +171,17 @@ public static class ChatCacheScenario
         }
     }
 
-    private static bool[] ReadPlan(Random rnd)
-    {
-        // true = chat tile, false = misc; shuffled so the two kinds interleave the way a render pass does.
-        var plan = new bool[TileReadsPerThread + MiscReadsPerThread];
-        for (var i = 0; i < TileReadsPerThread; i++)
-            plan[i] = true;
-        for (var i = plan.Length - 1; i > 0; i--) {
-            var j = rnd.Next(i + 1);
-            (plan[i], plan[j]) = (plan[j], plan[i]);
-        }
-        return plan;
-    }
+    private static IKvas NewKvas(IKvEngine engine, KvasStack stack)
+        => stack == KvasStack.Plain
+            ? new PlainKvas(engine)
+            : new BatchingKvasHarness(engine, stack == KvasStack.BatchingKvas, FlushDelay);
 
-    private static int PickHot(Random rnd, int[] order)
-    {
-        var hotCount = Math.Max(1, (int)(order.Length * HotSetShare));
-        return rnd.NextDouble() < HotReadShare
-            ? order[rnd.Next(hotCount)]
-            : order[hotCount + rnd.Next(order.Length - hotCount)];
-    }
+    private static string StackName(KvasStack stack)
+        => stack switch {
+            KvasStack.BatchingKvas => "BatchingKvas",
+            KvasStack.DirectReads => "direct reads",
+            _ => "plain",
+        };
 
     private static string NewDir(string root, string tag)
     {
@@ -220,31 +215,35 @@ public static class ChatCacheScenario
     private static void PrintTable(List<ChatResult> rows)
     {
         Console.WriteLine($"Cold start: open -> {AppThreads} threads x {TileReadsPerThread + MiscReadsPerThread} "
-            + $"reads ({AppThreads * TileReadsPerThread} tiles + {AppThreads * MiscReadsPerThread} misc, "
-            + $"{WriteProbability:P0} of them also write) -> flush; median of {Repeats} runs");
-        Console.WriteLine($"{"Engine",-24} {"Read path",-13} {"DB MB",6} {"TOTAL ms",9} {"Open ms",8} "
-            + $"{"Read ms",8} {"Flush ms",9} {"Backend",8} {"keys/op",8} {"CacheHit",9} {"SetMany",8} "
+            + $"reads of distinct keys ({AppThreads * TileReadsPerThread} tiles + "
+            + $"{AppThreads * MiscReadsPerThread} misc, {WriteProbability:P0} of them also write) -> flush; "
+            + $"median of {Repeats} runs");
+        Console.WriteLine($"{"Engine",-24} {"Stack",-13} {"DB MB",6} {"TOTAL ms",9} {"Open ms",8} "
+            + $"{"Read ms",8} {"Flush ms",9} {"Backend",8} {"keys/op",8} {"CacheHit",9} {"Writes",8} "
             + $"{"p50 us",8} {"p99 us",8}");
         Console.WriteLine(new string('-', 139));
         foreach (var r in rows)
-            Console.WriteLine($"{r.Name,-24} {r.ReadPath,-13} {r.FileBytes / 1e6,6:N1} {r.TotalMs,9:N1} "
+            Console.WriteLine($"{r.Name,-24} {r.Stack,-13} {r.FileBytes / 1e6,6:N1} {r.TotalMs,9:N1} "
                 + $"{r.OpenMs,8:N1} {r.ReadMs,8:N1} {r.FlushMs,9:N1} {r.GetManyCalls,8:N0} "
                 + $"{r.KeysPerGetMany,8:N2} {r.CacheHitRate,9:P1} {r.SetManyCalls,8:N0} "
                 + $"{r.P50Us,8:N1} {r.P99Us,8:N1}");
-        Console.WriteLine("(TOTAL ms = wall clock from the cold open until the write flush completes.");
-        Console.WriteLine(" Read path: 'BatchingKvas' = 256-entry LRU + BatchProcessor(64 keys, 4 workers) ->");
-        Console.WriteLine(" backend GetMany; 'direct' = no read cache, no read batching, one backend Get per key.");
-        Console.WriteLine(" Writes go through the same LazyWriter (250 ms / 64 items) in both cases.");
-        Console.WriteLine(" Backend = backend read calls; keys/op = keys per call; CacheHit = LRU read-cache hits,");
-        Console.WriteLine(" which BatchingKvas populates on Set only, so a cold start can only hit its own writes.)");
+        Console.WriteLine("(TOTAL ms = wall clock from the cold open until every write is durable.");
+        Console.WriteLine($" Stack: 'BatchingKvas' = 256-entry LRU + BatchProcessor(64 keys, 4 workers) -> GetMany,");
+        Console.WriteLine($" LazyWriter({FlushDelay.TotalMilliseconds:N0} ms / 64 items) -> SetMany; 'direct reads' = "
+            + "same writer, no read cache or batching;");
+        Console.WriteLine(" 'plain' = no layer: app threads call the engine's Get/Set directly.");
+        Console.WriteLine(" Backend = backend read calls; keys/op = keys per call; CacheHit = read-cache hit rate;");
+        Console.WriteLine(" Writes = backend write calls.)");
         foreach (var r in rows.Where(r => r.Misses > 0))
             Console.WriteLine($"  WARN {r.Name}: {r.Misses} reads returned a missing/short value");
     }
 
     // Nested types
 
+    private enum KvasStack { BatchingKvas, DirectReads, Plain }
+
     private sealed record ChatResult(
-        string Name, string ReadPath, long FileBytes, double TotalMs, double OpenMs, double ReadMs,
+        string Name, string Stack, long FileBytes, double TotalMs, double OpenMs, double ReadMs,
         double FlushMs, long GetManyCalls, double KeysPerGetMany, double CacheHitRate,
         long SetManyCalls, long SetManyKeys, double P50Us, double P99Us, int Misses);
 
@@ -253,8 +252,7 @@ public static class ChatCacheScenario
         public (KvKey Key, byte[] Value)[] Tiles { get; private init; } = [];
         public (KvKey Key, byte[] Value)[] Misc { get; private init; } = [];
         public (KvKey Key, byte[] Value)[] All { get; private init; } = [];
-        public int[] TileHotOrder { get; private init; } = [];
-        public int[] MiscHotOrder { get; private init; } = [];
+        public (bool IsTile, int Index)[][] Plan { get; private init; } = [];
         public int[] TilesPerLayer { get; private init; } = [];
         public long TileBytes { get; private init; }
         public long MiscBytes { get; private init; }
@@ -317,8 +315,9 @@ public static class ChatCacheScenario
                 Tiles = tileArray,
                 Misc = miscArray,
                 All = [..tileArray, ..miscArray],
-                TileHotOrder = Shuffle(tileArray.Length, new Random(4242)),
-                MiscHotOrder = Shuffle(miscArray.Length, new Random(4243)),
+                Plan = BuildPlan(
+                    Shuffle(tileArray.Length, new Random(4242)),
+                    Shuffle(miscArray.Length, new Random(4243))),
                 TilesPerLayer = tilesPerLayer,
                 TileBytes = tileBytes,
                 MiscBytes = miscBytes,
@@ -349,6 +348,28 @@ public static class ChatCacheScenario
         }
 
         // Private methods
+
+        private static (bool IsTile, int Index)[][] BuildPlan(int[] tileOrder, int[] miscOrder)
+        {
+            // Every one of the 800 reads hits a distinct key: an app start speculatively renders distinct UI,
+            // and Fusion's compute cache already dedupes repeats upstream. Tiles and misc are interleaved
+            // per thread the way a render pass issues them.
+            var plan = new (bool, int)[AppThreads][];
+            for (var t = 0; t < AppThreads; t++) {
+                var ops = new (bool, int)[TileReadsPerThread + MiscReadsPerThread];
+                for (var i = 0; i < TileReadsPerThread; i++)
+                    ops[i] = (true, tileOrder[t * TileReadsPerThread + i]);
+                for (var i = 0; i < MiscReadsPerThread; i++)
+                    ops[TileReadsPerThread + i] = (false, miscOrder[t * MiscReadsPerThread + i]);
+                var rnd = new Random(9000 + t);
+                for (var i = ops.Length - 1; i > 0; i--) {
+                    var j = rnd.Next(i + 1);
+                    (ops[i], ops[j]) = (ops[j], ops[i]);
+                }
+                plan[t] = ops;
+            }
+            return plan;
+        }
 
         private static double Mean(int[] values)
         {

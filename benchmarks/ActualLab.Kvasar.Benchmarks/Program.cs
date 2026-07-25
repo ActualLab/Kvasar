@@ -28,9 +28,9 @@ for (var i = 0; i < 32; i++) key[i] = (byte)(i * 3 + 1);
 
 Console.WriteLine($"Machine: {Environment.ProcessorCount} logical cores, .NET {Environment.Version}");
 if (scenario is "chat") {
-    Console.WriteLine("Scenario: ActualChat cold start (BatchingKvas harness over each engine)");
+    Console.WriteLine("Scenario: ActualChat cold start (each engine in the stack it would ship in)");
     Console.WriteLine();
-    await ChatCacheScenario.Run(root, key, engines);
+    await ChatCacheScenario.Run(root, key, engines, ArgInt("--pagesize", ChatCacheScenario.DefaultPageSize));
     try { Directory.Delete(root, true); } catch { /* ignore */ }
     return;
 }

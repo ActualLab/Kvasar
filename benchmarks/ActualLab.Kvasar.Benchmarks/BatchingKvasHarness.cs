@@ -2,24 +2,22 @@ using System.Threading.Channels;
 
 namespace ActualLab.Kvasar.Benchmarks;
 
-/// <summary>A cache key in both forms the harness needs: text for the read cache, UTF-8 for the backend.</summary>
-public sealed record KvKey(string Text, byte[] Bytes);
-
 /// <summary>
 /// A minimal port of ActualChat's <c>BatchingKvas</c>: a 256-entry LRU read cache, a batching reader
-/// (batches of up to 64 keys served by up to 4 workers), and one lazy writer (250 ms / 64 items).
-/// With <c>batchedReads: false</c> the whole read path is bypassed and app threads hit the backend directly.
+/// (batches of up to 64 keys served by up to 4 workers), and one lazy writer (64 items or
+/// <c>flushDelay</c>). With <c>batchedReads: false</c> the whole read path is bypassed and app
+/// threads hit the backend directly.
 /// </summary>
-public sealed class BatchingKvasHarness : IAsyncDisposable
+public sealed class BatchingKvasHarness : IKvas
 {
     public const int ReadCacheCapacity = 256;
     public const int ReaderBatchSize = 64;
     public const int ReaderWorkerCount = 4;
     public const int FlushMaxItemCount = 64;
-    public static readonly TimeSpan FlushDelay = TimeSpan.FromSeconds(0.25);
 
     private readonly IKvEngine _engine;
     private readonly bool _batchedReads;
+    private readonly TimeSpan _flushDelay;
     private readonly LruCache _readCache = new(ReadCacheCapacity);
     private readonly Channel<ReadItem> _reads;
     private readonly Channel<WriteCommand> _writes;
@@ -39,10 +37,11 @@ public sealed class BatchingKvasHarness : IAsyncDisposable
     public long SetManyCalls => Interlocked.Read(ref _setManyCalls);
     public long SetManyKeys => Interlocked.Read(ref _setManyKeys);
 
-    public BatchingKvasHarness(IKvEngine engine, bool batchedReads = true)
+    public BatchingKvasHarness(IKvEngine engine, bool batchedReads, TimeSpan flushDelay)
     {
         _engine = engine;
         _batchedReads = batchedReads;
+        _flushDelay = flushDelay;
         _reads = Channel.CreateUnbounded<ReadItem>(new UnboundedChannelOptions {
             SingleReader = false,
             SingleWriter = false,
@@ -80,15 +79,15 @@ public sealed class BatchingKvasHarness : IAsyncDisposable
         return new ValueTask<byte[]?>(item.Source.Task);
     }
 
-    public void Set(KvKey key, byte[]? value)
+    public ValueTask Set(KvKey key, byte[]? value)
     {
-        // Writes stay batched even when reads are direct: this asymmetry is deliberate. A single-record
-        // Set seals the tail page, so per-record writes cost roughly a page write each, while a 64-item
-        // SetMany amortizes that away — batching is a genuine win for Kvasar writes, unlike for its reads.
+        // Writes stay batched even when reads are direct, matching how BatchingKvas is wired: the LazyWriter
+        // is a property of the layer, not of the read path.
         if (_batchedReads)
             _readCache.Set(key.Text, value);
         if (!_writes.Writer.TryWrite(new WriteCommand((key, value), null)))
             throw new InvalidOperationException("The harness is already disposed.");
+        return default;
     }
 
     public Task Flush()
@@ -157,7 +156,7 @@ public sealed class BatchingKvasHarness : IAsyncDisposable
                 else if (delayCts == null) {
                     delayCts = new CancellationTokenSource();
                     var delayToken = delayCts.Token;
-                    _ = Task.Delay(FlushDelay, delayToken).ContinueWith(
+                    _ = Task.Delay(_flushDelay, delayToken).ContinueWith(
                         t => {
                             if (!t.IsCanceled)
                                 _writes.Writer.TryWrite(new WriteCommand(null, null));

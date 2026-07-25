@@ -17,6 +17,7 @@ public interface IKvEngine : IAsyncDisposable
     public ValueTask Open();                              // open or create the store at BasePath
     public ValueTask Close();                             // release handles (so we can reopen & time it)
     public ValueTask WriteBatch(IReadOnlyList<(byte[] Key, byte[] Value)> batch);
+    public ValueTask WriteOne(byte[] key, byte[] value);  // single-record write, no batching layer
     public ValueTask FlushDurable();                      // persist everything (fsync / checkpoint)
     public ValueTask<byte[]?> Get(byte[] key);
     public ValueTask<byte[]?[]> GetMany(IReadOnlyList<byte[]> keys); // one batched backend call, results by index
@@ -30,7 +31,8 @@ public sealed class KvasarEngine(
     byte[] key,
     bool encrypt,
     int pageSize = 4096,
-    long pageCacheBytes = 64L * 1024 * 1024
+    long pageCacheBytes = 64L * 1024 * 1024,
+    TimeSpan? flushDelay = null
 ) : IKvEngine
 {
     private KvasarStore _store = null!;
@@ -39,14 +41,19 @@ public sealed class KvasarEngine(
         (encrypt ? "Kvasar (AES-GCM)" : "Kvasar (no-enc)") + (pageSize == 4096 ? "" : $" p{pageSize / 1024}K");
 
     public async ValueTask Open()
-        => _store = await KvasarStore.Open(new KvasarOptions {
+    {
+        var options = new KvasarOptions {
             BasePath = basePath,
             EncryptionKey = key,
             DisableEncryption = !encrypt,
             PageSize = pageSize,
             PageCacheBytes = pageCacheBytes,
             SegmentBytes = 16 * 1024 * 1024,
-        });
+        };
+        if (flushDelay is { } d)
+            options = options with { FlushDelay = d };
+        _store = await KvasarStore.Open(options);
+    }
 
     public ValueTask Close()
         => _store.DisposeAsync();
@@ -59,6 +66,7 @@ public sealed class KvasarEngine(
         return _store.SetMany(updates);
     }
 
+    public ValueTask WriteOne(byte[] key, byte[] value) => _store.Set(key, value);
     public ValueTask FlushDurable() => _store.Flush(true);
 
     public async ValueTask<byte[]?> Get(byte[] key)
@@ -112,6 +120,7 @@ public sealed class SqliteEngine(string dbPath, byte[] key) : IKvEngine
 
     private readonly ConcurrentBag<SQLiteConnection> _all = new();
     private readonly ConcurrentBag<SQLiteConnection> _pool = new();
+    private readonly Lock _writeLock = new();
     private SQLiteConnection _writer = null!;
     private ThreadLocal<SQLiteConnection> _readers = null!;
 
@@ -139,10 +148,21 @@ public sealed class SqliteEngine(string dbPath, byte[] key) : IKvEngine
 
     public ValueTask WriteBatch(IReadOnlyList<(byte[] Key, byte[] Value)> batch)
     {
-        _writer.RunInTransaction(() => {
-            foreach (var (k, v) in batch)
-                _writer.Execute("insert or replace into items (Key, Value) values (?, ?)", Encoding.UTF8.GetString(k), v);
-        });
+        // The connection is opened with NoMutex, so the writer connection is guarded here instead.
+        using (_writeLock.EnterScope())
+            _writer.RunInTransaction(() => {
+                foreach (var (k, v) in batch)
+                    _writer.Execute("insert or replace into items (Key, Value) values (?, ?)",
+                        Encoding.UTF8.GetString(k), v);
+            });
+        return default;
+    }
+
+    public ValueTask WriteOne(byte[] key, byte[] value)
+    {
+        using (_writeLock.EnterScope())
+            _writer.Execute("insert or replace into items (Key, Value) values (?, ?)",
+                Encoding.UTF8.GetString(key), value);
         return default;
     }
 
