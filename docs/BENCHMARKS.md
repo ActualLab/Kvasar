@@ -19,8 +19,8 @@ Args: `--scenario sweep|chat` (default `sweep`), `--n` key count, `--value <byte
 (sweep = 128/1024/4096), `--threads` lookup threads, `--lookups` total random lookups,
 `--engines kvasar|sqlite|both`, `--pagesize <bytes>` (Kvasar page size; default 4096 for the sweep,
 16384 for `--scenario chat`).
-Keys are 50 bytes; values random. `--scenario chat` runs the cold-start scenario below and ignores
-the sweep's sizing args.
+Keys are 50 bytes; values random. `--scenario chat` runs the cold-start scenario below (two dataset
+configurations, one table each) and ignores the sweep's sizing args.
 
 > Run it on a quiesced machine. A concurrent `dotnet test` inflated every engine's numbers by
 > 20–60% in one run — SQLCipher's included, which is how the contamination was spotted.
@@ -74,8 +74,8 @@ trivially cheap — but it defers the work Kvasar has already done, which is why
 ## ActualChat cold start (`--scenario chat`)
 
 The sweep measures the engines in isolation. This scenario measures what the app actually does at
-launch: a phone opens its ~25 MB client cache and speculatively executes the compute methods that
-render the UI, which hammers the cache in a short burst.
+launch: a phone opens its client cache and speculatively executes the compute methods that render the
+UI, which hammers the cache in a short burst.
 
 **Stacks.** Same dataset, same workload, same seeds — only the stack above the store differs, and
 each engine runs in the stack it would actually ship in:
@@ -86,18 +86,31 @@ each engine runs in the stack it would actually ship in:
   (**500 ms** debounce, 64-item flush → one `SetMany`). The SQLite side mirrors `DbHelpers.FindMany`
   — one `where Key in (select e.value from json_each(?) e)` query per call, one connection per
   reader worker — and stays synchronous, as it ships.
-- **Kvasar, plain** — *no layer at all*: the 8 app threads call `store.Get`/`store.Set` directly.
+- **Kvasar + `plain`** — *no layer at all*: the 8 app threads call `store.Get`/`store.Set` directly.
   No read cache, no read batching, no external writer; write debouncing is
   `KvasarOptions.FlushDelay = 0.5 s`, which is why the harness's `LazyWriter` is set to the same
   500 ms — neither side is credited for deferring more than the other.
 
-Kvasar uses `PageSize = 16 KB` and `PageCacheBytes = 16 MB`, a phone-sized budget deliberately
-*below* the dataset, so this is a genuine mixed hit/miss workload (the sweep uses 64 MB).
+Kvasar behind `BatchingKvas` is also measured, as evidence that the layer is unnecessary in front of
+it — not as a shipping configuration.
 
-**Dataset** (fixed seed, sized from a 25 MB byte budget rather than hardcoded counts): 80% of the
-bytes are chat tiles, 20% misc values.
+Kvasar uses `PageSize = 16 KB` and `PageCacheBytes = 16 MB`, a phone-sized budget (the sweep uses
+64 MB). That 16 MB deliberately sits *above* config A's 12 MB dataset and *below* config B's 25 MB,
+so the two configs bracket the point where the page cache stops being able to hold the working set.
+
+**Dataset** (fixed seed, sized from a byte budget rather than hardcoded counts): 80% of the bytes are
+chat tiles, 20% misc values. Two configurations are run, each with its own table:
 
 ```
+===== Config A: 12 MB dataset, 500 tile + 500 misc reads =====
+Dataset: 12.0 MB in 19,094 entries (tiles 9.6 MB = 80.0 %, misc 2.4 MB = 20.0 %)
+  Tiles: 2,992 over 48 chats [L5: 1,816 (60.7 %), L20: 871 (29.1 %), L80: 305 (10.2 %)],
+         50,900 chat entries, 50-byte keys
+  Tile size: mean 3.09 KB, median 1.05 KB, p99 15.52 KB, max 17.08 KB
+  Message text: mean 65.8 chars (log-normal, median 40, sigma 1.0), +120 B/entry overhead
+  Misc: 16,102 entries, 49-byte keys, 100-byte mean value
+
+===== Config B: 25 MB dataset, 1,000 tile + 1,000 misc reads =====
 Dataset: 25.0 MB in 39,800 entries (tiles 20.0 MB = 80.0 %, misc 5.0 MB = 20.0 %)
   Tiles: 6,239 over 48 chats [L5: 3,793 (60.8 %), L20: 1,814 (29.1 %), L80: 632 (10.1 %)],
          105,805 chat entries, 50-byte keys
@@ -109,46 +122,78 @@ Dataset: 25.0 MB in 39,800 entries (tiles 20.0 MB = 80.0 %, misc 5.0 MB = 20.0 %
 Tiles follow the reader's `Long5To80` stack (layers 5/20/80, weighted 60/30/10 by count); keys look
 like `ChatEntryReader.GetTile:{chatId}:{layer}:{start}`.
 
-**Measured operation.** Populate, close, then time from a cold open: 8 app threads issue 800 logical
-`Get`s of **800 distinct keys** (400 tiles + 400 misc, sampled without repetition and split 100 per
-thread), 10% of reads also `Set` a fresh same-size value, then flush. Nothing is deliberately
-re-read: an app start renders distinct UI, and Fusion's compute cache dedupes repeats upstream.
+**Measured operation.** Populate, close, then time from a cold open: 8 app threads issue the burst
+against **distinct keys** (1,000 keys in config A, 2,000 in config B, sampled without repetition and
+split evenly across the threads), 10% of reads also `Set` a fresh same-size value, then flush.
+Nothing is deliberately re-read: an app start renders distinct UI, and Fusion's compute cache dedupes
+repeats upstream.
 
 Both stacks end **fully durable** — the harness `LazyWriter` is drained and `wal_checkpoint(TRUNCATE)`
 runs for SQLite; plain Kvasar ends on `store.Flush(fsync: true)`, which force-seals the tail rather
 than waiting out the 500 ms debounce. Neither side is credited for work it merely deferred. Every
-row is the median of 5 cold starts.
+row is the median of 5 cold starts; `min–max` spans all 5.
 
 Machine: 32 logical cores, .NET 10, Windows. Lower is better everywhere.
 
-| Engine | Stack | DB MB | **TOTAL ms** | Open | Read | Flush | Read calls | keys/call | Cache hit | Write calls | p50 µs | p99 µs |
-|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| **SQLCipher** | BatchingKvas | 32.4 | **45.7** | 1.2 | 36.8 | 7.5 | 300 | 2.67 | 0.0% | 2 | 282 | 595 |
-| **Kvasar (AES-GCM), 16 KB pages** | **plain** | 30.5 | **11.3** | 5.0 | 2.3 | 3.9 | 800 | 1.00 | — | 85 | 21.0 | 68.5 |
-| Kvasar (no-enc), 16 KB pages | plain | 30.5 | 11.3 | 5.5 | 2.3 | 3.5 | 800 | 1.00 | — | 85 | 18.2 | 67.2 |
-| Kvasar (AES-GCM), 16 KB pages | BatchingKvas | 30.5 | 13.9 | 5.8 | 4.0 | 4.1 | 572 | 1.40 | 0.0% | 2 | 30.1 | 121 |
-| Kvasar (AES-GCM), 16 KB pages | direct reads | 30.5 | 12.0 | 5.3 | 2.6 | 4.1 | 800 | 1.00 | 0.0% | 2 | 22.9 | 69.7 |
+### Config A — 12 MB dataset, 1,000 reads (500 tiles + 500 misc)
 
-`plain` = no layer at all. `direct reads` = the harness with its read path bypassed but writes still
-going through the `LazyWriter` — it isolates the read path from the write path. Run-to-run spread on
-the Kvasar rows is ~±1 ms, so differences under that are noise.
+| Engine | Stack | DB MB | **TOTAL ms** | min–max | Open | Read | Flush | Read calls | keys/call | Cache hit | Write calls | p50 µs | p99 µs |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| **SQLCipher** | BatchingKvas | 15.6 | **52.3** | 50.8–59.7 | 1.4 | 41.3 | 9.4 | 419 | 2.39 | 0.0% | 2 | 227 | 1,208 |
+| **Kvasar (AES-GCM)** | **plain** | 14.6 | **9.1** | 8.7–9.7 | 3.0 | 3.2 | 2.8 | 1,000 | 1.00 | — | 111 | 5.7 | 94.0 |
+| Kvasar (no-enc) | plain | 14.6 | 8.9 | 8.4–9.4 | 3.2 | 3.2 | 2.4 | 1,000 | 1.00 | — | 111 | 7.0 | 97.8 |
+| Kvasar (AES-GCM) | BatchingKvas | 14.6 | 10.7 | 10.4–11.7 | 3.4 | 4.8 | 2.4 | 699 | 1.43 | 0.0% | 2 | 28.7 | 142 |
+
+### Config B — 25 MB dataset, 2,000 reads (1,000 tiles + 1,000 misc)
+
+| Engine | Stack | DB MB | **TOTAL ms** | min–max | Open | Read | Flush | Read calls | keys/call | Cache hit | Write calls | p50 µs | p99 µs |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| **SQLCipher** | BatchingKvas | 32.4 | **102.3** | 100.6–111.3 | 1.2 | 87.3 | 13.7 | 749 | 2.67 | 0.0% | 3 | 273 | 633 |
+| **Kvasar (AES-GCM)** | **plain** | 30.5 | **12.6** | 11.6–19.8 | 3.2 | 5.4 | 3.9 | 2,000 | 1.00 | — | 182 | 17.9 | 73.7 |
+| Kvasar (no-enc) | plain | 30.5 | 12.2 | 11.6–12.5 | 3.4 | 5.4 | 3.3 | 2,000 | 1.00 | — | 182 | 20.3 | 70.5 |
+| Kvasar (AES-GCM) | BatchingKvas | 30.5 | 15.3 | 15.1–15.9 | 3.0 | 8.9 | 3.4 | 1,478 | 1.35 | 0.0% | 3 | 28.3 | 145 |
+
+**Run-to-run spread** (4 independent process runs of the whole scenario, TOTAL ms): SQLCipher
+52.1–55.0 (A) / 102.3–107.2 (B); Kvasar AES-GCM plain 9.1–10.3 / 12.0–12.6; no-enc plain 8.5–12.8 /
+11.4–12.2; Kvasar + `BatchingKvas` 9.9–16.8 / 14.6–15.9. So on the Kvasar rows differences under
+~1.5 ms are noise — which specifically means the AES-GCM vs no-enc gap is noise, and `BatchingKvas`
+vs `plain` is decisive only in config B by TOTAL (it is decisive in *both* configs on the read burst,
+where the spread is much tighter).
 
 ### Takeaways
 
-- **Cold start is ~4.0× faster** (45.7 → 11.3 ms), and every phase but `Open` improves: the read
-  burst 36.8 → 2.3 ms (16×) and the durable flush 7.5 → 3.9 ms. Bare `Open` is slower (1.2 → 5.0 ms)
-  because Kvasar loads its index up front instead of deferring the work; it wins startup anyway.
+- **Cold start is 5.7× faster at 12 MB (52.3 → 9.1 ms) and 8.1× at 25 MB (102.3 → 12.6 ms).** Every
+  phase but `Open` improves: the read burst 41.3 → 3.2 ms (13×) and 87.3 → 5.4 ms (16×), the durable
+  flush 9.4 → 2.8 and 13.7 → 3.9 ms. Bare `Open` is slower (1.2–1.4 → ~3 ms) because Kvasar loads its
+  index up front instead of deferring the work; it wins startup regardless.
+- **The gap widens with load, because only SQLCipher scales with it.** Per read, SQLCipher costs
+  41 µs (A) and 44 µs (B); Kvasar costs 3.2 µs and 2.7 µs — flat, and marginally *better* on the
+  bigger dataset, where the fixed thread-ramp cost is amortized over more operations. Doubling the
+  dataset and the burst costs SQLCipher +96% and Kvasar +38%.
+- **Kvasar's cold start is dominated by fixed cost, not by data.** Halving the workload only takes it
+  from 12.6 to 9.1 ms (−28%, not −50%), because `Open` (~3 ms) and the durable flush (~3 ms) barely
+  move; the read burst is the only part that halves. This is why config A looks less than
+  proportionally faster — it is not an anomaly, it is the read burst having shrunk to a quarter of the
+  total.
 - **Kvasar needs no layer above it.** `FlushDelay` absorbs what `LazyWriter` was for, and the read
-  path is pure overhead: the same store behind `BatchingKvas` costs 13.9 ms vs 11.3 ms plain, with
-  the read burst at 4.0 ms vs 2.3 ms despite issuing *fewer* backend calls (572 vs 800). A channel
-  hop plus a `TaskCompletionSource` per key plus worker dispatch costs more than the read it
-  amortizes, and Kvasar's page cache already makes the 256-entry LRU redundant.
-- **Unbatched writes are no longer a problem.** Plain Kvasar issues 85 single-record `Set`s where the
-  harness issues 2 `SetMany`s, and still flushes in ~4 ms: with `FlushDelay > 0` a `Set` appends into
-  the unsealed tail instead of sealing a page per record.
-- **Encryption is nearly free on this workload** — AES-GCM and no-enc both finish in 11.3 ms.
-- **Read batching barely engages at this concurrency** — 1.40 keys/call for Kvasar vs 2.67 for
-  SQLCipher. Batches only form while a worker is busy, and Kvasar's workers are never busy long
+  path is pure overhead: the same store behind `BatchingKvas` costs 10.7 vs 9.1 ms (A) and 15.3 vs
+  12.6 ms (B), with the read burst at 4.8 vs 3.2 ms and 8.9 vs 5.4 ms — despite issuing *fewer*
+  backend calls (699 vs 1,000; 1,478 vs 2,000). A channel hop plus a `TaskCompletionSource` per key
+  plus worker dispatch costs more than the read it amortizes, and Kvasar's page cache already makes
+  the 256-entry LRU redundant.
+- **Unbatched writes are no longer a problem.** Plain Kvasar issues 111/182 single-record `Set`s
+  where the harness issues 2–3 `SetMany`s, and still flushes in 2.8–3.9 ms: with `FlushDelay > 0` a
+  `Set` appends into the unsealed tail instead of sealing a page per record.
+- **Encryption is free on this workload** — AES-GCM and no-enc land within the run-to-run spread of
+  each other in both configs (and in one run no-enc came out *slower*).
+- **A page cache above the dataset buys median latency, not cold-start time.** Config A's 14.6 MB
+  file fits the 16 MB page cache and its p50 is 5.7 µs — a decrypted-page hit; config B's 30.5 MB
+  does not and its p50 is 17.9 µs. Raising `PageCacheBytes` to 64 MB confirms the mechanism: config
+  B's p50 drops to 4.0 µs, while TOTAL does not improve (12.6 → 14.0 ms, i.e. no better and within
+  the spread). A distinct-key burst can only hit on pages a *sibling* record already pulled in, so
+  the misses that dominate the wall clock happen either way.
+- **Read batching barely engages at this concurrency** — 1.35–1.43 keys/call for Kvasar vs 2.4–2.7
+  for SQLCipher. Batches only form while a worker is busy, and Kvasar's workers are never busy long
   enough. Batching is a workaround for a slow backend.
 - **The 256-entry LRU contributes nothing here (0.0% hit rate).** `BatchingKvas` populates the read
   cache on `Set` only, and no key is read twice, so it can never hit. That is the expected result for
@@ -157,7 +202,8 @@ the Kvasar rows is ~±1 ms, so differences under that are noise.
 
 ### On-disk size vs `PageSize` on this dataset
 
-Same 25.20 MB of live records, populated identically, varying only `PageSize`. (The 4 KB column also
+Config B's dataset — the same 25.20 MB of live records, populated identically, varying only
+`PageSize`. (The 4 KB column also
 shows what `FlushDelay` bought: the previous, pre-`FlushDelay` run of this dataset was 31.3 MB at
 4 KB pages, because each 64-item `SetMany` sealed the tail — deferring the seal packs across batches.)
 
@@ -174,8 +220,9 @@ if it fits the free space left in it, otherwise the tail is sealed and the remai
 14.9 KB record almost always forces a seal at 16 KB pages, wasting the tail's free space *and* the
 ~1.5 KB left over after it. At 4/8 KB the same record spills into a multi-page run whose tail
 remainder keeps packing; at 32 KB two of them fit per page. 16 KB is the local worst case for this
-particular size mix, and 32 KB would be both smaller and equally fast (11.0 ms plain, AES-GCM) — the
-16 KB configuration is kept here because it is the value the sweep recommends generally.
+particular size mix, and 32 KB is both smaller and equally fast (its cold start matched 16 KB's
+within the run-to-run spread) — the 16 KB configuration is kept here because it is the value the
+sweep recommends generally.
 
 ## Tune `PageSize` to the value size
 

@@ -5,8 +5,7 @@ namespace ActualLab.Kvasar.Benchmarks;
 /// <summary>
 /// A minimal port of ActualChat's <c>BatchingKvas</c>: a 256-entry LRU read cache, a batching reader
 /// (batches of up to 64 keys served by up to 4 workers), and one lazy writer (64 items or
-/// <c>flushDelay</c>). With <c>batchedReads: false</c> the whole read path is bypassed and app
-/// threads hit the backend directly.
+/// <c>flushDelay</c>).
 /// </summary>
 public sealed class BatchingKvasHarness : IKvas
 {
@@ -16,7 +15,6 @@ public sealed class BatchingKvasHarness : IKvas
     public const int FlushMaxItemCount = 64;
 
     private readonly IKvEngine _engine;
-    private readonly bool _batchedReads;
     private readonly TimeSpan _flushDelay;
     private readonly LruCache _readCache = new(ReadCacheCapacity);
     private readonly Channel<ReadItem> _reads;
@@ -37,10 +35,9 @@ public sealed class BatchingKvasHarness : IKvas
     public long SetManyCalls => Interlocked.Read(ref _setManyCalls);
     public long SetManyKeys => Interlocked.Read(ref _setManyKeys);
 
-    public BatchingKvasHarness(IKvEngine engine, bool batchedReads, TimeSpan flushDelay)
+    public BatchingKvasHarness(IKvEngine engine, TimeSpan flushDelay)
     {
         _engine = engine;
-        _batchedReads = batchedReads;
         _flushDelay = flushDelay;
         _reads = Channel.CreateUnbounded<ReadItem>(new UnboundedChannelOptions {
             SingleReader = false,
@@ -54,7 +51,7 @@ public sealed class BatchingKvasHarness : IKvas
         // BatchProcessor grows its worker pool on demand up to MaxWorkerCount; starting all 4 up front is
         // both deterministic and the conservative choice — idle workers pick items up sooner, so batches
         // are smaller than the real pool would produce, never larger.
-        _readers = new Task[batchedReads ? ReaderWorkerCount : 0];
+        _readers = new Task[ReaderWorkerCount];
         for (var i = 0; i < _readers.Length; i++)
             _readers[i] = Task.Run(RunReader);
         _writer = Task.Run(RunWriter);
@@ -62,12 +59,6 @@ public sealed class BatchingKvasHarness : IKvas
 
     public ValueTask<byte[]?> Get(KvKey key)
     {
-        if (!_batchedReads) {
-            Interlocked.Increment(ref _cacheMisses);
-            Interlocked.Increment(ref _getManyCalls);
-            Interlocked.Increment(ref _getManyKeys);
-            return _engine.Get(key.Bytes);
-        }
         if (_readCache.TryGetValue(key.Text, out var cached)) {
             Interlocked.Increment(ref _cacheHits);
             return new ValueTask<byte[]?>(cached);
@@ -81,10 +72,7 @@ public sealed class BatchingKvasHarness : IKvas
 
     public ValueTask Set(KvKey key, byte[]? value)
     {
-        // Writes stay batched even when reads are direct, matching how BatchingKvas is wired: the LazyWriter
-        // is a property of the layer, not of the read path.
-        if (_batchedReads)
-            _readCache.Set(key.Text, value);
+        _readCache.Set(key.Text, value);
         if (!_writes.Writer.TryWrite(new WriteCommand((key, value), null)))
             throw new InvalidOperationException("The harness is already disposed.");
         return default;

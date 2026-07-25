@@ -20,9 +20,25 @@ buys the speed.
 ## Performance vs SQLite + SQLCipher
 
 Measured against a faithful replica of ActualChat's `SQLiteBatchingKvasBackend` (encrypted, WAL,
-`synchronous=normal`, one connection per reader thread). 100k keys, 50-byte keys, 8 reader threads,
-Kvasar with AES-256-GCM so both sides are encrypted. Full methodology and raw tables in
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+`synchronous=normal`, one connection per reader thread), with Kvasar using AES-256-GCM so both sides
+are encrypted. Full methodology and raw tables in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
+**Cold start** is the most meaningful number: an app launch opens its client cache cold, then 8
+threads speculatively render the UI — a burst of distinct-key reads (80% of the bytes are chat tiles,
+20% misc values), 10% of which also write — and everything ends fully durable. SQLCipher runs in the
+stack it ships in (ActualChat's `BatchingKvas`: a 256-entry LRU, batched reads, a 500 ms lazy writer);
+Kvasar runs with **no layer at all**, app threads calling `Get`/`Set` directly, with its own 0.5 s
+`FlushDelay` for write debouncing.
+
+| Cold start, median of 5 | SQLCipher + BatchingKvas | Kvasar, no layer | Speedup |
+|---|--:|--:|--:|
+| 12 MB cache, 1,000 reads | 52.3 ms | **9.1 ms** | **5.7×** |
+| 25 MB cache, 2,000 reads | 102.3 ms | **12.6 ms** | **8.1×** |
+
+Batching layers exist to hide a slow backend; in front of Kvasar the same layer only *costs* time
+(10.7 / 15.3 ms), and its read cache never hits on a distinct-key burst.
+
+A per-value-size sweep of the engines in isolation — 100k keys, 50-byte keys, 8 reader threads:
 
 | Value size | Batched writes | Startup hydration | Point reads | Read p99 |
 |---|--:|--:|--:|--:|
