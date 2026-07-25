@@ -11,7 +11,9 @@ members, mixed brace style — Allman for types/methods/ctors, K&R everywhere el
 static readonly / const `PascalCase`.
 
 ## Already-written contracts (do NOT modify these files)
-- `KvasarOptions`, `KvasarStats`, `IndexEncryption`, `KvasarValueType`, `KvasarCorruptException`
+- `KvasarOptions`, `KvasarStats`, `IndexEncryption`, `KvasarValueKind`, `KvasarCorruptException`
+- `KvasarKey`, `KvasarValue` (+ `KvasarKeyExt`/`KvasarValueExt`) — the public key/value structs;
+  they wrap `ReadOnlyMemory<byte>` and carry the conversions, so the internals below stay on raw memory
 - `Crypto/IKeyHasher`, `Crypto/IKeyDerivation`, `Crypto/IPageCipher` (+ `IPageCipherFactory`)
 - `Internal/Locator`, `Internal/IndexEntry`, `Internal/RecordFlags`, `Internal/KvasarConstants`, `Internal/Varint`
 
@@ -38,6 +40,18 @@ Never mutate a decrypted page buffer in place after it is published to the cache
 Multi-reader, single-writer. Readers never lock and never block on the writer. The single writer
 serializes all mutations. Publication of an index slot is the linearization point: write record
 bytes to a sealed/appended page first, then publish the locator with release semantics.
+
+### Cancellation (writes are uninterruptible)
+**Read paths take a `CancellationToken`; write paths take none** — `AppendPage`, `SealTail`,
+`Flush`, `RollToNewSegment`, `StartNewSegment`, delta append and checkpoint write all run to
+completion. Cancelling a write is not a safe operation on a self-describing append-only log: a
+half-written multi-page record leaves a header claiming more bytes than exist, so recovery reads
+the records appended after it as that record's tail, and a torn entry in the buffered `.kidx` delta
+stream shifts every entry behind it into a garbage locator. `KvasarStore`'s public write methods
+stay cancellable for the *caller* by awaiting an uncancellable `*Locked` body through
+`Task.WaitAsync(cancellationToken)`: the token abandons the wait, the body still finishes and
+releases the write lock. Compaction's copy pass is the one exception — it only adds records, so
+stopping it early leaves reclaimable dead bytes, never a dangling locator.
 
 ## Module APIs to implement
 
@@ -94,7 +108,7 @@ Implements the three crypto interfaces + factories + default singletons.
     by the on-disk page count (staged pages are never read from disk). All failures are swallowed — it only
     warms the cache, so the normal read path remains the single place that decides what a bad page means,
     and error/recovery semantics are unchanged.
-  - `ValueTask<long> AppendPage(ReadOnlyMemory<byte> payload, CancellationToken ct = default)` — append one
+  - `ValueTask<long> AppendPage(ReadOnlyMemory<byte> payload)` — append one
     sealed page (payload length must be PageSize; caller pads). Returns the new pageId. Writer-only.
     **Write-behind**: the encrypted page is staged in a ~1 MiB buffer and written on the next `Flush` (or
     when the buffer fills), so a batch of appends costs one `WriteAsync` instead of one per page. Staged
@@ -102,7 +116,7 @@ Implements the three crypto interfaces + factories + default singletons.
     compaction scans the log while appending to it. This is safe for published data because the store's
     seal-before-publish protocol always calls `SegmentSet.Flush` *before* publishing a locator, so no
     reachable locator can point at an unwritten page.
-  - `ValueTask Flush(bool fsync, CancellationToken ct = default)` — writes the staged pages in one I/O;
+  - `ValueTask Flush(bool fsync)` — writes the staged pages in one I/O;
     .NET has no async fsync, so that blocking syscall is offloaded off the caller's thread. `Dispose`
     writes any remaining staged pages synchronously, so forgetting `Flush` degrades durability timing but
     never silently loses data.
@@ -112,16 +126,16 @@ Implements the three crypto interfaces + factories + default singletons.
 ### M3 — Record log / Layer 2 (`Log/`)
 Owns the record format and the multi-segment append log with live/dead accounting.
 - Record format (plaintext), see SPEC §5.2:
-  `recordLen: varint (bytes after this field)`, `flags: u8`, `valType: u8`, `keyLen: varint`,
+  `recordLen: varint (bytes after this field)`, `flags: u8`, `valueKind: u8`, `keyLen: varint`,
   `key: keyLen bytes`, `value: rest`. Tombstone ⇒ no value.
 - `RecordCodec` (static) — encode/decode a record to/from a span:
-  - `int MaxHeaderSize(int keyLen)`; `int Encode(Span<byte> dst, RecordFlags, KvasarValueType, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)`.
+  - `int MaxHeaderSize(int keyLen)`; `int Encode(Span<byte> dst, RecordFlags, KvasarValueKind, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)`.
   - `bool TryDecode(ReadOnlySpan<byte> src, out RecordView view, out int totalLen)` — false on truncated/torn.
-  - `RecordView` = `{ RecordFlags Flags; KvasarValueType ValType; ReadOnlyMemory<byte> Key; ReadOnlyMemory<byte> Value; bool IsTombstone; }` (memory variant for reads that slice pages).
+  - `RecordView` = `{ RecordFlags Flags; KvasarValueKind ValueKind; ReadOnlyMemory<byte> Key; ReadOnlyMemory<byte> Value; bool IsTombstone; }` (memory variant for reads that slice pages).
 - `SegmentSet : IDisposable` — the set of `.klog` segments + the active tail. This is the writer's
   log. Single-writer for all append/seal; concurrent readers for `Read*`.
   - Open: `static ValueTask<SegmentSet> Create(string basePath, int pageSize, IPageCipherFactory, uint formatVer, PageCache, long segmentBytes, int maxInlineValueBytes = 0, CancellationToken ct = default)` — an async factory, since discovery does I/O and constructors can't await. Discovers existing `<base>.NNN.klog`, opens them, picks/creates the active segment.
-  - `ValueTask<(Locator Locator, int RecordLength)> Append(RecordFlags, KvasarValueType, ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, bool isTombstone, CancellationToken ct = default)` — packs the record into the active tail page(s); buffers the active (unsealed) page in memory; seals+`AppendPage`s full pages; rolls to a new segment past `segmentBytes`. Returns the logical `Locator` of the record start and its on-stream length. Values ≤ `MaxInlineValueBytes` never span a page (pad to next page if needed); larger use a contiguous multi-page run. Enforce single-page inline so reads of small values are zero-copy.
+  - `ValueTask<(Locator Locator, int RecordLength)> Append(RecordFlags, KvasarValueKind, ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, bool isTombstone)` — packs the record into the active tail page(s); buffers the active (unsealed) page in memory; seals+`AppendPage`s full pages; rolls to a new segment past `segmentBytes`. Returns the logical `Locator` of the record start and its on-stream length. Values ≤ `MaxInlineValueBytes` never span a page (pad to next page if needed); larger use a contiguous multi-page run. Enforce single-page inline so reads of small values are zero-copy.
   - `ValueTask<RecordView> ReadRecord(Locator loc, CancellationToken ct = default)` — locate page(s), decrypt via `PagedSegment.GetPage`, parse header, return a `RecordView` whose `Value` is a **zero-copy** slice of the cached page when single-page (copy into a pooled/heap buffer only for multi-page runs).
   - `ValueTask<RecordRead> TryReadRecord(Locator loc, CancellationToken ct = default)` — `RecordRead` is
     `readonly record struct (bool IsFound, RecordView View, int TotalLength)`; `IsFound == false` if
@@ -130,7 +144,7 @@ Owns the record format and the multi-segment append log with live/dead accountin
     single-page record whose page is already decrypted in the cache (the common case). Returns false on a
     cache miss or a page-spanning record so the caller awaits the general path. It never returns a wrong
     answer, only "not right now" — this is what keeps `KvasarStore.Get` allocation-free when warm.
-  - `ValueTask Flush(bool fsync, CancellationToken ct = default)` — seal+write the active tail page (buffered), flush all segments.
+  - `ValueTask Flush(bool fsync)` — seal+write the active tail page (buffered), then flush every segment concurrently (an fsync is a blocking syscall per handle, so sequential flushes cost their sum).
   - Live/dead accounting: `void OnSuperseded(Locator oldLoc, int oldRecordLength)` decrements the old
     segment's liveBytes / increments deadBytes. Expose per-segment and totals:
     `long LiveBytes`, `long DeadBytes`, `long FileBytes`, and enumeration of sealed segments with their

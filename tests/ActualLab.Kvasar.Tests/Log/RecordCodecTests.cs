@@ -18,13 +18,13 @@ public class RecordCodecTests
         var value = RandomBytes(valueLen, 2);
         var buf = new byte[RecordCodec.MaxHeaderSize(keyLen) + valueLen];
 
-        var written = RecordCodec.Encode(buf, RecordFlags.None, KvasarValueType.Raw, key, value, false);
+        var written = RecordCodec.Encode(buf, RecordFlags.None, KvasarValueKind.Raw, key, value, false);
         RecordCodec.GetRecordLength(keyLen, valueLen, false).Should().Be(written);
 
         RecordCodec.TryDecode(buf.AsMemory(0, written), out var view, out var totalLen).Should().BeTrue();
         totalLen.Should().Be(written);
         view.IsTombstone.Should().BeFalse();
-        view.ValType.Should().Be(KvasarValueType.Raw);
+        view.ValueKind.Should().Be(KvasarValueKind.Raw);
         view.Key.ToArray().Should().Equal(key);
         view.Value.ToArray().Should().Equal(value);
     }
@@ -34,7 +34,7 @@ public class RecordCodecTests
     {
         var key = RandomBytes(9, 3);
         var buf = new byte[RecordCodec.MaxHeaderSize(key.Length)];
-        var written = RecordCodec.Encode(buf, RecordFlags.None, KvasarValueType.Raw, key, ReadOnlySpan<byte>.Empty, true);
+        var written = RecordCodec.Encode(buf, RecordFlags.None, KvasarValueKind.Raw, key, ReadOnlySpan<byte>.Empty, true);
 
         RecordCodec.TryDecode(buf.AsMemory(0, written), out var view, out _).Should().BeTrue();
         view.IsTombstone.Should().BeTrue();
@@ -49,7 +49,7 @@ public class RecordCodecTests
         var key = RandomBytes(7, 4);
         var value = RandomBytes(33, 5);
         var buf = new byte[RecordCodec.MaxHeaderSize(key.Length) + value.Length];
-        var written = RecordCodec.Encode(buf, RecordFlags.None, KvasarValueType.Raw, key, value, false);
+        var written = RecordCodec.Encode(buf, RecordFlags.None, KvasarValueKind.Raw, key, value, false);
 
         RecordCodec.TryDecode(buf.AsSpan(0, written), out var view, out var totalLen).Should().BeTrue();
         totalLen.Should().Be(written);
@@ -63,7 +63,7 @@ public class RecordCodecTests
         var key = RandomBytes(20, 6);
         var value = RandomBytes(400, 7);
         var buf = new byte[RecordCodec.MaxHeaderSize(key.Length) + value.Length];
-        var written = RecordCodec.Encode(buf, RecordFlags.None, KvasarValueType.Raw, key, value, false);
+        var written = RecordCodec.Encode(buf, RecordFlags.None, KvasarValueKind.Raw, key, value, false);
 
         for (var cut = 0; cut < written; cut++)
             RecordCodec.TryDecode(buf.AsMemory(0, cut), out _, out _).Should().BeFalse($"cut at {cut}");

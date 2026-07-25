@@ -52,7 +52,7 @@ public class SegmentSetTests : IDisposable
             var len = i % 7 == 0 ? 1500 : (i % 3 == 0 ? 0 : 20 + i % 40); // some multi-page, some empty, some tiny
             var key = Key(i);
             var val = Val(i, len);
-            var (loc, _) = await set.Append(RecordFlags.None, KvasarValueType.Raw, key, val, false);
+            var (loc, _) = await set.Append(RecordFlags.None, KvasarValueKind.Raw, key, val, false);
             locs.Add((loc, key, val));
         }
         foreach (var (loc, key, val) in locs) {
@@ -69,7 +69,7 @@ public class SegmentSetTests : IDisposable
         using var set = await NewSet();
         var key = Key(1);
         var (loc, _) = await set.Append(
-            RecordFlags.None, KvasarValueType.Raw, key, ReadOnlyMemory<byte>.Empty, true);
+            RecordFlags.None, KvasarValueKind.Raw, key, ReadOnlyMemory<byte>.Empty, true);
         var view = await set.ReadRecord(loc);
         view.IsTombstone.Should().BeTrue();
         view.Key.ToArray().Should().Equal(key);
@@ -80,7 +80,7 @@ public class SegmentSetTests : IDisposable
     public async Task SmallValueIsZeroCopy()
     {
         using var set = await NewSet();
-        var (loc, _) = await set.Append(RecordFlags.None, KvasarValueType.Raw, Key(1), Val(1, 16), false);
+        var (loc, _) = await set.Append(RecordFlags.None, KvasarValueKind.Raw, Key(1), Val(1, 16), false);
         var a = (await set.ReadRecord(loc)).Value;
         var b = (await set.ReadRecord(loc)).Value;
         SameBackingArray(a, b).Should().BeTrue("single-page reads must alias the same page buffer");
@@ -91,7 +91,7 @@ public class SegmentSetTests : IDisposable
     {
         using var set = await NewSet();
         var val = Val(1, 3 * PageSize + 40);
-        var (loc, recLen) = await set.Append(RecordFlags.None, KvasarValueType.Raw, Key(1), val, false);
+        var (loc, recLen) = await set.Append(RecordFlags.None, KvasarValueKind.Raw, Key(1), val, false);
         recLen.Should().BeGreaterThan(PageSize);
 
         var view = await set.ReadRecord(loc);
@@ -108,7 +108,7 @@ public class SegmentSetTests : IDisposable
     {
         using var set = await NewSet(segmentBytes: 4 * PageSize);
         for (var i = 0; i < 400; i++)
-            await set.Append(RecordFlags.None, KvasarValueType.Raw, Key(i), Val(i, 30), false);
+            await set.Append(RecordFlags.None, KvasarValueKind.Raw, Key(i), Val(i, 30), false);
         set.ActiveSegmentId.Should().BeGreaterThan(0u);
         set.SealedSegments().Should().NotBeEmpty();
     }
@@ -122,7 +122,7 @@ public class SegmentSetTests : IDisposable
                 var len = i % 11 == 0 ? 1200 : 25;
                 var key = Key(i);
                 var val = Val(i, len);
-                await set.Append(RecordFlags.None, KvasarValueType.Raw, key, val, false);
+                await set.Append(RecordFlags.None, KvasarValueKind.Raw, key, val, false);
                 expected.Add((key, val));
             }
             await set.Flush(false);
@@ -143,7 +143,7 @@ public class SegmentSetTests : IDisposable
         using (var set = await NewSet()) {
             for (var i = 0; i < 120; i++) {
                 var key = Key(i);
-                await set.Append(RecordFlags.None, KvasarValueType.Raw, key, Val(i, 40), false);
+                await set.Append(RecordFlags.None, KvasarValueKind.Raw, key, Val(i, 40), false);
                 keys.Add(key);
             }
             await set.Flush(false);
@@ -169,8 +169,8 @@ public class SegmentSetTests : IDisposable
     public async Task OnSupersededMovesBytesLiveToDead()
     {
         using var set = await NewSet();
-        var (loc0, len0) = await set.Append(RecordFlags.None, KvasarValueType.Raw, Key(0), Val(0, 50), false);
-        var (_, len1) = await set.Append(RecordFlags.None, KvasarValueType.Raw, Key(1), Val(1, 60), false);
+        var (loc0, len0) = await set.Append(RecordFlags.None, KvasarValueKind.Raw, Key(0), Val(0, 50), false);
+        var (_, len1) = await set.Append(RecordFlags.None, KvasarValueKind.Raw, Key(1), Val(1, 60), false);
 
         var liveBefore = set.LiveBytes;
         set.DeadBytes.Should().Be(0);
@@ -186,7 +186,7 @@ public class SegmentSetTests : IDisposable
     {
         using var set = await NewSet();
         set.ActiveLogicalHwm.Should().Be(0);
-        var (loc, len) = await set.Append(RecordFlags.None, KvasarValueType.Raw, Key(0), Val(0, 10), false);
+        var (loc, len) = await set.Append(RecordFlags.None, KvasarValueKind.Raw, Key(0), Val(0, 10), false);
         set.ActiveLogicalHwm.Should().Be(len);
         // Read before any flush: served from the in-memory tail buffer.
         (await set.ReadRecord(loc)).Value.ToArray().Should().Equal(Val(0, 10));
@@ -197,7 +197,7 @@ public class SegmentSetTests : IDisposable
     {
         using var set = await NewSet(segmentBytes: 4 * PageSize);
         for (var i = 0; i < 400; i++)
-            await set.Append(RecordFlags.None, KvasarValueType.Raw, Key(i), Val(i, 30), false);
+            await set.Append(RecordFlags.None, KvasarValueKind.Raw, Key(i), Val(i, 30), false);
         var sealedId = set.SealedSegments().First().SegmentId;
         var path = _basePath + $".{sealedId:D3}.klog";
         File.Exists(path).Should().BeTrue();

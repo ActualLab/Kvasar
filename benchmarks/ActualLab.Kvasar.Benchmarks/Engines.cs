@@ -60,7 +60,7 @@ public sealed class KvasarEngine(
 
     public ValueTask WriteBatch(IReadOnlyList<(byte[] Key, byte[] Value)> batch)
     {
-        var updates = new (ReadOnlyMemory<byte> Key, ReadOnlyMemory<byte>? Value)[batch.Count];
+        var updates = new (KvasarKey Key, KvasarValue? Value)[batch.Count];
         for (var i = 0; i < batch.Count; i++)
             updates[i] = (batch[i].Key, batch[i].Value);
         return _store.SetMany(updates);
@@ -77,10 +77,10 @@ public sealed class KvasarEngine(
 
     public async ValueTask<byte[]?[]> GetMany(IReadOnlyList<byte[]> keys)
     {
-        var memoryKeys = new ReadOnlyMemory<byte>[keys.Count];
+        var kvasarKeys = new KvasarKey[keys.Count];
         for (var i = 0; i < keys.Count; i++)
-            memoryKeys[i] = keys[i];
-        var values = await _store.GetMany(memoryKeys);
+            kvasarKeys[i] = keys[i];
+        var values = await _store.GetMany(kvasarKeys);
         var result = new byte[]?[values.Length];
         for (var i = 0; i < values.Length; i++)
             result[i] = values[i]?.ToArray();

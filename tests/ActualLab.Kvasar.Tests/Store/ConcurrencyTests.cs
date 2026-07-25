@@ -110,7 +110,7 @@ public sealed class ConcurrencyTests : IDisposable
         var writer = Task.Run(async () => {
             try {
                 var rnd = new Random(1_000);
-                var batch = new List<(ReadOnlyMemory<byte>, ReadOnlyMemory<byte>?)>();
+                var batch = new List<(KvasarKey, KvasarValue?)>();
                 var ops = 0;
                 while (Environment.TickCount64 < deadline) {
                     if (rnd.Next(4) == 0) {
@@ -232,7 +232,7 @@ public sealed class ConcurrencyTests : IDisposable
         for (var t = 0; t < 2; t++) {
             scanners.Add(Task.Run(async () => {
                 try {
-                    var all = new List<(ReadOnlyMemory<byte> Key, ReadOnlyMemory<byte> Value)>();
+                    var all = new List<(KvasarKey Key, KvasarValue Value)>();
                     while (Environment.TickCount64 < deadline) {
                         // Scan must never throw and every value it yields must be internally consistent
                         // (Scan may observe any snapshot-ish set as the writer mutates).
@@ -285,7 +285,7 @@ public sealed class ConcurrencyTests : IDisposable
             readers.Add(Task.Run(async () => {
                 try {
                     var rnd = new Random(seed);
-                    var keys = new ReadOnlyMemory<byte>[16];
+                    var keys = new KvasarKey[16];
                     while (Environment.TickCount64 < deadline) {
                         if (rnd.Next(3) == 0) {
                             // Batched GetMany.

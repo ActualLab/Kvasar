@@ -127,7 +127,7 @@ public sealed class ConsistencyTests : IDisposable
                     var versions = new int[keysPerThread];
 
                     // Precompute this thread's disjoint keys.
-                    var keys = new ReadOnlyMemory<byte>[keysPerThread];
+                    var keys = new KvasarKey[keysPerThread];
                     for (var k = 0; k < keysPerThread; k++)
                         keys[k] = Encoding.ASCII.GetBytes($"t{threadIndex:D2}:k{k:D3}");
 
@@ -287,7 +287,7 @@ public sealed class ConsistencyTests : IDisposable
         var errors = new ConcurrentQueue<string>();
         await using var store = await KvasarStore.Open(Options(encrypt));
 
-        var keys = new ReadOnlyMemory<byte>[sharedKeyCount];
+        var keys = new KvasarKey[sharedKeyCount];
         for (var k = 0; k < sharedKeyCount; k++)
             keys[k] = Encoding.ASCII.GetBytes($"shared:k{k:D2}");
 

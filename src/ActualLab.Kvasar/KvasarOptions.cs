@@ -12,8 +12,11 @@ public sealed record KvasarOptions
     public required string BasePath { get; init; }
     // 32-byte AES-256 master key.
     public required byte[] EncryptionKey { get; init; }
-    // A mismatch on open ⇒ wipe & recreate.
+    // On-disk format version; a mismatch on open ⇒ wipe & recreate.
     public string FormatVersion { get; init; } = "1";
+    // The caller's own data version (schema, serializer, cache generation, ...): bump it and the next
+    // open wipes & recreates the store. Empty ⇒ unversioned.
+    public string Version { get; init; } = "";
     // Plaintext page payload size; 0 ⇒ probe the FS cluster size (fallback 4 KiB). Power of two.
     public int PageSize { get; init; } = 0;
     public long PageCacheBytes { get; init; } = 16 * 1024 * 1024;

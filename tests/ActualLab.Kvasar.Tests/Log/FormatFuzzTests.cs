@@ -33,7 +33,7 @@ public class FormatFuzzTests
         var value = Payload(valueLen, 12);
         var buf = new byte[RecordCodec.MaxHeaderSize(keyLen) + valueLen];
 
-        var written = RecordCodec.Encode(buf, RecordFlags.None, KvasarValueType.Raw, key, value, false);
+        var written = RecordCodec.Encode(buf, RecordFlags.None, KvasarValueKind.Raw, key, value, false);
         written.Should().Be(RecordCodec.GetRecordLength(keyLen, valueLen, false));
 
         RecordCodec.TryDecode(buf.AsMemory(0, written), out var view, out var totalLen).Should().BeTrue();
@@ -57,7 +57,7 @@ public class FormatFuzzTests
         var value = Payload(64, 14);
         var buf = new byte[RecordCodec.MaxHeaderSize(keyLen) + value.Length];
 
-        var written = RecordCodec.Encode(buf, RecordFlags.None, KvasarValueType.Raw, key, value, true);
+        var written = RecordCodec.Encode(buf, RecordFlags.None, KvasarValueKind.Raw, key, value, true);
         written.Should().Be(RecordCodec.GetRecordLength(keyLen, value.Length, true));
 
         RecordCodec.TryDecode(buf.AsMemory(0, written), out var view, out var totalLen).Should().BeTrue();
@@ -383,7 +383,7 @@ public class FormatFuzzTests
         var key = Payload(keyLen, 21);
         var value = Payload(valueLen, 22);
         var buf = new byte[RecordCodec.MaxHeaderSize(keyLen) + valueLen];
-        var written = RecordCodec.Encode(buf, RecordFlags.None, KvasarValueType.Raw, key, value, isTombstone);
+        var written = RecordCodec.Encode(buf, RecordFlags.None, KvasarValueKind.Raw, key, value, isTombstone);
         return buf[..written];
     }
 

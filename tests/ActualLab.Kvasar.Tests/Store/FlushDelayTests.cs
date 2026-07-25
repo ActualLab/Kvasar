@@ -222,7 +222,7 @@ public class FlushDelayTests : IDisposable
             FlushDelay = flushDelay,
         };
 
-    private static ReadOnlyMemory<byte> Key(int index) => Encoding.UTF8.GetBytes($"fd-key-{index:D6}");
+    private static KvasarKey Key(int index) => Encoding.UTF8.GetBytes($"fd-key-{index:D6}");
 
     private static byte[] Value(int index, int size)
     {

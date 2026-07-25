@@ -5,8 +5,9 @@ namespace ActualLab.Kvasar;
 
 /// <summary>
 /// An embedded, encrypted, file-system-based key-value store (Bitcask model): an in-RAM hash index
-/// over an append-only, encrypted, paged log. Keys and values are binary (<see cref="ReadOnlyMemory{Byte}"/>);
-/// reads are zero-copy slices into cached, immutable pages. Multi-reader / single-writer (§7).
+/// over an append-only, encrypted, paged log. Keys and values are binary (<see cref="KvasarKey"/> /
+/// <see cref="KvasarValue"/>); reads are zero-copy slices into cached, immutable pages.
+/// Multi-reader / single-writer (§7).
 /// </summary>
 public sealed class KvasarStore : IAsyncDisposable
 {
@@ -15,7 +16,7 @@ public sealed class KvasarStore : IAsyncDisposable
     private readonly IKeyHasher _hasher;
     private readonly byte[] _hashKey;
     private readonly IPageCipherFactory _cipherFactory;
-    private readonly bool _persistIndex;
+    private readonly bool _mustPersistIndex;
     private readonly string _kidxPath;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
 
@@ -28,51 +29,17 @@ public sealed class KvasarStore : IAsyncDisposable
     private volatile HashIndex _index = null!;
     private FileStream? _kidxDelta;   // held open across the store's life so each delta is one buffered write, not a file open
     private long _deltaCount;
-    private bool _checkpointDue;
+    private bool _isCheckpointDue;
     private readonly TimeSpan _flushDelay;
     private readonly CancellationTokenSource _disposeCts = new();
-    private Task? _flushLoop;
-    private int _dirty;
-    private bool _disposed;
+    private Task? _flushLoopTask;
+    private int _isDirty;
+    private bool _isDisposed;
 
     public KvasarStats Stats
         // Best-effort snapshot: read without taking the write lock, so a concurrent writer may shift
         // the numbers mid-read. They're advisory (compaction/diagnostics), never used for correctness.
         => new(_index.Count, _segments.LiveBytes, _segments.DeadBytes, _segments.FileBytes);
-
-    private KvasarStore(KvasarOptions options, StoreLock storeLock)
-    {
-        _options = options;
-        _kidxPath = options.BasePath + ".kidx";
-
-        var kdf = options.Kdf ?? KeyDerivations.HkdfSha256;
-        _hasher = options.Hasher ?? KeyHashers.SipHash24;
-        _formatVer = ParseFormatVersion(options.FormatVersion);
-
-        // Derive per-store subkeys from the master key. The page nonce's uniqueness comes from each
-        // segment's own random salt, so a store-level KDF salt isn't needed (the master key is already
-        // a uniformly-random 256-bit secret); subkeys are separated by info label.
-        var pageKey = new byte[KvasarConstants.PageKeySize];
-        _hashKey = new byte[_hasher.IsKeyed ? Math.Max(1, _hasher.SecretSize) : 0];
-        kdf.Derive(options.EncryptionKey, [], KvasarConstants.PageKeyInfo, pageKey);
-        if (_hashKey.Length != 0)
-            kdf.Derive(options.EncryptionKey, [], KvasarConstants.HashKeyInfo, _hashKey);
-
-        _cipherFactory = options.DisableEncryption
-            ? NoopPageCipherFactory.Instance
-            : new AesGcmPageCipherFactory(pageKey, _formatVer);
-
-        // The .kidx may live unencrypted only under a keyed-PRF hasher; otherwise we simply don't
-        // persist it (always rebuild from the log) rather than leaking key-derived metadata.
-        _persistIndex = _options.IndexEncryption switch {
-            IndexEncryption.Off => true,
-            IndexEncryption.On => false, // encrypted .kidx not implemented yet ⇒ rebuild each open
-            _ => _hasher.IsKeyed,
-        };
-
-        _flushDelay = options.FlushDelay;
-        _lock = storeLock;
-    }
 
     public static async ValueTask<KvasarStore> Open(
         KvasarOptions options, CancellationToken cancellationToken = default)
@@ -102,10 +69,107 @@ public sealed class KvasarStore : IAsyncDisposable
         }
     }
 
+    private static async ValueTask<KvasarStore> Create(
+        KvasarOptions options, StoreLock storeLock, CancellationToken cancellationToken)
+    {
+        var store = new KvasarStore(options, storeLock);
+        try {
+            await store.Initialize(cancellationToken).ConfigureAwait(false);
+            return store;
+        }
+        catch {
+            // Release what this attempt opened, but leave the lock to Open — it stays held across the
+            // wipe-and-retry, and a throw here must not strand it.
+            try {
+                await store.DisposeDeltaStream().ConfigureAwait(false);
+            }
+            catch {
+                // Ignored: we're already unwinding, and the files are about to be wiped or abandoned.
+            }
+            store._segments?.Dispose();
+            throw;
+        }
+    }
+
+    private KvasarStore(KvasarOptions options, StoreLock storeLock)
+    {
+        _options = options;
+        _kidxPath = options.BasePath + ".kidx";
+
+        var kdf = options.Kdf ?? KeyDerivations.HkdfSha256;
+        _hasher = options.Hasher ?? KeyHashers.SipHash24;
+        _formatVer = ParseFormatVersion(options.FormatVersion, options.Version);
+
+        // Derive per-store subkeys from the master key. The page nonce's uniqueness comes from each
+        // segment's own random salt, so a store-level KDF salt isn't needed (the master key is already
+        // a uniformly-random 256-bit secret); subkeys are separated by info label.
+        var pageKey = new byte[KvasarConstants.PageKeySize];
+        _hashKey = new byte[_hasher.IsKeyed ? Math.Max(1, _hasher.SecretSize) : 0];
+        kdf.Derive(options.EncryptionKey, [], KvasarConstants.PageKeyInfo, pageKey);
+        if (_hashKey.Length != 0)
+            kdf.Derive(options.EncryptionKey, [], KvasarConstants.HashKeyInfo, _hashKey);
+
+        _cipherFactory = options.DisableEncryption
+            ? NoopPageCipherFactory.Instance
+            : new AesGcmPageCipherFactory(pageKey, _formatVer);
+
+        // The .kidx may live unencrypted only under a keyed-PRF hasher; otherwise we simply don't
+        // persist it (always rebuild from the log) rather than leaking key-derived metadata.
+        _mustPersistIndex = _options.IndexEncryption switch {
+            IndexEncryption.Off => true,
+            IndexEncryption.On => false, // encrypted .kidx not implemented yet ⇒ rebuild each open
+            _ => _hasher.IsKeyed,
+        };
+
+        _flushDelay = options.FlushDelay;
+        _lock = storeLock;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        // Stop the background flusher before taking the lock, so it can't be mid-flush while we tear down.
+        await _disposeCts.CancelAsync().ConfigureAwait(false);
+        if (_flushLoopTask is { } flushLoopTask) {
+            try {
+                await flushLoopTask.ConfigureAwait(false);
+            }
+            catch {
+                // Already best-effort; dispose still has to run.
+            }
+        }
+
+        await _writeLock.WaitAsync().ConfigureAwait(false);
+        try {
+            if (_isDisposed)
+                return;
+            _isDisposed = true;
+            try {
+                await _segments.Flush(true).ConfigureAwait(false);
+                await WriteCheckpoint().ConfigureAwait(false);
+                await DisposeDeltaStream().ConfigureAwait(false);
+                // Everything is on disk, so the next open can safely append to the active segment.
+                WriteCleanMarker();
+            }
+            catch {
+                // Best-effort flush on dispose; a regenerable cache tolerates losing the last writes.
+            }
+            finally {
+                // Must run even if the flush throws (a full disk can fail the buffered .kidx dispose):
+                // _isDisposed is already set, so a retry would no-op and the store lock would leak for the
+                // rest of the process.
+                _segments.Dispose();
+                _lock.Dispose();
+            }
+        }
+        finally {
+            _writeLock.Release();
+        }
+    }
+
     // --- Reads (lock-free) --------------------------------------------------
 
-    public ValueTask<ReadOnlyMemory<byte>?> Get(
-        ReadOnlyMemory<byte> key, CancellationToken cancellationToken = default)
+    public ValueTask<KvasarValue?> Get(
+        KvasarKey key, CancellationToken cancellationToken = default)
     {
         // Not an async method: when the record's page is already decrypted in the cache — the common
         // case — this returns an already-completed ValueTask with no state machine and no allocation.
@@ -119,22 +183,22 @@ public sealed class KvasarStore : IAsyncDisposable
             if (view.IsTombstone)
                 continue;
             if (view.Key.Span.SequenceEqual(key.Span))
-                return new ValueTask<ReadOnlyMemory<byte>?>(view.Value);
+                return new ValueTask<KvasarValue?>(new KvasarValue(view.Value, view.ValueKind));
         }
         return default;
     }
 
-    public async ValueTask<ReadOnlyMemory<byte>?[]> GetMany(
-        IReadOnlyList<ReadOnlyMemory<byte>> keys, CancellationToken cancellationToken = default)
+    public async ValueTask<KvasarValue?[]> GetMany(
+        IReadOnlyList<KvasarKey> keys, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(keys);
-        var results = new ReadOnlyMemory<byte>?[keys.Count];
+        var results = new KvasarValue?[keys.Count];
         for (var i = 0; i < keys.Count; i++)
             results[i] = await Get(keys[i], cancellationToken).ConfigureAwait(false);
         return results;
     }
 
-    public async IAsyncEnumerable<(ReadOnlyMemory<byte> Key, ReadOnlyMemory<byte> Value)> Scan(
+    public async IAsyncEnumerable<(KvasarKey Key, KvasarValue Value)> Scan(
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         IndexEntry[] entries;
@@ -174,30 +238,28 @@ public sealed class KvasarStore : IAsyncDisposable
             }
             if (!read.IsFound || read.View.IsTombstone)
                 continue;
-            yield return (read.View.Key, read.View.Value);
+            yield return (new KvasarKey(read.View.Key), new KvasarValue(read.View.Value, read.View.ValueKind));
         }
     }
 
     // --- Writes (single-writer) --------------------------------------------
 
+    // Every write method has the same two-part shape: acquire the write lock (cancellable — nothing is
+    // mutated yet), then await an uncancellable *Locked body via WaitAsync(cancellationToken). Cancelling
+    // therefore stops the caller's *wait*, never the write: the body keeps running to completion and
+    // releases the lock on its way out. That's deliberate — a write abandoned midway is what would leave
+    // a truncated record in the log (recovery reads the records after it as its own tail) or an index
+    // pointing at bytes that were never written, so no token is passed down to the log/paging/index
+    // layers at all — their write methods don't even take one.
     public async ValueTask Set(
-        ReadOnlyMemory<byte> key, ReadOnlyMemory<byte>? value, CancellationToken cancellationToken = default)
+        KvasarKey key, KvasarValue? value, CancellationToken cancellationToken = default)
     {
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            var appended = await AppendOne(key, value, cancellationToken).ConfigureAwait(false);
-            await SealOrDefer(cancellationToken).ConfigureAwait(false);
-            await Publish(key, appended, cancellationToken).ConfigureAwait(false);
-            await MaybeCheckpoint(cancellationToken).ConfigureAwait(false);
-        }
-        finally {
-            _writeLock.Release();
-        }
+        await SetLocked(key, value).WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask SetMany(
-        IReadOnlyList<(ReadOnlyMemory<byte> Key, ReadOnlyMemory<byte>? Value)> updates,
+        IReadOnlyList<(KvasarKey Key, KvasarValue? Value)> updates,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(updates);
@@ -209,31 +271,78 @@ public sealed class KvasarStore : IAsyncDisposable
             lastByHash[_hasher.Hash(updates[i].Key.Span, _hashKey)] = i;
 
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await SetManyLocked(updates, lastByHash).WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask Clear(CancellationToken cancellationToken = default)
+    {
+        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await ClearLocked().WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask Flush(bool fsync, CancellationToken cancellationToken = default)
+    {
+        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await FlushLocked(fsync).WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask Compact(CancellationToken cancellationToken = default)
+    {
+        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        // The only write with a genuinely cancellable interior: the token stops the copy pass at a record
+        // boundary (see TryCompactOne), and the pass in flight still finishes repointing the index.
+        await CompactLocked(cancellationToken).WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    // Private methods
+
+    private readonly record struct AppendResult(Locator Locator, int RecordLength, bool IsTombstone);
+
+    // --- Private: write-lock bodies ----------------------------------------
+    // Each of these is entered with the write lock already held and releases it; they return Task (not
+    // ValueTask) because the public wrapper awaits them through Task.WaitAsync.
+
+    private async Task SetLocked(KvasarKey key, KvasarValue? value)
+    {
         try {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            var pending = new List<(ReadOnlyMemory<byte> Key, AppendResult Appended)>(lastByHash.Count);
-            for (var i = 0; i < updates.Count; i++) {
-                var (key, value) = updates[i];
-                if (lastByHash[_hasher.Hash(key.Span, _hashKey)] != i)
-                    continue; // superseded within this batch
-                var appended = await AppendOne(key, value, cancellationToken).ConfigureAwait(false);
-                pending.Add((key, appended));
-            }
-            await SealOrDefer(cancellationToken).ConfigureAwait(false); // seal once for the whole batch
-            foreach (var p in pending)
-                await Publish(p.Key, p.Appended, cancellationToken).ConfigureAwait(false);
-            await MaybeCheckpoint(cancellationToken).ConfigureAwait(false);
+            ObjectDisposedException.ThrowIf(_isDisposed, this);
+            var appended = await AppendOne(key, value).ConfigureAwait(false);
+            await SealOrDefer().ConfigureAwait(false);
+            await Publish(key, appended).ConfigureAwait(false);
+            await MaybeCheckpoint().ConfigureAwait(false);
         }
         finally {
             _writeLock.Release();
         }
     }
 
-    public async ValueTask Clear(CancellationToken cancellationToken = default)
+    private async Task SetManyLocked(
+        IReadOnlyList<(KvasarKey Key, KvasarValue? Value)> updates, Dictionary<ulong, int> lastByHash)
     {
-        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try {
-            ObjectDisposedException.ThrowIf(_disposed, this);
+            ObjectDisposedException.ThrowIf(_isDisposed, this);
+            var pending = new List<(KvasarKey Key, AppendResult Appended)>(lastByHash.Count);
+            for (var i = 0; i < updates.Count; i++) {
+                var (key, value) = updates[i];
+                if (lastByHash[_hasher.Hash(key.Span, _hashKey)] != i)
+                    continue; // superseded within this batch
+                var appended = await AppendOne(key, value).ConfigureAwait(false);
+                pending.Add((key, appended));
+            }
+            await SealOrDefer().ConfigureAwait(false); // seal once for the whole batch
+            foreach (var p in pending)
+                await Publish(p.Key, p.Appended).ConfigureAwait(false);
+            await MaybeCheckpoint().ConfigureAwait(false);
+        }
+        finally {
+            _writeLock.Release();
+        }
+    }
+
+    private async Task ClearLocked()
+    {
+        try {
+            ObjectDisposedException.ThrowIf(_isDisposed, this);
             _index.Clear();
             _segments.Dispose();
             await DisposeDeltaStream().ConfigureAwait(false);
@@ -242,31 +351,26 @@ public sealed class KvasarStore : IAsyncDisposable
             _cache = new PageCache(_options.PageCacheBytes);
             _segments = await SegmentSet.Create(
                 _options.BasePath, _pageSize, _cipherFactory, _formatVer, _cache,
-                _options.SegmentBytes, ResolveInlineCap(_options, _pageSize), cancellationToken).ConfigureAwait(false);
+                _options.SegmentBytes, ResolveInlineCap(_options, _pageSize), CancellationToken.None)
+                .ConfigureAwait(false);
             // Recreate a fresh (empty) .kidx and reopen the delta stream.
-            await WriteCheckpoint(cancellationToken).ConfigureAwait(false);
+            await WriteCheckpoint().ConfigureAwait(false);
         }
         finally {
             _writeLock.Release();
         }
     }
 
-    // No CancellationToken: a flush can't be meaningfully abandoned partway, and the returned Task is the
-    // caller's signal that everything written so far is on disk. fsync stays opt-in via the overload.
-    public Task Flush()
-        => Flush(false, CancellationToken.None).AsTask();
-
-    public async ValueTask Flush(bool fsync, CancellationToken cancellationToken = default)
+    private async Task FlushLocked(bool fsync)
     {
-        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try {
-            if (_disposed)
+            if (_isDisposed)
                 return;
-            await _segments.Flush(fsync, cancellationToken).ConfigureAwait(false);
+            await _segments.Flush(fsync).ConfigureAwait(false);
             if (_kidxDelta != null) {
-                await _kidxDelta.FlushAsync(cancellationToken).ConfigureAwait(false);
+                await _kidxDelta.FlushAsync(CancellationToken.None).ConfigureAwait(false);
                 if (fsync)
-                    _kidxDelta.Flush(true);
+                    _kidxDelta.Flush(flushToDisk: true);
             }
         }
         finally {
@@ -274,82 +378,18 @@ public sealed class KvasarStore : IAsyncDisposable
         }
     }
 
-    public async ValueTask Compact(CancellationToken cancellationToken = default)
+    private async Task CompactLocked(CancellationToken cancellationToken)
     {
-        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try {
-            ObjectDisposedException.ThrowIf(_disposed, this);
+            ObjectDisposedException.ThrowIf(_isDisposed, this);
             while (await TryCompactOne(cancellationToken).ConfigureAwait(false)) { }
         }
-        finally {
-            _writeLock.Release();
-        }
-    }
-
-    public async ValueTask DisposeAsync()
-    {
-        // Stop the background flusher before taking the lock, so it can't be mid-flush while we tear down.
-        await _disposeCts.CancelAsync().ConfigureAwait(false);
-        if (_flushLoop is { } flushLoop) {
-            try {
-                await flushLoop.ConfigureAwait(false);
-            }
-            catch {
-                // Already best-effort; dispose still has to run.
-            }
-        }
-
-        await _writeLock.WaitAsync().ConfigureAwait(false);
-        try {
-            if (_disposed)
-                return;
-            _disposed = true;
-            try {
-                await _segments.Flush(true).ConfigureAwait(false);
-                await WriteCheckpoint(CancellationToken.None).ConfigureAwait(false);
-                await DisposeDeltaStream().ConfigureAwait(false);
-                // Everything is on disk, so the next open can safely append to the active segment.
-                WriteCleanMarker();
-            }
-            catch {
-                // Best-effort flush on dispose; a regenerable cache tolerates losing the last writes.
-            }
-            finally {
-                // Must run even if the flush throws (a full disk can fail the buffered .kidx dispose):
-                // _disposed is already set, so a retry would no-op and the store lock would leak for the
-                // rest of the process.
-                _segments.Dispose();
-                _lock.Dispose();
-            }
+        catch (OperationCanceledException) {
+            // Compaction is opportunistic maintenance: a cancelled pass has already left the store
+            // consistent (see TryCompactOne), and the caller's await observed the cancellation anyway.
         }
         finally {
             _writeLock.Release();
-        }
-    }
-
-    // Private methods
-
-    private readonly record struct AppendResult(Locator Locator, int RecordLength, bool IsTombstone);
-
-    private static async ValueTask<KvasarStore> Create(
-        KvasarOptions options, StoreLock storeLock, CancellationToken cancellationToken)
-    {
-        var store = new KvasarStore(options, storeLock);
-        try {
-            await store.Initialize(cancellationToken).ConfigureAwait(false);
-            return store;
-        }
-        catch {
-            // Release what this attempt opened, but leave the lock to Open — it stays held across the
-            // wipe-and-retry, and a throw here must not strand it.
-            try {
-                await store.DisposeDeltaStream().ConfigureAwait(false);
-            }
-            catch {
-                // Ignored: we're already unwinding, and the files are about to be wiped or abandoned.
-            }
-            store._segments?.Dispose();
-            throw;
         }
     }
 
@@ -369,15 +409,15 @@ public sealed class KvasarStore : IAsyncDisposable
             // A graceful close flushes everything and leaves a marker, so only an unclean shutdown needs
             // the roll — otherwise every launch would strand another segment. An empty active segment has
             // no pages to collide with either.
-            var closedCleanly = TryConsumeCleanMarker();
-            if (!closedCleanly && _segments.ActiveSegmentPageCount > 0)
-                await _segments.RollToNewSegment(cancellationToken).ConfigureAwait(false);
-            _flushLoop = Task.Run(RunFlushLoop, CancellationToken.None);
+            var isClosedCleanly = TryConsumeCleanMarker();
+            if (!isClosedCleanly && _segments.ActiveSegmentPageCount > 0)
+                await _segments.RollToNewSegment().ConfigureAwait(false);
+            _flushLoopTask = Task.Run(RunFlushLoop, CancellationToken.None);
         }
     }
 
-    private async ValueTask<ReadOnlyMemory<byte>?> GetSlow(
-        ReadOnlyMemory<byte> key, ulong keyHash, CancellationToken cancellationToken)
+    private async ValueTask<KvasarValue?> GetSlow(
+        KvasarKey key, ulong keyHash, CancellationToken cancellationToken)
     {
         var cursor = _index.Probe(keyHash);
         while (cursor.MoveNext(out var loc, out _)) {
@@ -390,8 +430,8 @@ public sealed class KvasarStore : IAsyncDisposable
         return null;
     }
 
-    private async ValueTask<ReadOnlyMemory<byte>?> TryReadValue(
-        Locator loc, ReadOnlyMemory<byte> key, CancellationToken cancellationToken)
+    private async ValueTask<KvasarValue?> TryReadValue(
+        Locator loc, KvasarKey key, CancellationToken cancellationToken)
     {
         try {
             var read = await _segments.TryReadRecord(loc, cancellationToken).ConfigureAwait(false);
@@ -399,71 +439,70 @@ public sealed class KvasarStore : IAsyncDisposable
                 return null;
             if (!read.View.Key.Span.SequenceEqual(key.Span))
                 return null; // hash collision ⇒ different key
-            return read.View.Value;
+            return new KvasarValue(read.View.Value, read.View.ValueKind);
         }
         catch (Exception e) when (e is not KvasarCorruptException) {
             return null; // transient (e.g. segment compacted away) ⇒ treat as miss
         }
     }
 
-    private async ValueTask<AppendResult> AppendOne(
-        ReadOnlyMemory<byte> key, ReadOnlyMemory<byte>? value, CancellationToken cancellationToken)
+    private async ValueTask<AppendResult> AppendOne(KvasarKey key, KvasarValue? value)
     {
         var isTombstone = value is null;
-        var valueMemory = isTombstone ? default : value!.Value;
-        if (!isTombstone && valueMemory.Length > _options.MaxValueBytes) {
+        var record = value ?? default;
+        if (!isTombstone && record.Length > _options.MaxValueBytes) {
             if (_options.OversizedValueThrows)
                 throw new ArgumentException($"Value exceeds MaxValueBytes ({_options.MaxValueBytes}).", nameof(value));
             // §12: skip oversized value (default). Callers wanting failures set OversizedValueThrows.
             return new AppendResult(Locator.None, 0, isTombstone);
         }
         var (locator, recordLength) = await _segments
-            .Append(RecordFlags.None, KvasarValueType.Raw, key, valueMemory, isTombstone, cancellationToken)
+            .Append(RecordFlags.None, record.Kind, key.Memory, record.Memory, isTombstone)
             .ConfigureAwait(false);
         return new AppendResult(locator, recordLength, isTombstone);
     }
 
-    private async ValueTask Publish(
-        ReadOnlyMemory<byte> key, AppendResult appended, CancellationToken cancellationToken)
+    private async ValueTask Publish(KvasarKey key, AppendResult appended)
     {
         var (loc, recordLength, isTombstone) = appended;
         if (loc.IsNone)
             return; // skipped oversized value
         var h = _hasher.Hash(key.Span, _hashKey);
-        var hadOld = _index.TryGetFirst(h, out var oldLoc, out var oldLen);
+        var hasOld = _index.TryGetFirst(h, out var oldLoc, out var oldLen);
         if (isTombstone) {
-            if (hadOld) {
+            if (hasOld) {
                 _index.Remove(h, oldLoc);
                 _segments.OnSuperseded(oldLoc, oldLen);
             }
             _segments.OnSuperseded(loc, recordLength); // the tombstone itself is reclaimable space
-            await AppendDelta(h, loc, recordLength, true, cancellationToken).ConfigureAwait(false);
+            await AppendDelta(h, loc, recordLength, true).ConfigureAwait(false);
         }
         else {
-            if (hadOld)
+            if (hasOld)
                 _segments.OnSuperseded(oldLoc, oldLen);
             _index.Set(h, loc, recordLength);
-            await AppendDelta(h, loc, recordLength, false, cancellationToken).ConfigureAwait(false);
+            await AppendDelta(h, loc, recordLength, false).ConfigureAwait(false);
         }
     }
 
-    private async ValueTask AppendDelta(
-        ulong keyHash, Locator loc, int length, bool tombstone, CancellationToken cancellationToken)
+    private async ValueTask AppendDelta(ulong keyHash, Locator loc, int length, bool isTombstone)
     {
-        if (!_persistIndex)
+        if (!_mustPersistIndex)
             return;
         var entry = new IndexEntry {
             KeyHash = keyHash,
             SegmentId = loc.SegmentId,
             Offset = loc.Offset,
             Length = (uint)length,
-            Flags = tombstone ? (byte)RecordFlags.Tombstone : (byte)0,
+            Flags = isTombstone ? (byte)RecordFlags.Tombstone : (byte)0,
         };
         try {
+            // CancellationToken.None: the delta stream is buffered, so a cancelled write can tear an entry
+            // in the middle of the file — and every entry after it then decodes as garbage locators.
             if (_kidxDelta != null)
-                await IndexFile.AppendDelta(_kidxDelta, entry, cancellationToken).ConfigureAwait(false);
+                await IndexFile.AppendDelta(_kidxDelta, entry, CancellationToken.None).ConfigureAwait(false);
             if (++_deltaCount > (_index.Count / 2) + 64)
-                _checkpointDue = true; // deferred — see MaybeCheckpoint
+                _isCheckpointDue = true; // deferred — see MaybeCheckpoint
         }
         catch {
             // .kidx is a rebuildable hint; a failed lazy delta is non-fatal.
@@ -497,7 +536,7 @@ public sealed class KvasarStore : IAsyncDisposable
         }
     }
 
-    private ValueTask SealOrDefer(CancellationToken cancellationToken)
+    private ValueTask SealOrDefer()
     {
         // Durable mode seals the tail before publishing, so a published locator always points at an
         // immutable page. Deferred mode publishes into the *unsealed* tail instead, which readers already
@@ -505,8 +544,8 @@ public sealed class KvasarStore : IAsyncDisposable
         // than rewriting this one, so bytes under a handed-out slice never change. Skipping the seal is
         // what makes an unbatched Set cheap — sealing per call pads a whole page per record.
         if (_flushDelay <= TimeSpan.Zero)
-            return _segments.Flush(false, cancellationToken);
-        Volatile.Write(ref _dirty, 1);
+            return _segments.Flush(false);
+        Volatile.Write(ref _isDirty, 1);
         return default;
     }
 
@@ -517,7 +556,7 @@ public sealed class KvasarStore : IAsyncDisposable
         try {
             while (!_disposeCts.IsCancellationRequested) {
                 await Task.Delay(_flushDelay, _disposeCts.Token).ConfigureAwait(false);
-                if (Interlocked.Exchange(ref _dirty, 0) == 0)
+                if (Interlocked.Exchange(ref _isDirty, 0) == 0)
                     continue;
                 try {
                     await Flush(false, _disposeCts.Token).ConfigureAwait(false);
@@ -525,7 +564,7 @@ public sealed class KvasarStore : IAsyncDisposable
                 catch (Exception e) when (e is not OperationCanceledException) {
                     // Best-effort: a failed background flush costs durability, never consistency, so the
                     // next tick simply tries again.
-                    Volatile.Write(ref _dirty, 1);
+                    Volatile.Write(ref _isDirty, 1);
                 }
             }
         }
@@ -534,24 +573,24 @@ public sealed class KvasarStore : IAsyncDisposable
         }
     }
 
-    private ValueTask MaybeCheckpoint(CancellationToken cancellationToken)
+    private ValueTask MaybeCheckpoint()
     {
         // A checkpoint stamps the log HWM alongside the index, so it must never run while a batch is
         // only half-published. SetMany and compaction seal the *whole* batch before publishing any of
         // it, so a checkpoint taken mid-loop would pair an end-of-batch HWM with an index missing the
         // rest of the batch — and recovery, which replays only past the HWM, would never re-read those
         // records. They would be lost permanently despite the write having been acknowledged.
-        if (!_checkpointDue)
+        if (!_isCheckpointDue)
             return default;
-        _checkpointDue = false;
-        return WriteCheckpoint(cancellationToken);
+        _isCheckpointDue = false;
+        return WriteCheckpoint();
     }
 
     private void OpenDeltaStream()
     {
         // Idempotent: LoadIndex's rebuild path checkpoints (which reopens the stream) before Initialize
         // calls this, and a second FileStream on the same path would be a sharing violation.
-        if (!_persistIndex || _kidxDelta != null)
+        if (!_mustPersistIndex || _kidxDelta != null)
             return;
         // The file exists after LoadIndex (either loaded or freshly checkpointed). Keep it open for
         // buffered appends; a 4 KiB buffer coalesces a batch's deltas into one write.
@@ -568,17 +607,20 @@ public sealed class KvasarStore : IAsyncDisposable
         _kidxDelta = null;
     }
 
-    private async ValueTask WriteCheckpoint(CancellationToken cancellationToken)
+    private async ValueTask WriteCheckpoint()
     {
-        if (!_persistIndex)
+        if (!_mustPersistIndex)
             return;
         // Rewriting the whole file invalidates the append handle; close, rewrite, reopen at the end.
+        // CancellationToken.None: bailing out between the two would leave the store with no delta stream
+        // for the rest of its life, silently dropping every later index update.
         await DisposeDeltaStream().ConfigureAwait(false);
         var live = _index.Snapshot().ToArray();
         var hwm = (_segments.ActiveSegmentId, checked((uint)_segments.ActiveLogicalHwm));
-        await IndexFile.WriteCheckpoint(_kidxPath, live, hwm, _formatVer, cancellationToken).ConfigureAwait(false);
+        await IndexFile.WriteCheckpoint(_kidxPath, live, hwm, _formatVer, CancellationToken.None)
+            .ConfigureAwait(false);
         _deltaCount = 0;
-        _checkpointDue = false;
+        _isCheckpointDue = false;
         OpenDeltaStream();
     }
 
@@ -598,6 +640,10 @@ public sealed class KvasarStore : IAsyncDisposable
         if (target == uint.MaxValue)
             return false;
 
+        // The copy loop is the one cancellable part of a write path: it only ever *adds* records, and the
+        // index still points at the originals, so an abandoned pass leaves unreferenced copies (dead bytes
+        // a later compaction reclaims), never a broken record or a dangling locator. Everything below —
+        // repointing the index and dropping the drained segment — must run as a whole.
         var pending = new List<(ulong Hash, Locator NewLoc, int NewLen, Locator OldLoc, int OldLen)>();
         await foreach (var (loc, view, recordLength) in _segments.ScanAll(cancellationToken).ConfigureAwait(false)) {
             if (loc.SegmentId != target || view.IsTombstone)
@@ -606,21 +652,21 @@ public sealed class KvasarStore : IAsyncDisposable
             if (!_index.TryGetFirst(h, out var cur, out _) || cur != loc)
                 continue; // dead record (superseded) ⇒ don't carry forward
             var (newLoc, newLen) = await _segments
-                .Append(view.Flags, view.ValType, view.Key, view.Value, false, cancellationToken)
+                .Append(view.Flags, view.ValueKind, view.Key, view.Value, false)
                 .ConfigureAwait(false);
             pending.Add((h, newLoc, newLen, loc, recordLength));
         }
         // Seal before repointing so readers see immutable pages.
-        await _segments.Flush(false, cancellationToken).ConfigureAwait(false);
+        await _segments.Flush(false).ConfigureAwait(false);
         foreach (var p in pending) {
             _index.Set(p.Hash, p.NewLoc, p.NewLen);
             _segments.OnSuperseded(p.OldLoc, p.OldLen);
-            await AppendDelta(p.Hash, p.NewLoc, p.NewLen, false, cancellationToken).ConfigureAwait(false);
+            await AppendDelta(p.Hash, p.NewLoc, p.NewLen, false).ConfigureAwait(false);
         }
         _segments.RemoveSegment(target);
         // Only now is the index fully repointed off the drained segment; checkpointing mid-loop would
         // pair an end-of-compaction HWM with stale locators into a file this line just deleted.
-        await MaybeCheckpoint(cancellationToken).ConfigureAwait(false);
+        await MaybeCheckpoint().ConfigureAwait(false);
         return true;
     }
 
@@ -628,7 +674,7 @@ public sealed class KvasarStore : IAsyncDisposable
 
     private async ValueTask LoadIndex(CancellationToken cancellationToken)
     {
-        var checkpoint = _persistIndex
+        var checkpoint = _mustPersistIndex
             ? await IndexFile.TryLoad(_kidxPath, _formatVer, cancellationToken).ConfigureAwait(false)
             : null;
         if (checkpoint is { } cp) {
@@ -644,7 +690,7 @@ public sealed class KvasarStore : IAsyncDisposable
             await foreach (var (loc, view, recordLength) in
                 _segments.ScanAll(cancellationToken).ConfigureAwait(false))
                 ApplyLoaded(loc, view, recordLength);
-            await WriteCheckpoint(cancellationToken).ConfigureAwait(false);
+            await WriteCheckpoint().ConfigureAwait(false);
         }
         SeedAccounting();
     }
@@ -676,7 +722,7 @@ public sealed class KvasarStore : IAsyncDisposable
         var existing = await TryReadExistingHeader(options.BasePath, cancellationToken).ConfigureAwait(false);
         if (existing is { } header) {
             if (header.FormatVer != _formatVer)
-                throw new KvasarCorruptException("FormatVersion mismatch.");
+                throw new KvasarCorruptException("FormatVersion or Version mismatch.");
             if (options.PageSize > 0 && options.PageSize != header.PageSize)
                 throw new KvasarCorruptException("PageSize mismatch with the existing store.");
             return header.PageSize;
@@ -754,16 +800,25 @@ public sealed class KvasarStore : IAsyncDisposable
         }
     }
 
-    private static uint ParseFormatVersion(string formatVersion)
+    private static uint ParseFormatVersion(string formatVersion, string? version)
     {
-        if (uint.TryParse(formatVersion, out var v))
+        // The app-level Version folds into the same on-disk tag as FormatVersion: both are stamped into
+        // every segment header, so changing either makes the next open see a mismatched header and
+        // wipe & recreate the store (§11).
+        if (string.IsNullOrEmpty(version) && uint.TryParse(formatVersion, out var v))
             return v;
-        // Non-numeric version ⇒ stable 32-bit hash (FNV-1a) so it still round-trips on reopen.
+        // Anything else ⇒ stable 32-bit hash (FNV-1a) so it still round-trips on reopen.
         uint hash = 2166136261;
-        foreach (var b in System.Text.Encoding.UTF8.GetBytes(formatVersion)) {
-            hash ^= b;
-            hash *= 16777619;
-        }
+        Add(formatVersion);
+        Add("\0"); // separator, so ("1", "0") and ("10", "") don't hash alike
+        Add(version ?? "");
         return hash | 0x8000_0000; // keep it distinct from small numeric versions
+
+        void Add(string s) {
+            foreach (var b in System.Text.Encoding.UTF8.GetBytes(s)) {
+                hash ^= b;
+                hash *= 16777619;
+            }
+        }
     }
 }

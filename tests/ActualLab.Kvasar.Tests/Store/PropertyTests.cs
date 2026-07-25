@@ -120,7 +120,7 @@ public class PropertyTests : IDisposable
                 byte[]? val = vr < 6 ? RandomValue(rnd) : vr < 8 ? [] : null;
                 picks.Add((ki, val));
             }
-            var updates = new (ReadOnlyMemory<byte>, ReadOnlyMemory<byte>?)[count];
+            var updates = new (KvasarKey, KvasarValue?)[count];
             for (var i = 0; i < count; i++)
                 updates[i] = (keys[picks[i].Ki], ToVal(picks[i].Val));
             await store.SetMany(updates);
@@ -175,9 +175,9 @@ public class PropertyTests : IDisposable
     // --- Helpers ------------------------------------------------------------
 
     // NOTE: the null branch needs an explicit nullable target, otherwise the conditional's natural type
-    // is byte[] and a null byte[] flows through the implicit byte[]->ReadOnlyMemory<byte> operator,
+    // is byte[] and a null byte[] flows through the implicit byte[]->KvasarValue operator,
     // producing a *present* empty value (HasValue==true) instead of a null (delete).
-    private static ReadOnlyMemory<byte>? ToVal(byte[]? a) => a is null ? null : (ReadOnlyMemory<byte>?)a;
+    private static KvasarValue? ToVal(byte[]? a) => a is null ? null : (KvasarValue?)a;
 
     private static byte[] RandomValue(Random rnd)
     {

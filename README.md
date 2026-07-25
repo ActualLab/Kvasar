@@ -106,17 +106,21 @@ copy of itself (nothing binds a segment to the store — see the limitations in
 await using var store = await KvasarStore.Open(new KvasarOptions {
     BasePath = "/path/to/cache/CCC",
     EncryptionKey = key32, // 32 bytes
+    Version = "1.0",       // your data version; bump it and the store is wiped & recreated
 });
 
-await store.Set(key, value);                       // value == null => delete
-var value = await store.Get(key);                  // ReadOnlyMemory<byte>? — null = miss
+await store.Set("some-key", value);                // value == null => delete
+var value = await store.Get("some-key");           // KvasarValue? — null = miss
+Console.WriteLine(value?.AsString);                // UTF-8 decode
 await foreach (var (k, v) in store.Scan()) { … }   // enumerate all (unordered)
 await store.Flush();
 ```
 
-Keys and values are binary (`ReadOnlyMemory<byte>`); string and typed conversions belong in the
-caller. `KvasarOptions` also exposes `PageSize`, `PageCacheBytes`, compaction thresholds, and
-pluggable hasher/KDF — see [`docs/SPEC.md`](docs/SPEC.md) §4.
+Keys and values are binary — `KvasarKey` / `KvasarValue`, thin structs over
+`ReadOnlyMemory<byte>` with implicit conversions from byte/char memory, `byte[]`, `char[]` and
+`string` (UTF-8), plus an `AsString` extension for the way back. `KvasarOptions` also exposes
+`PageSize`, `PageCacheBytes`, compaction thresholds, and pluggable hasher/KDF — see
+[`docs/SPEC.md`](docs/SPEC.md) §4.
 
 **Tune `PageSize` to your value size.** It is the highest-leverage knob: values larger than a page
 can't stay single-page, which costs both space and I/O. Moving 4 KB values from 4 KB to 16 KB pages

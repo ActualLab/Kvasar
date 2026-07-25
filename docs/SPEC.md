@@ -79,14 +79,16 @@ Task Clear(CancellationToken ct);
 
 ## 4. Public API
 
-Keys **and** values are **`ReadOnlyMemory<byte>`** — always binary. A returned value is a
-**zero-copy slice into a cached page** (§6.3). `null` (a `ReadOnlyMemory<byte>?`) means
-*absent*; a present value may be empty (`ReadOnlyMemory<byte>.Empty`). String/typed conversions,
-if any, live in the caller/adapter (§13), not the store.
+Keys **and** values are **binary**, wrapped in the `KvasarKey` / `KvasarValue` readonly structs —
+each is a `ReadOnlyMemory<byte>` plus implicit conversions from byte/char memory, `byte[]`, `char[]`
+and `string` (chars are UTF-8 encoded), so a caller can pass a `string` key without writing an
+adapter. A returned value is a **zero-copy slice into a cached page** (§6.3). `null` (a
+`KvasarValue?`) means *absent*; a present value may be empty.
 
 The API is **fully async** — SQLite is synchronous for historical reasons, Kvasar deliberately is
 not: all disk I/O uses positional `RandomAccess.ReadAsync`/`WriteAsync` on handles opened with
-`FileOptions.Asynchronous`, and a `CancellationToken` flows through every path. `ValueTask` (not
+`FileOptions.Asynchronous`, and a `CancellationToken` flows through every *read* path (§4.4).
+`ValueTask` (not
 `Task`) is used throughout so that the **cache-hit fast path completes synchronously with no state
 machine and no allocation** (§6.3): `Get` is not an `async` method — it resolves a cached,
 single-page record inline and only builds a state machine on a cache miss or a page-spanning record.
@@ -100,14 +102,14 @@ public sealed class KvasarStore : IAsyncDisposable
 {
     public static ValueTask<KvasarStore> Open(KvasarOptions options, CancellationToken ct = default);
 
-    // --- core KV (all binary; ReadOnlyMemory<byte>) ---
-    public ValueTask<ReadOnlyMemory<byte>?> Get(ReadOnlyMemory<byte> key, CancellationToken ct = default); // thread-safe, null = miss
-    public ValueTask<ReadOnlyMemory<byte>?[]> GetMany(IReadOnlyList<ReadOnlyMemory<byte>> keys, CancellationToken ct = default); // positional
-    public ValueTask Set(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte>? value, CancellationToken ct = default); // value == null => delete
-    public ValueTask SetMany(IReadOnlyList<(ReadOnlyMemory<byte> Key, ReadOnlyMemory<byte>? Value)> updates, CancellationToken ct = default); // last dup wins
+    // --- core KV (all binary; KvasarKey / KvasarValue) ---
+    public ValueTask<KvasarValue?> Get(KvasarKey key, CancellationToken ct = default);   // thread-safe, null = miss
+    public ValueTask<KvasarValue?[]> GetMany(IReadOnlyList<KvasarKey> keys, CancellationToken ct = default); // positional
+    public ValueTask Set(KvasarKey key, KvasarValue? value, CancellationToken ct = default); // value == null => delete
+    public ValueTask SetMany(IReadOnlyList<(KvasarKey Key, KvasarValue? Value)> updates, CancellationToken ct = default); // last dup wins
 
     // --- enumeration & reset ---
-    public IAsyncEnumerable<(ReadOnlyMemory<byte> Key, ReadOnlyMemory<byte> Value)> Scan(CancellationToken ct = default); // ALL (unordered)
+    public IAsyncEnumerable<(KvasarKey Key, KvasarValue Value)> Scan(CancellationToken ct = default); // ALL (unordered)
     public ValueTask Clear(CancellationToken ct = default);              // wipe everything (fast reset)
 
     // --- lifecycle ---
@@ -119,11 +121,30 @@ public sealed class KvasarStore : IAsyncDisposable
     public KvasarStats Stats { get; }                                    // sync; best-effort snapshot
 }
 
+public readonly struct KvasarKey : IEquatable<KvasarKey>
+{
+    public ReadOnlyMemory<byte> Memory { get; }
+    public ReadOnlySpan<byte> Span { get; }
+    public int Length { get; }
+    public bool IsEmpty { get; }
+    public byte[] ToArray();
+    // implicit: ReadOnlyMemory<byte|char>, byte[], char[], string -> KvasarKey; KvasarKey -> ReadOnlyMemory/Span<byte>
+    // KvasarKeyExt.AsString: UTF-8 decode
+}
+
+public readonly struct KvasarValue : IEquatable<KvasarValue>   // same shape as KvasarKey, plus:
+{
+    public KvasarValueKind Kind { get; }                                 // Raw in v1 (§4.3)
+    public KvasarValue Require(KvasarValueKind kind);                    // throws on a kind mismatch
+    // every conversion *out* of a value (operators, KvasarValueExt.AsString) goes through Require
+}
+
 public sealed record KvasarOptions
 {
     public required string BasePath { get; init; }                       // -> <base>.klog / .kidx / .lock
     public required byte[] EncryptionKey { get; init; }                  // 32 bytes (AES-256)
-    public string FormatVersion { get; init; } = "1";                    // mismatch => wipe & recreate
+    public string FormatVersion { get; init; } = "1";                    // on-disk format; mismatch => wipe & recreate
+    public string Version { get; init; } = "";                           // caller's data version; mismatch => wipe & recreate
     public int  PageSize { get; init; } = 0;                             // 0 => probe FS cluster size (fallback 4 KiB)
     public long PageCacheBytes { get; init; } = 16 * 1024 * 1024;        // decrypted-page LRU budget
     public int  MaxValueBytes { get; init; } = 8 * 1024 * 1024;
@@ -151,22 +172,40 @@ public enum IndexEncryption { Auto, On, Off }   // Auto: encrypt .kidx unless Ha
 - No bulk/regex delete — use `Clear()` to wipe, or `Scan()` + per-key `Set(key, null)`.
 
 ### 4.2 Key & value semantics
-- **Key identity = the raw key bytes** (the whole `ReadOnlyMemory<byte>` content).
-- **Empty vs missing:** an empty value (`ReadOnlyMemory<byte>.Empty`) is a present value; a miss
-  is `null`. Delete = `null`.
+- **Key identity = the raw key bytes** (the whole `KvasarKey.Memory` content). A `string` key is
+  its UTF-8 encoding, so `"a"` and `"a"u8` are the same key.
+- **Empty vs missing:** an empty value is a present value; a miss is `null`. Delete = `null`.
+  Mind the difference between `KvasarValue?` = `null` (delete) and a `KvasarValue` built from a
+  `null` array/string (a *present*, empty value) — the implicit conversions treat null like
+  `ReadOnlyMemory<byte>` does.
 - **Buffer ownership:** `Set` copies the key/value bytes it needs, so the caller may reuse its
   buffer right after the call. A `Get`/`Scan` result is a zero-copy slice into an immutable cached
   page and stays valid for as long as the caller holds it (GC-backed, §6.3) — copy it only to
   detach from the store's memory.
 
 ### 4.3 Value model & atomicity — forward-compatible
-- **v1: binary keys + binary values** (`ReadOnlyMemory<byte>`).
-- **Value type tag:** every stored value carries a **1-byte type tag**; v1 defines one —
-  `Raw` (opaque bytes). Reserves room for Redis-style typed values later (counter, list,
-  hash, set, …) **without a format break**; an unknown tag ⇒ corrupt ⇒ regenerate.
+- **v1: binary keys + binary values** (`KvasarKey` / `KvasarValue`).
+- **Value type tag:** every stored value carries a **1-byte type tag** (`KvasarValueKind`, surfaced
+  as `KvasarValue.Kind`); v1 defines one — `Raw` (opaque bytes). Reserves room for Redis-style typed
+  values later (counter, list, hash, set, …) **without a format break**; an unknown tag ⇒ corrupt ⇒
+  regenerate. Only the store tags a value, so a caller can never write an unknown kind; conversions
+  out of a `KvasarValue` assert the expected kind.
 - **Atomicity: single-key operations are atomic** — a reader sees the complete old or new
   value, never a torn state (single-writer + immutable pages + atomic index publication, §7).
   **No transactions** across keys.
+
+### 4.4 What a `CancellationToken` actually cancels
+A write method's token cancels **only the wait for the single-writer lock** — the point before
+anything has been mutated. Once the lock is held, `append → publish → checkpoint` runs to completion
+uncancelled, and no token is passed down to the log, paging or index layers (their write methods
+take none, so it can't be done by accident). Cancelling mid-write is not a safe operation on an
+append-only log: a record's bytes are self-describing, so a half-written multi-page record makes
+recovery read the records after it as its own tail, and a torn entry in the buffered `.kidx` delta
+stream turns every entry after it into a garbage locator.
+
+Fully cancellable: `Get`/`GetMany`/`Scan`, `Open`, and compaction's copy pass (it only *adds*
+records — the index still points at the originals, so an abandoned pass leaves reclaimable dead
+bytes, never a dangling locator).
 
 ---
 
@@ -430,7 +469,10 @@ Overwrites and deletes leave dead records; we reclaim them with **Bitcask-style 
 `DisposeAsync`: `Flush(fsync:true)`, write `.kidx`, release lock/handles.
 
 ## 11. Versioning
-`FormatVersion` + on-disk `formatVer`/`pageSize`; any mismatch ⇒ wipe & recreate (safe: cache).
+`FormatVersion` (the on-disk format) and `Version` (the caller's own data version — schema,
+serializer, cache generation) fold into the single on-disk `formatVer` tag stamped into every
+segment header; that plus `pageSize`, any mismatch ⇒ wipe & recreate (safe: cache). This mirrors
+what the SQLite backend did with its `(version)` row, minus the reserved key.
 This is also the migration story **from SQLite** — first launch finds no `.klog`, starts empty,
 caches repopulate. `.kidx` is always rebuildable and may be discarded across versions.
 
@@ -442,9 +484,10 @@ caches repopulate. `.kidx` is always rebuildable and may be discarded across ver
 ## 13. ActualChat integration
 - `KvasarBatchingKvasBackend : IBatchingKvasBackend` (Maui project, or `ActualChat.Core` if
   reused): `GetMany`→`GetMany`; `SetMany`→`SetMany`+`Flush`; `ListAllEntries`→`Scan()`;
-  `Clear`→`Clear`. The adapter owns `string`↔`byte[]` conversion (encode `string` keys to UTF-8;
-  return `byte[]`/`ReadOnlyMemory<byte>` values) — the store is pure binary. Wrap init in the
-  existing delete-and-retry safety net.
+  `Clear`→`Clear`. `string` keys convert to `KvasarKey` implicitly (UTF-8), and the adapter turns
+  `KvasarValue` back into `byte[]` — the store itself stays pure binary. Pass the cache generation
+  as `KvasarOptions.Version` (the `(version)` row's replacement) and wrap init in the existing
+  delete-and-retry safety net.
 - `MauiModule` swaps the SQLite-backed cache/KVAS for Kvasar-backed ones; `BasePath` from
   `FileSystem.CacheDirectory & "CCC"` / `AppDataDirectory & "LocalSettings"`; `EncryptionKey`
   from `MauiPreferences.DbEncryptionKey`.

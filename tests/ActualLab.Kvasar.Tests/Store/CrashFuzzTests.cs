@@ -126,7 +126,7 @@ public sealed class CrashFuzzTests : IDisposable
             await using (var store = await KvasarStore.Open(Options(BaseIn(liveDir), encrypt: false))) {
                 for (var i = 0; i < warmup; i++)
                     await store.Set(Utf8($"warm{i:D4}"), new byte[16]);
-                var batch = new List<(ReadOnlyMemory<byte> Key, ReadOnlyMemory<byte>? Value)>();
+                var batch = new List<(KvasarKey Key, KvasarValue? Value)>();
                 for (var j = 0; j < batchSize; j++)
                     batch.Add((Utf8($"batch{j:D2}"), Val(new byte[16])));
                 await store.SetMany(batch);
@@ -434,12 +434,12 @@ public sealed class CrashFuzzTests : IDisposable
     };
 
     private static string BaseIn(string dir) => Path.Combine(dir, StoreName);
-    private static ReadOnlyMemory<byte> Utf8(string s) => Encoding.UTF8.GetBytes(s);
-    // The explicit default() is load-bearing: byte[] converts implicitly to ReadOnlyMemory<byte>, so a plain
+    private static KvasarKey Utf8(string s) => Encoding.UTF8.GetBytes(s);
+    // The explicit default() is load-bearing: byte[] converts implicitly to KvasarValue, so a plain
     // `value is null ? null : ...` types the conditional as non-nullable and turns every delete into an
     // empty-value write.
-    private static ReadOnlyMemory<byte>? Val(byte[]? value)
-        => value is null ? default(ReadOnlyMemory<byte>?) : new ReadOnlyMemory<byte>(value);
+    private static KvasarValue? Val(byte[]? value)
+        => value is null ? default(KvasarValue?) : new KvasarValue(value);
 
     // Nested types
 

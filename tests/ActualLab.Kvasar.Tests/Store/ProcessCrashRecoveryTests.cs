@@ -166,7 +166,7 @@ public class ProcessCrashRecoveryTests : IDisposable
             SegmentBytes = 8 * 1024 * 1024,
         };
 
-    private static ReadOnlyMemory<byte> Key(int index) => Encoding.UTF8.GetBytes($"key-{index:D8}");
+    private static KvasarKey Key(int index) => Encoding.UTF8.GetBytes($"key-{index:D8}");
 
     private static byte[] ExpectedValue(int index, int size)
     {

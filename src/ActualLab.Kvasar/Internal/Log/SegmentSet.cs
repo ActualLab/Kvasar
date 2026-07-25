@@ -47,7 +47,7 @@ public sealed class SegmentSet : IDisposable
     // swaps in a fresh array rather than reusing this one, so a reader must not cache a stale reference.
     private volatile byte[] _tail;
     private int _tailFill;
-    private bool _disposed;
+    private bool _isDisposed;
 
     public uint ActiveSegmentId => _active.SegmentId;
     public long ActiveSegmentPageCount => _active.PageCount;
@@ -87,21 +87,21 @@ public sealed class SegmentSet : IDisposable
 
     // --- Append -------------------------------------------------------------
 
+    // No CancellationToken on any append/seal/flush path, by design: a record's bytes are self-describing,
+    // so abandoning a multi-page append partway leaves a header claiming more bytes than were written, and
+    // recovery then swallows the records appended after it. See PagedSegment's write-path note.
     public async ValueTask<(Locator Locator, int RecordLength)> Append(
-        RecordFlags flags, KvasarValueType valType,
-        ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, bool isTombstone,
-        CancellationToken cancellationToken = default)
+        RecordFlags flags, KvasarValueKind valueKind,
+        ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, bool isTombstone)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(_isDisposed, this);
         var valueLen = isTombstone ? 0 : value.Length;
         var recordLength = RecordCodec.GetRecordLength(key.Length, valueLen, isTombstone);
-        await RollIfNeeded(cancellationToken).ConfigureAwait(false);
-        var singlePage = recordLength <= _pageSize && (isTombstone || value.Length <= _maxInlineValueBytes);
-        var locator = singlePage
-            ? await AppendSinglePage(flags, valType, key, value, isTombstone, recordLength, cancellationToken)
-                .ConfigureAwait(false)
-            : await AppendMultiPage(flags, valType, key, value, isTombstone, recordLength, cancellationToken)
-                .ConfigureAwait(false);
+        await RollIfNeeded().ConfigureAwait(false);
+        var isSinglePage = recordLength <= _pageSize && (isTombstone || value.Length <= _maxInlineValueBytes);
+        var locator = isSinglePage
+            ? await AppendSinglePage(flags, valueKind, key, value, isTombstone, recordLength).ConfigureAwait(false)
+            : await AppendMultiPage(flags, valueKind, key, value, isTombstone, recordLength).ConfigureAwait(false);
         return (locator, recordLength);
     }
 
@@ -126,10 +126,10 @@ public sealed class SegmentSet : IDisposable
     // a crash there can lose whole unwritten pages, so PageCount comes back lower and appends would reuse
     // those page ids — and the GCM nonce is a pure function of (fileSalt, pageId). A new segment gets a new
     // random salt, so its nonce space is disjoint and reuse is structurally impossible.
-    public async ValueTask RollToNewSegment(CancellationToken cancellationToken = default)
+    public async ValueTask RollToNewSegment()
     {
-        await SealTail(cancellationToken).ConfigureAwait(false);
-        await StartNewSegment(cancellationToken).ConfigureAwait(false);
+        await SealTail().ConfigureAwait(false);
+        await StartNewSegment().ConfigureAwait(false);
     }
 
     public ValueTask Prefetch(uint segmentId, long fromPageId, int maxPages, CancellationToken cancellationToken = default)
@@ -301,11 +301,21 @@ public sealed class SegmentSet : IDisposable
         }
     }
 
-    public async ValueTask Flush(bool fsync, CancellationToken cancellationToken = default)
+    public async ValueTask Flush(bool fsync)
     {
-        await SealTail(cancellationToken).ConfigureAwait(false);
-        foreach (var st in _states.Values)
-            await st.Segment.Flush(fsync, cancellationToken).ConfigureAwait(false);
+        await SealTail().ConfigureAwait(false);
+        // Start every segment's flush before awaiting any: an fsync is a blocking syscall on its own file
+        // handle, so sequential flushes cost their sum while concurrent ones cost the slowest. Segments
+        // that finish inline (nothing pending, no fsync) never reach the list, so the common single-segment
+        // flush stays allocation-free.
+        List<Task>? flushTasks = null;
+        foreach (var st in _states.Values) {
+            var flushTask = st.Segment.Flush(fsync);
+            if (!flushTask.IsCompletedSuccessfully)
+                (flushTasks ??= new List<Task>(_states.Count)).Add(flushTask.AsTask());
+        }
+        if (flushTasks != null)
+            await Task.WhenAll(flushTasks).ConfigureAwait(false);
     }
 
     public void RemoveSegment(uint segmentId)
@@ -323,9 +333,9 @@ public sealed class SegmentSet : IDisposable
 
     public void Dispose()
     {
-        if (_disposed)
+        if (_isDisposed)
             return;
-        _disposed = true;
+        _isDisposed = true;
         foreach (var st in _states.Values)
             st.Segment.Dispose();
         _states.Clear();
@@ -334,14 +344,13 @@ public sealed class SegmentSet : IDisposable
     // Private methods
 
     private async ValueTask<Locator> AppendSinglePage(
-        RecordFlags flags, KvasarValueType valType,
-        ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, bool isTombstone, int recordLength,
-        CancellationToken cancellationToken)
+        RecordFlags flags, KvasarValueKind valueKind,
+        ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, bool isTombstone, int recordLength)
     {
         if (_tailFill + recordLength > _pageSize)
-            await SealTail(cancellationToken).ConfigureAwait(false);
+            await SealTail().ConfigureAwait(false);
         var offset = (long)_active.PageCount * _pageSize + _tailFill;
-        RecordCodec.Encode(_tail.AsSpan(_tailFill), flags, valType, key.Span, value.Span, isTombstone);
+        RecordCodec.Encode(_tail.AsSpan(_tailFill), flags, valueKind, key.Span, value.Span, isTombstone);
         _tailFill += recordLength;
         PublishTail();
         _activeState.LiveBytes += recordLength;
@@ -349,20 +358,19 @@ public sealed class SegmentSet : IDisposable
     }
 
     private async ValueTask<Locator> AppendMultiPage(
-        RecordFlags flags, KvasarValueType valType,
-        ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, bool isTombstone, int recordLength,
-        CancellationToken cancellationToken)
+        RecordFlags flags, KvasarValueKind valueKind,
+        ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, bool isTombstone, int recordLength)
     {
         // Multi-page runs start at a page boundary and occupy whole pages (§5.2).
         if (_tailFill > 0)
-            await SealTail(cancellationToken).ConfigureAwait(false);
+            await SealTail().ConfigureAwait(false);
         var offset = (long)_active.PageCount * _pageSize;
         var buf = ArrayPool<byte>.Shared.Rent(recordLength);
         try {
-            RecordCodec.Encode(buf, flags, valType, key.Span, value.Span, isTombstone);
+            RecordCodec.Encode(buf, flags, valueKind, key.Span, value.Span, isTombstone);
             var pos = 0;
             while (recordLength - pos >= _pageSize) {
-                await _active.AppendPage(buf.AsMemory(pos, _pageSize), cancellationToken).ConfigureAwait(false);
+                await _active.AppendPage(buf.AsMemory(pos, _pageSize)).ConfigureAwait(false);
                 pos += _pageSize;
             }
             var rem = recordLength - pos;
@@ -370,9 +378,8 @@ public sealed class SegmentSet : IDisposable
                 buf.AsSpan(pos, rem).CopyTo(_tail);
                 _tailFill = rem;
             }
-            else {
+            else
                 _tailFill = 0;
-            }
             PublishTail();
         }
         finally {
@@ -382,30 +389,32 @@ public sealed class SegmentSet : IDisposable
         return new Locator(_active.SegmentId, checked((uint)offset));
     }
 
-    private async ValueTask SealTail(CancellationToken cancellationToken)
+    private async ValueTask SealTail()
     {
         if (_tailFill == 0)
             return;
         _tail.AsSpan(_tailFill).Clear(); // pad the remainder with zeros
-        await _active.AppendPage(_tail, cancellationToken).ConfigureAwait(false);
+        await _active.AppendPage(_tail).ConfigureAwait(false);
         _tail = new byte[_pageSize]; // fresh buffer so any handed-out zero-copy slice stays immutable
         _tailFill = 0;
         PublishTail();
     }
 
-    private async ValueTask RollIfNeeded(CancellationToken cancellationToken)
+    private async ValueTask RollIfNeeded()
     {
         if (ActiveLogicalHwm < _segmentBytes)
             return;
-        await SealTail(cancellationToken).ConfigureAwait(false);
-        await StartNewSegment(cancellationToken).ConfigureAwait(false);
+        await SealTail().ConfigureAwait(false);
+        await StartNewSegment().ConfigureAwait(false);
     }
 
-    private async ValueTask StartNewSegment(CancellationToken cancellationToken)
+    private async ValueTask StartNewSegment()
     {
         var newId = _active.SegmentId + 1;
+        // No token: a partially written header would fail the next open's validation and take the whole
+        // store (every segment, not just this one) down the wipe & recreate path.
         var seg = await PagedSegment
-            .Create(PathFor(newId), newId, _pageSize, _cipherFactory, _formatVer, _cache, cancellationToken)
+            .Create(PathFor(newId), newId, _pageSize, _cipherFactory, _formatVer, _cache, CancellationToken.None)
             .ConfigureAwait(false);
         var st = new SegState { Segment = seg };
         _states[newId] = st;
@@ -455,7 +464,7 @@ public sealed class SegmentSet : IDisposable
             // the reused nonce would expose the XOR of both plaintexts. Start a fresh segment instead —
             // it gets a fresh random salt, so its nonce space is disjoint.
             if (_active.HasTornTail)
-                await StartNewSegment(cancellationToken).ConfigureAwait(false);
+                await StartNewSegment().ConfigureAwait(false);
         }
         catch {
             // A bad key / corrupt segment surfaces here (decrypt fails); dispose any handles we opened

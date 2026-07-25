@@ -4,7 +4,7 @@ namespace ActualLab.Kvasar.Internal;
 
 /// <summary>
 /// Encodes/decodes the plaintext record format (§5.2):
-/// <c>recordLen: varint (bytes after this field)</c>, <c>flags: u8</c>, <c>valType: u8</c>,
+/// <c>recordLen: varint (bytes after this field)</c>, <c>flags: u8</c>, <c>valueKind: u8</c>,
 /// <c>keyLen: varint</c>, <c>key</c>, <c>value</c> (absent for a tombstone).
 /// </summary>
 public static class RecordCodec
@@ -19,7 +19,7 @@ public static class RecordCodec
     }
 
     public static int Encode(
-        Span<byte> dst, RecordFlags flags, KvasarValueType valType,
+        Span<byte> dst, RecordFlags flags, KvasarValueKind valueKind,
         ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)
     {
         if (isTombstone)
@@ -28,7 +28,7 @@ public static class RecordCodec
         var body = 2 + Varint.SizeOf((ulong)key.Length) + key.Length + valueLen;
         var pos = Varint.Write(dst, (ulong)body);
         dst[pos++] = (byte)flags;
-        dst[pos++] = (byte)valType;
+        dst[pos++] = (byte)valueKind;
         pos += Varint.Write(dst[pos..], (ulong)key.Length);
         key.CopyTo(dst[pos..]);
         pos += key.Length;
@@ -43,11 +43,11 @@ public static class RecordCodec
     {
         // Zero-copy: the returned view's Key/Value slices alias src.
         view = default;
-        if (!TryParse(src.Span, out var flags, out var valType,
+        if (!TryParse(src.Span, out var flags, out var valueKind,
                 out var keyOffset, out var keyLen, out var valueOffset, out var valueLen, out var isTombstone, out totalLen))
             return false;
         view = new RecordView(
-            flags, valType,
+            flags, valueKind,
             src.Slice(keyOffset, keyLen),
             isTombstone ? ReadOnlyMemory<byte>.Empty : src.Slice(valueOffset, valueLen),
             isTombstone);
@@ -58,22 +58,22 @@ public static class RecordCodec
     {
         // Copies key/value out: a span has no backing Memory to slice into the view.
         view = default;
-        if (!TryParse(src, out var flags, out var valType,
+        if (!TryParse(src, out var flags, out var valueKind,
                 out var keyOffset, out var keyLen, out var valueOffset, out var valueLen, out var isTombstone, out totalLen))
             return false;
         var key = src.Slice(keyOffset, keyLen).ToArray();
         var value = isTombstone ? Array.Empty<byte>() : src.Slice(valueOffset, valueLen).ToArray();
-        view = new RecordView(flags, valType, key, value, isTombstone);
+        view = new RecordView(flags, valueKind, key, value, isTombstone);
         return true;
     }
 
     private static bool TryParse(
-        ReadOnlySpan<byte> src, out RecordFlags flags, out KvasarValueType valType,
+        ReadOnlySpan<byte> src, out RecordFlags flags, out KvasarValueKind valueKind,
         out int keyOffset, out int keyLen, out int valueOffset, out int valueLen,
         out bool isTombstone, out int totalLen)
     {
         flags = default;
-        valType = default;
+        valueKind = default;
         keyOffset = keyLen = valueOffset = valueLen = 0;
         isTombstone = false;
         totalLen = 0;
@@ -89,7 +89,7 @@ public static class RecordCodec
 
         var body = src.Slice(recLenBytes, bodyLen);
         flags = (RecordFlags)body[0];
-        valType = (KvasarValueType)body[1];
+        valueKind = (KvasarValueKind)body[1];
         isTombstone = (flags & RecordFlags.Tombstone) != 0;
         if (!Varint.TryRead(body[2..], out var keyLenU, out var keyLenBytes))
             return false;

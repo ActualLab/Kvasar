@@ -9,17 +9,17 @@ namespace ActualLab.Kvasar.Internal;
 public readonly struct RecordView
 {
     public RecordFlags Flags { get; }
-    public KvasarValueType ValType { get; }
+    public KvasarValueKind ValueKind { get; }
     public ReadOnlyMemory<byte> Key { get; }
     public ReadOnlyMemory<byte> Value { get; }
     public bool IsTombstone { get; }
 
     public RecordView(
-        RecordFlags flags, KvasarValueType valType,
+        RecordFlags flags, KvasarValueKind valueKind,
         ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, bool isTombstone)
     {
         Flags = flags;
-        ValType = valType;
+        ValueKind = valueKind;
         Key = key;
         Value = value;
         IsTombstone = isTombstone;

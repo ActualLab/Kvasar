@@ -35,9 +35,9 @@ public class EdgeCaseTests : IDisposable
 
     private static byte[] K(string s) => Encoding.UTF8.GetBytes(s);
 
-    private static async Task<List<(ReadOnlyMemory<byte> Key, ReadOnlyMemory<byte> Value)>> ScanAll(KvasarStore store)
+    private static async Task<List<(KvasarKey Key, KvasarValue Value)>> ScanAll(KvasarStore store)
     {
-        var items = new List<(ReadOnlyMemory<byte> Key, ReadOnlyMemory<byte> Value)>();
+        var items = new List<(KvasarKey Key, KvasarValue Value)>();
         await foreach (var item in store.Scan())
             items.Add(item);
         return items;
@@ -207,7 +207,7 @@ public class EdgeCaseTests : IDisposable
     public async Task SetManyDuplicateKeysLastWins()
     {
         await using var store = await KvasarStore.Open(Options());
-        (ReadOnlyMemory<byte>, ReadOnlyMemory<byte>?)[] updates = [
+        (KvasarKey, KvasarValue?)[] updates = [
             (K("k"), K("first")),
             (K("other"), K("x")),
             (K("k"), K("second")),
@@ -218,7 +218,7 @@ public class EdgeCaseTests : IDisposable
         (await store.Get(K("other")))!.Value.ToArray().Should().Equal(K("x"));
 
         // Last occurrence being a delete wins too.
-        (ReadOnlyMemory<byte>, ReadOnlyMemory<byte>?)[] updates2 = [
+        (KvasarKey, KvasarValue?)[] updates2 = [
             (K("k"), K("resurrected")),
             (K("k"), null),
         ];
@@ -236,7 +236,7 @@ public class EdgeCaseTests : IDisposable
         await store.Set(K("c"), K("C"));
         await store.Set(K("e"), ReadOnlyMemory<byte>.Empty);
 
-        ReadOnlyMemory<byte>[] keys = [K("a"), K("miss1"), K("c"), K("miss2"), K("e")];
+        KvasarKey[] keys = [K("a"), K("miss1"), K("c"), K("miss2"), K("e")];
         var results = await store.GetMany(keys);
 
         results.Should().HaveCount(keys.Length);
@@ -329,5 +329,33 @@ public class EdgeCaseTests : IDisposable
         // Fully usable afterward.
         await store2.Set(K("c"), K("charlie"));
         (await store2.Get(K("c")))!.Value.ToArray().Should().Equal(K("charlie"));
+    }
+
+    // --- Version (the caller's own data version) mismatch ⇒ wipe ------------
+
+    [Fact]
+    public async Task VersionMismatchWipes()
+    {
+        var v1 = Options() with { Version = "1.0" };
+        await using (var store = await KvasarStore.Open(v1)) {
+            await store.Set(K("a"), K("alpha"));
+            await store.Flush(true);
+        }
+
+        // Same Version ⇒ the store survives.
+        await using (var store = await KvasarStore.Open(Options() with { Version = "1.0" }))
+            (await store.Get(K("a")))!.Value.ToArray().Should().Equal(K("alpha"));
+
+        // Bumped Version ⇒ wiped & regenerated (empty), no throw.
+        await using (var store = await KvasarStore.Open(Options() with { Version = "1.1" })) {
+            (await ScanAll(store)).Should().BeEmpty();
+            await store.Set(K("b"), K("bravo"));
+            await store.Flush(true);
+        }
+
+        // Dropping Version entirely is a change too ⇒ another wipe.
+        await using (var store = await KvasarStore.Open(Options())) {
+            (await ScanAll(store)).Should().BeEmpty();
+        }
     }
 }

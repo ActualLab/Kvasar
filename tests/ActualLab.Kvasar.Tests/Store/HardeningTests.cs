@@ -143,7 +143,7 @@ public class HardeningTests : IDisposable
         var basePath = Path.Combine(_dir, "torn");
         await using (var store = await KvasarStore.Open(Options(basePath))) {
             for (var i = 0; i < 64; i++)
-                await store.Set(Key($"k{i}"), Key($"v{i}"));
+                await store.Set(Key($"k{i}"), Val($"v{i}"));
             await store.Flush(true);
         }
 
@@ -154,8 +154,8 @@ public class HardeningTests : IDisposable
             fs.SetLength(fs.Length - 7);
 
         await using (var store = await KvasarStore.Open(Options(basePath))) {
-            await store.Set(Key("after"), Key("recovered"));
-            (await store.Get(Key("after")))!.Value.ToArray().Should().Equal(Key("recovered").ToArray());
+            await store.Set(Key("after"), Val("recovered"));
+            (await store.Get(Key("after")))!.Value.ToArray().Should().Equal(Val("recovered").ToArray());
         }
 
         File.Exists($"{basePath}.002.klog").Should()
@@ -176,5 +176,6 @@ public class HardeningTests : IDisposable
     private static IndexEntry NewEntry(ulong keyHash, uint segmentId, uint offset, uint length)
         => new() { KeyHash = keyHash, SegmentId = segmentId, Offset = offset, Length = length, Flags = 0 };
 
-    private static ReadOnlyMemory<byte> Key(string s) => Encoding.UTF8.GetBytes(s);
+    private static KvasarKey Key(string s) => Encoding.UTF8.GetBytes(s);
+    private static KvasarValue Val(string s) => Encoding.UTF8.GetBytes(s);
 }

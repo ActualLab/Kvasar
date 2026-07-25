@@ -200,13 +200,17 @@ public sealed class PagedSegment : IDisposable
         }
     }
 
-    public async ValueTask<long> AppendPage(ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
+    // No CancellationToken on the write path, by design: abandoning an append or a flush partway would
+    // leave a half-written record in the log (a record's bytes are self-describing, so recovery would
+    // read the following records as its tail) or a torn entry in a buffered stream. Writes are local,
+    // bounded, and fast; the caller's token guards the *wait* for the write lock instead.
+    public async ValueTask<long> AppendPage(ReadOnlyMemory<byte> payload)
     {
         if (payload.Length != PageSize)
             throw new ArgumentException("Payload length must equal PageSize.", nameof(payload));
 
         if (_pendingCount == _pendingCapacity)
-            await FlushPending(cancellationToken).ConfigureAwait(false);
+            await FlushPending().ConfigureAwait(false);
 
         var pageId = _pageCount;
         if (_pendingCount == 0)
@@ -222,12 +226,12 @@ public sealed class PagedSegment : IDisposable
         return pageId;
     }
 
-    public async ValueTask Flush(bool fsync, CancellationToken cancellationToken = default)
+    public async ValueTask Flush(bool fsync)
     {
-        await FlushPending(cancellationToken).ConfigureAwait(false);
+        await FlushPending().ConfigureAwait(false);
         // .NET has no async fsync, so the blocking syscall is offloaded off the caller's thread.
         if (fsync)
-            await Task.Run(() => RandomAccess.FlushToDisk(_handle), cancellationToken).ConfigureAwait(false);
+            await Task.Run(() => RandomAccess.FlushToDisk(_handle)).ConfigureAwait(false);
     }
 
     public void Dispose()
@@ -250,14 +254,14 @@ public sealed class PagedSegment : IDisposable
 
     // Private methods
 
-    private async ValueTask FlushPending(CancellationToken cancellationToken)
+    private async ValueTask FlushPending()
     {
         if (_pendingCount == 0)
             return;
         var count = _pendingCount;
         var firstPageId = _pendingFirstPageId;
         await RandomAccess
-            .WriteAsync(_handle, _pending.AsMemory(0, count * _onDiskPageSize), PagePosition(firstPageId), cancellationToken)
+            .WriteAsync(_handle, _pending.AsMemory(0, count * _onDiskPageSize), PagePosition(firstPageId))
             .ConfigureAwait(false);
         _pendingCount = 0;
         // Drop the staged plaintext only after the bytes are on disk, so a concurrent reader always finds

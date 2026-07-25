@@ -34,7 +34,7 @@ public class SmokeTests : IDisposable
     {
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
         await foreach (var (key, value) in store.Scan())
-            map.Add(Encoding.UTF8.GetString(key.Span), Encoding.UTF8.GetString(value.Span));
+            map.Add(key.AsString, value.AsString);
         return map;
     }
 
@@ -86,14 +86,14 @@ public class SmokeTests : IDisposable
     public async Task SetManyPositionalGetManyAndDupWins()
     {
         await using var store = await KvasarStore.Open(Options());
-        (ReadOnlyMemory<byte>, ReadOnlyMemory<byte>?)[] updates = [
+        (KvasarKey, KvasarValue?)[] updates = [
             (K("k1"), K("a")),
             (K("k2"), K("b")),
             (K("k1"), K("c")), // duplicate: last wins
         ];
         await store.SetMany(updates);
 
-        ReadOnlyMemory<byte>[] keys = [K("k1"), K("nope"), K("k2")];
+        KvasarKey[] keys = [K("k1"), K("nope"), K("k2")];
         var results = await store.GetMany(keys);
         results.Length.Should().Be(3);
         results[0]!.Value.ToArray().Should().Equal(K("c"));
