@@ -2,7 +2,9 @@
 setlocal
 rem Runs the Kvasar vs SQLCipher benchmarks in Release; see docs\BENCHMARKS.md.
 rem Args are forwarded to the benchmark itself (after --):
-rem   --n <count> --value <bytes|sweep> --threads <n> --lookups <n> --engines kvasar|sqlite|both --pagesize <bytes>
+rem   --scenario sweep|chat --n <count> --value <bytes|sweep> --threads <n> --lookups <n>
+rem   --engines kvasar|sqlite|both --pagesize <bytes>
+rem   --scenario chat runs the ActualChat cold-start scenario and ignores the sweep's sizing args.
 rem With no args the documented default sweep is used.
 rem Run this on an otherwise-idle machine: concurrent load has been measured to skew results by 20-60%%.
 set "ARGS=%*"

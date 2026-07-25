@@ -9,7 +9,8 @@ int[] sizes = ArgStr("--value", "sweep") is "sweep"
     : [ArgInt("--value", 1024)];
 int threads = ArgInt("--threads", Math.Min(8, Environment.ProcessorCount));
 int totalLookups = ArgInt("--lookups", 500_000);
-var engines = ArgStr("--engines", "both")!; // kvasar | sqlite | both
+var engines = ArgStr("--engines", "both")!;   // kvasar | sqlite | both
+var scenario = ArgStr("--scenario", "sweep")!; // sweep | chat
 int pageSize = ArgInt("--pagesize", 4096);  // Kvasar page size; larger pages = fewer, bigger async I/Os
 const int BatchSize = 64;
 
@@ -26,6 +27,14 @@ var key = new byte[32];
 for (var i = 0; i < 32; i++) key[i] = (byte)(i * 3 + 1);
 
 Console.WriteLine($"Machine: {Environment.ProcessorCount} logical cores, .NET {Environment.Version}");
+if (scenario is "chat") {
+    Console.WriteLine("Scenario: ActualChat cold start (BatchingKvas harness over each engine)");
+    Console.WriteLine();
+    await ChatCacheScenario.Run(root, key, engines);
+    try { Directory.Delete(root, true); } catch { /* ignore */ }
+    return;
+}
+
 Console.WriteLine($"N={N:N0} keys (50-byte keys), lookup threads={threads}, total lookups={totalLookups:N0}, batch={BatchSize}");
 Console.WriteLine($"Value sizes: {string.Join(", ", sizes)} bytes");
 Console.WriteLine();

@@ -15,9 +15,11 @@ misrepresent the comparison. So this measures async Kvasar against SQLite as it 
 dotnet run -c Release --project benchmarks/ActualLab.Kvasar.Benchmarks -- \
     --n 100000 --value sweep --threads 8 --lookups 500000 --engines both
 ```
-Args: `--n` key count, `--value <bytes|sweep>` (sweep = 128/1024/4096), `--threads` lookup threads,
-`--lookups` total random lookups, `--engines kvasar|sqlite|both`, `--pagesize <bytes>` (Kvasar page
-size, default 4096). Keys are 50 bytes; values random.
+Args: `--scenario sweep|chat` (default `sweep`), `--n` key count, `--value <bytes|sweep>`
+(sweep = 128/1024/4096), `--threads` lookup threads, `--lookups` total random lookups,
+`--engines kvasar|sqlite|both`, `--pagesize <bytes>` (Kvasar page size, default 4096).
+Keys are 50 bytes; values random. `--scenario chat` runs the cold-start scenario below and ignores
+the sweep's sizing args.
 
 > Run it on a quiesced machine. A concurrent `dotnet test` inflated every engine's numbers by
 > 20–60% in one run — SQLCipher's included, which is how the contamination was spotted.
@@ -67,6 +69,71 @@ trivially cheap — but it defers the work Kvasar has already done, which is why
 - **On-disk size.** Smaller than SQLCipher for small values. At 4 KB with 4 KB pages it is ~1.75×
   larger, because a value ≥ the page can't stay single-page and rounds up to a multi-page run;
   **16 KB pages cut that to 564 MB (−31%)**, close to SQLite's 468 MB.
+
+## ActualChat cold start (`--scenario chat`)
+
+The sweep measures the engines in isolation. This scenario measures what the app actually does at
+launch: a phone opens its ~25 MB client cache and speculatively executes the compute methods that
+render the UI, which hammers the cache in a short burst.
+
+**Harness.** Every engine runs behind the same port of ActualChat's `BatchingKvas`
+(`benchmarks/.../BatchingKvasHarness.cs`): a 256-entry LRU read cache, a `BatchProcessor` reader
+(batches of ≤64 keys, ≤4 workers, one `GetMany` per batch), and a single `LazyWriter`
+(250 ms debounce, 64-item flush → one `SetMany`). The SQLite side mirrors `DbHelpers.FindMany` —
+one `where Key in (select e.value from json_each(?) e)` query per call, one connection per reader
+worker — and stays synchronous, as it ships. Kvasar uses `PageCacheBytes = 16 MB`, a phone-sized
+budget deliberately *below* the dataset, so this is a genuine mixed hit/miss workload (the sweep
+uses 64 MB).
+
+**Dataset** (fixed seed, sized from a 25 MB byte budget rather than hardcoded counts): 80% of the
+bytes are chat tiles, 20% misc values.
+
+```
+Dataset: 25.0 MB in 39,800 entries (tiles 20.0 MB = 80.0 %, misc 5.0 MB = 20.0 %)
+  Tiles: 6,239 over 48 chats [L5: 3,793 (60.8 %), L20: 1,814 (29.1 %), L80: 632 (10.1 %)],
+         105,805 chat entries, 50-byte keys
+  Tile size: mean 3.08 KB, median 1.03 KB, p99 15.52 KB, max 18.65 KB
+  Message text: mean 66.0 chars (log-normal, median 40, sigma 1.0), +120 B/entry overhead
+  Misc: 33,561 entries, 49-byte keys, 100-byte mean value
+```
+
+Tiles follow the reader's `Long5To80` stack (layers 5/20/80, weighted 60/30/10 by count); keys look
+like `ChatEntryReader.GetTile:{chatId}:{layer}:{start}`.
+
+**Measured operation.** Populate, close, then time from a cold open: 8 app threads issue 800 logical
+`Get`s (400 tiles + 400 misc, 20% of the keys taking 80% of the reads), 10% of reads also `Set` a
+fresh same-size value, then flush the writer. Every row is the median of 5 cold starts.
+
+Machine: 32 logical cores, .NET 10, Windows. Lower is better everywhere.
+
+| Engine | Read path | DB MB | **TOTAL ms** | Open | Read | Flush | Backend calls | keys/op | p50 µs | p99 µs |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| SQLCipher | BatchingKvas | 32.4 | **44.5** | 1.3 | 34.4 | 8.7 | 272 | 2.92 | 279 | 1,012 |
+| **Kvasar (AES-GCM)** | BatchingKvas | 31.3 | **12.4** | 4.5 | 3.9 | 3.7 | 566 | 1.40 | 29.7 | 128 |
+| **Kvasar (AES-GCM)** | direct | 31.3 | **10.3** | 4.1 | 3.1 | 2.9 | 800 | 1.00 | 24.1 | 120 |
+| Kvasar (no-enc) | BatchingKvas | 31.2 | 11.0 | 3.8 | 4.5 | 2.6 | 572 | 1.39 | 33.5 | 144 |
+| Kvasar (no-enc) | direct | 31.2 | 8.7 | 2.7 | 2.7 | 3.2 | 800 | 1.00 | 19.1 | 94.4 |
+
+`direct` = no read cache and no read batching (app threads call `Get` per key); writes still go
+through the same `LazyWriter`, because batching genuinely helps Kvasar *writes* — a single-record
+`Set` seals the tail page, while a 64-item `SetMany` amortizes that away.
+
+### Takeaways
+
+- **Cold start is ~3.6× faster** (44.5 → 12.4 ms) with the identical harness, and ~4.3× faster with
+  the read path removed. Both the read burst (34.4 → 3.9 ms) and the write flush (8.7 → 3.7 ms)
+  improve; only bare `Open` is slower (1.3 → 4.5 ms), because Kvasar loads its index up front
+  instead of deferring the work.
+- **BatchingKvas is dead weight in front of Kvasar.** Removing the read cache and the batch
+  processor cut the read burst 3.9 → 3.1 ms (−21%) and p50 29.7 → 24.1 µs, despite tripling the
+  backend call count (566 → 800). A channel hop plus a `TaskCompletionSource` per key plus worker
+  dispatch costs more than the read it is amortizing, and Kvasar's own page cache already makes the
+  256-entry LRU redundant.
+- **Read batching barely engages at this concurrency** — 1.40 keys/call for Kvasar vs 2.92 for
+  SQLCipher. Batches only form while a worker is busy, and Kvasar's workers are never busy long
+  enough. Batching is a workaround for a slow backend.
+- **The 256-entry LRU is near-useless on a cold start** (0.7% hit rate): `BatchingKvas` populates
+  the read cache on `Set` only, so at launch it can only hit keys the session has already written.
 
 ## Tune `PageSize` to the value size
 

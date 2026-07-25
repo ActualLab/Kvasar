@@ -1,9 +1,14 @@
 using System.Collections.Concurrent;
 using System.Text;
+using System.Text.Json;
 using ActualLab.Kvasar;
+using System.Text.Json.Serialization;
 using SQLite;
 
 namespace ActualLab.Kvasar.Benchmarks;
+
+[JsonSerializable(typeof(string[]))]
+internal sealed partial class BenchJsonContext : JsonSerializerContext;
 
 /// <summary>A key-value engine under test. Keys/values are raw bytes; the same data feeds every engine.</summary>
 public interface IKvEngine : IAsyncDisposable
@@ -14,12 +19,19 @@ public interface IKvEngine : IAsyncDisposable
     public ValueTask WriteBatch(IReadOnlyList<(byte[] Key, byte[] Value)> batch);
     public ValueTask FlushDurable();                      // persist everything (fsync / checkpoint)
     public ValueTask<byte[]?> Get(byte[] key);
+    public ValueTask<byte[]?[]> GetMany(IReadOnlyList<byte[]> keys); // one batched backend call, results by index
     public ValueTask<long> ScanAll();                     // enumerate ALL entries (the cache's startup hydration); returns count
     public long FileBytes { get; }
     public string? IndexHintFile { get; }                 // .kidx path for Kvasar (deletable to force rebuild); null otherwise
 }
 
-public sealed class KvasarEngine(string basePath, byte[] key, bool encrypt, int pageSize = 4096) : IKvEngine
+public sealed class KvasarEngine(
+    string basePath,
+    byte[] key,
+    bool encrypt,
+    int pageSize = 4096,
+    long pageCacheBytes = 64L * 1024 * 1024
+) : IKvEngine
 {
     private KvasarStore _store = null!;
 
@@ -32,7 +44,7 @@ public sealed class KvasarEngine(string basePath, byte[] key, bool encrypt, int 
             EncryptionKey = key,
             DisableEncryption = !encrypt,
             PageSize = pageSize,
-            PageCacheBytes = 64L * 1024 * 1024,
+            PageCacheBytes = pageCacheBytes,
             SegmentBytes = 16 * 1024 * 1024,
         });
 
@@ -53,6 +65,18 @@ public sealed class KvasarEngine(string basePath, byte[] key, bool encrypt, int 
     {
         var v = await _store.Get(key);
         return v?.ToArray();
+    }
+
+    public async ValueTask<byte[]?[]> GetMany(IReadOnlyList<byte[]> keys)
+    {
+        var memoryKeys = new ReadOnlyMemory<byte>[keys.Count];
+        for (var i = 0; i < keys.Count; i++)
+            memoryKeys[i] = keys[i];
+        var values = await _store.GetMany(memoryKeys);
+        var result = new byte[]?[values.Length];
+        for (var i = 0; i < values.Length; i++)
+            result[i] = values[i]?.ToArray();
+        return result;
     }
 
     public async ValueTask<long> ScanAll()
@@ -84,7 +108,10 @@ public sealed class SqliteEngine(string dbPath, byte[] key) : IKvEngine
 {
     private const SQLiteOpenFlags Flags = SQLiteOpenFlags.ReadWrite | SQLiteOpenFlags.Create | SQLiteOpenFlags.NoMutex;
 
+    private const string FindManySql = "select Key, Value from items where Key in (select e.value from json_each(?) e)";
+
     private readonly ConcurrentBag<SQLiteConnection> _all = new();
+    private readonly ConcurrentBag<SQLiteConnection> _pool = new();
     private SQLiteConnection _writer = null!;
     private ThreadLocal<SQLiteConnection> _readers = null!;
 
@@ -103,6 +130,7 @@ public sealed class SqliteEngine(string dbPath, byte[] key) : IKvEngine
             try { c.Close(); } catch { /* ignore */ }
         }
         _all.Clear();
+        _pool.Clear();
         _readers?.Dispose();
         GC.Collect();
         GC.WaitForPendingFinalizers();
@@ -128,6 +156,33 @@ public sealed class SqliteEngine(string dbPath, byte[] key) : IKvEngine
     {
         var v = _readers.Value!.ExecuteScalar<byte[]>("select Value from items where Key = ?", Encoding.UTF8.GetString(key));
         return new ValueTask<byte[]?>(v);
+    }
+
+    public ValueTask<byte[]?[]> GetMany(IReadOnlyList<byte[]> keys)
+    {
+        // Mirrors ActualChat's DbHelpers.FindMany: one batched query per call, keys passed as a JSON array,
+        // and a connection rented per reader worker.
+        var result = new byte[]?[keys.Count];
+        if (keys.Count == 0)
+            return new ValueTask<byte[]?[]>(result);
+
+        var texts = new string[keys.Count];
+        var indexes = new Dictionary<string, int>(keys.Count, StringComparer.Ordinal);
+        for (var i = 0; i < keys.Count; i++) {
+            texts[i] = Encoding.UTF8.GetString(keys[i]);
+            indexes[texts[i]] = i;
+        }
+        var connection = _pool.TryTake(out var c) ? c : NewConnection();
+        try {
+            var keysJson = JsonSerializer.Serialize(texts, BenchJsonContext.Default.StringArray);
+            foreach (var row in connection.Query<KvRow>(FindManySql, keysJson))
+                if (indexes.TryGetValue(row.Key, out var i))
+                    result[i] = row.Value;
+        }
+        finally {
+            _pool.Add(connection);
+        }
+        return new ValueTask<byte[]?[]>(result);
     }
 
     public ValueTask<long> ScanAll()
