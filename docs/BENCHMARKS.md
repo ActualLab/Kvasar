@@ -30,38 +30,41 @@ Kvasar uses AES-256-GCM (encrypted, like SQLCipher). Higher is better except ms 
 ### Value = 128 B (12.8 MB — fits the page cache, like the ~25 MB hot set)
 | Engine | Write k/s | File MB | Open ms | Startup ms* | Lookup k/s | p50 µs | p99 µs |
 |---|--:|--:|--:|--:|--:|--:|--:|
-| **Kvasar (AES-GCM)** | **328** | **19.3** | 28.9 | 169 | **7,270** | **0.8** | **1.6** |
-| Kvasar (no-enc) | 428 | 19.2 | 15.6 | 130 | 5,375 | 1.1 | 3.1 |
-| SQLCipher | 139 | 26.5 | 1.4 | **138** | 117 | 67.1 | 122 |
+| **Kvasar (AES-GCM)** | **399** | **19.3** | 28.4 | **121** | **8,653** | **0.7** | **1.3** |
+| Kvasar (no-enc) | 493 | 19.2 | 13.9 | 85 | 8,529 | 0.7 | 3.2 |
+| SQLCipher | 134 | 26.5 | 3.9 | 140 | 119 | 66.5 | 117 |
 
 ### Value = 1 KB (102 MB — exceeds the 64 MB cache)
 | Engine | Write k/s | File MB | Open ms | Startup ms* | Lookup k/s | p50 µs | p99 µs |
 |---|--:|--:|--:|--:|--:|--:|--:|
-| **Kvasar (AES-GCM)** | **86** | 141 | 16.4 | 1,521 | **400** | **10.4** | **42.6** |
-| Kvasar (no-enc) | 138 | 141 | 12.1 | 1,124 | 405 | 9.5 | 43.6 |
-| SQLCipher | 51 | 144 | 1.4 | **740** | 104 | 69.4 | 142 |
+| **Kvasar (AES-GCM)** | **233** | 141 | 16.0 | **185** | **386** | **10.9** | **43.0** |
+| Kvasar (no-enc) | 334 | 141 | 13.7 | 115 | 471 | 8.6 | 36.8 |
+| SQLCipher | 54 | 144 | 1.3 | 743 | 105 | 69.0 | 141 |
 
 ### Value = 4 KB (410 MB — far exceeds cache; value ≥ the default page size)
 | Engine | Write k/s | File MB | Open ms | Startup ms* | Lookup k/s | p50 µs | p99 µs |
 |---|--:|--:|--:|--:|--:|--:|--:|
-| Kvasar (AES-GCM), 4 KB pages | 24.7 | 822 | 16.8 | 3,220 | 132 | 30.5 | 89.2 |
-| **Kvasar (AES-GCM), 16 KB pages** | **72.3** | **564** | 36.5 | **2,264** | **157** | **21.0** | **82.8** |
-| Kvasar (no-enc), 16 KB pages | 84.6 | 563 | 17.0 | 1,799 | 164 | 18.7 | 73.1 |
-| SQLCipher | 21.7 | **468** | 1.4 | 2,924 | 72.7 | 103 | 183 |
+| Kvasar (AES-GCM), 4 KB pages | 77.9 | 822 | 40.5 | 649 | 137 | 29.8 | 81.7 |
+| **Kvasar (AES-GCM), 16 KB pages** | **122** | **564** | 35.4 | **318** | **171** | **20.0** | **63.7** |
+| Kvasar (no-enc), 16 KB pages | 168 | 563 | 21.4 | 209 | 182 | 16.8 | 59.2 |
+| SQLCipher | 19.8 | **468** | 1.4 | 2,498 | 75.0 | 101 | 172 |
 
 \* Startup ms = open + full `ListAllEntries`/`Scan` (the client cache's launch-time hydration).
 Open ms = just reopening the store (Kvasar: load `.kidx` + seed accounting; SQLite: open connection).
 
 ## Takeaways
 
-- **Point reads — Kvasar wins decisively.** ~**62×** faster when the hot data fits the page cache
+Kvasar wins every metric at every value size except bare `Open` (opening a SQLite connection is
+trivially cheap — but it defers the work Kvasar has already done, which is why Kvasar still wins
+*startup*) and on-disk size at 4 KB.
+
+- **Point reads — Kvasar wins decisively.** ~**73×** faster when the hot data fits the page cache
   (the target ~25 MB scenario), narrowing to ~2–4× when the dataset is many times the cache. Tail
-  latency is dramatically better (p99 1.6–89 µs vs SQLCipher's 122–183 µs) — one hash probe + one
+  latency is dramatically better (p99 1.3–64 µs vs SQLCipher's 117–172 µs) — one hash probe + one
   cached page decrypt + zero-copy slice vs. a B-tree descent through the SQLite VM.
-- **Batched writes — Kvasar wins 2.4–3.3×** (at a page size suited to the value size).
-- **Startup hydration.** Kvasar wins at 4 KB (2,264 vs 2,924 ms) but **loses at 128 B and 1 KB** —
-  see the async trade-off below. This regressed relative to the synchronous implementation.
-- **On-disk size.** Smaller than SQLCipher for small values. At 4 KB with 4 KB pages it was ~1.75×
+- **Batched writes — Kvasar wins 3.0–6.1×** (at a page size suited to the value size).
+- **Startup hydration — Kvasar wins 1.2× (128 B), 4.0× (1 KB), 7.8× (4 KB at 16 KB pages).**
+- **On-disk size.** Smaller than SQLCipher for small values. At 4 KB with 4 KB pages it is ~1.75×
   larger, because a value ≥ the page can't stay single-page and rounds up to a multi-page run;
   **16 KB pages cut that to 564 MB (−31%)**, close to SQLite's 468 MB.
 
@@ -72,11 +75,11 @@ on-disk bloat. At 4 KB values, moving from 4 KB to 16 KB pages:
 
 | 4 KB values, AES-GCM | 4 KB pages | 16 KB pages |
 |---|--:|--:|
-| Write k/s | 24.7 | **72.3** (2.9×) |
+| Write k/s | 77.9 | **122** (+56%) |
 | File MB | 822 | **564** (−31%) |
-| Startup ms | 3,220 | **2,264** (−30%) |
-| Lookup k/s | 132 | **157** (+19%) |
-| p50 µs | 30.5 | **21.0** (−31%) |
+| Startup ms | 649 | **318** (−51%) |
+| Lookup k/s | 137 | **171** (+25%) |
+| p50 µs | 29.8 | **20.0** (−33%) |
 
 Rule of thumb: **`PageSize` should comfortably exceed your typical value size**, so values stay
 single-page (zero-copy reads, no multi-page run) and each async I/O carries more payload.
@@ -91,23 +94,34 @@ cost is not free, and it is worth stating precisely:
   `async` methods; a cache-resident single-page record returns an already-completed `ValueTask` with
   no state machine and no allocation. At 128 B: lookups went **6,774 → 7,270 k/s** and **p99 halved
   (2.9 → 1.6 µs)** versus the synchronous implementation.
-- **Bulk I/O-bound paths regressed**, and the regression tracks **page-I/O count**, not record count
-  (~3,200 page I/Os at 128 B vs ~100,000 at 4 KB). Working the deltas out per operation, both the
-  write and the scan paths land at roughly **~20 µs of extra cost per page I/O** — consistent across
-  two independent paths, which is about what Windows overlapped-I/O completion costs versus a
-  synchronous write into the OS cache.
+- **Bulk I/O-bound paths regressed at first**, and the regression tracked **page-I/O count**, not
+  record count (~3,200 page I/Os at 128 B vs ~100,000 at 4 KB). Working the deltas out per operation,
+  both the write and the scan paths landed at roughly **~20 µs of extra cost per page I/O** —
+  consistent across two independent paths, which is about what Windows overlapped-I/O completion
+  costs versus a synchronous write into the OS cache. Writes fell 52–57% at 1 KB/4 KB and startup
+  hydration roughly tripled.
+
+The fix was not to undo the async conversion but to stop paying that fixed cost per 4 KiB page:
+
+- **Write-behind** — appends stage into a ~1 MiB buffer, so a 64-record batch at 4 KiB values is one
+  `WriteAsync` instead of 64. Safe because the store's seal-before-publish protocol already flushes
+  before publishing a locator, so no reachable locator can point at an unwritten page.
+- **Readahead** — sequential walks pull ~1 MiB of consecutive pages per read.
+- **Log-order scanning** — `Scan` sorts the index snapshot by `(SegmentId, Offset)`. The snapshot is
+  in *hash* order, which made a full scan a storm of random page faults; scan order is unspecified by
+  SPEC §4, so this is free, and it is what makes readahead effective.
 
 | vs. the old synchronous implementation | Write k/s | Startup ms |
 |---|--:|--:|
-| 128 B | 356 → 328 (−8%) | 97 → 169 |
-| 1 KB | 178 → 86 (−52%) | 597 → 1,521 |
-| 4 KB, 4 KB pages | 58 → 24.7 (−57%) | 1,157 → 3,220 |
-| 4 KB, **16 KB pages** | 58 → **72.3 (+25%)** | 1,157 → 2,264 |
+| 128 B | 356 → **399** (+12%) | 97 → 121 |
+| 1 KB | 178 → **233** (+31%) | 597 → **185** (3.2× better) |
+| 4 KB, 4 KB pages | 58 → **77.9** (+34%) | 1,157 → **649** (1.8× better) |
+| 4 KB, **16 KB pages** | 58 → **122** (2.1×) | 1,157 → **318** (3.6× better) |
 
-The last row is the point: **larger pages amortize the fixed per-I/O cost**, and at 16 KB pages the
-async build *beats* the old synchronous one on writes. Where bulk-write throughput at small page
-sizes matters more than non-blocking behavior, the remaining lever is coalescing consecutive page
-appends into a single `WriteAsync` (a write-behind buffer) — not yet implemented.
+Net: the async build now **beats the synchronous one on writes at every value size**, and on startup
+everywhere except 128 B (121 vs 97 ms), while keeping the warm read path allocation-free — 128 B
+lookups went 6,774 → 8,653 k/s and p99 2.9 → 1.3 µs. Non-blocking I/O turned out to cost nothing
+once the per-operation overhead was amortized instead of paid per page.
 
 ## Earlier fixes worth keeping on record
 
