@@ -229,6 +229,40 @@ and cancellable, and the shape of that conversion is load-bearing:
 - **`Stats` stays synchronous** — a best-effort, lock-free snapshot; the numbers are advisory
   (compaction/diagnostics) and never used for correctness.
 
+### Deferred flush (`KvasarOptions.FlushDelay`, default 0.5 s)
+
+This absorbs the one part of ActualChat's `BatchingKvas` worth keeping — its `LazyWriter` — and does it
+better, because the store can delay *durability* without delaying *visibility*:
+
+- `Set` appends and publishes to the in-RAM index synchronously, so the value is readable by every
+  reader the instant it returns. Only sealing and the disk write are deferred, by up to `FlushDelay`.
+  (A `LazyWriter` above the store can't manage this: it delays the write itself, so a key evicted from
+  its 256-entry cache before the flush reads back *stale*.)
+- The accepted failure mode is exactly and only this: **a crash loses writes newer than the last
+  flush.** Anything already flushed survives, and the store always reopens consistent.
+- Deferring the *seal* is what makes an unbatched `Set` cheap. Sealing per call pads a whole page per
+  record — measured at ~21× amplification (16 MB of data → 340 MB on disk).
+- Mandatory flush points that must never be deferred: before `RemoveSegment` in compaction (else records
+  copied into the new segment die with the deleted source — real loss, not staleness), `WriteCheckpoint`,
+  `Clear`, and `DisposeAsync`.
+- Ordering rule: the log must never be *less* durable than the index. `.kidx` may lag freely — it's a
+  hint replayed from the HWM — but if it ever led, it would point at records that don't exist.
+
+Two hazards this introduced, both caught by the test suite and worth remembering:
+
+1. **Tail visibility.** Publishing into the unsealed tail means readers slice a buffer the writer is
+   still appending to. Individual bytes are stable (the writer only appends past `Fill`, and `SealTail`
+   installs a *new* buffer), but `(buffer, fill, pageId)` must be read as one unit — reading them
+   separately lets a concurrent seal swap the buffer mid-read, and the reader then slices the fresh
+   empty one and reports a miss for a key that exists. Fixed by publishing an immutable `TailSnapshot`
+   through a single volatile field. In durable mode this was unreachable, because the seal always
+   preceded the publish.
+2. **Page-id reuse ⇒ nonce reuse.** A crash can now lose whole unwritten pages, so `PageCount` comes
+   back lower and appends would re-encrypt different data under an already-used `(fileSalt, pageId)`
+   nonce. Recovery therefore rolls to a fresh segment (new random salt ⇒ disjoint nonce space) whenever
+   it can't prove the previous run closed cleanly. A graceful close leaves a `<base>.clean` marker, so
+   the common path doesn't strand a segment per launch.
+
 ### Amortizing per-I/O cost
 
 Async file I/O has a materially higher fixed cost per operation than a synchronous write into the OS

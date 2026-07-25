@@ -30,6 +30,10 @@ public sealed record KvasarOptions
     public IndexEncryption IndexEncryption { get; init; } = IndexEncryption.Auto;
 
     public long SegmentBytes { get; init; } = 16 * 1024 * 1024;
+    // Defers sealing and the disk write by up to this long, so writes pack densely and go out in one I/O;
+    // a crash then loses writes newer than the last flush. Zero makes every Set durable before it returns.
+    // Values stay visible to readers immediately either way: only durability is delayed, never visibility.
+    public TimeSpan FlushDelay { get; init; } = TimeSpan.FromSeconds(0.5);
     public double CompactionDeadRatio { get; init; } = 0.5;
     // Reclaimable bytes, not segment size: don't compact below this.
     public long CompactionMinBytes { get; init; } = 4 * 1024 * 1024;

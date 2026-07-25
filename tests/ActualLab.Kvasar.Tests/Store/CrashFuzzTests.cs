@@ -428,6 +428,9 @@ public sealed class CrashFuzzTests : IDisposable
         DisableEncryption = !encrypt,
         PageSize = PageSize,
         SegmentBytes = SegmentBytes,
+        // Durable mode: these tests assert that flushed writes survive an abort, which is only a guarantee
+        // when Set is durable before it returns. Deferred flushing has its own suite in FlushDelayTests.
+        FlushDelay = TimeSpan.Zero,
     };
 
     private static string BaseIn(string dir) => Path.Combine(dir, StoreName);

@@ -15,11 +15,19 @@ public readonly record struct RecordRead(bool IsFound, RecordView View, int Tota
 /// </summary>
 public sealed class SegmentSet : IDisposable
 {
+    // The unsealed tail, published as one immutable triple. Deferred-flush mode publishes locators into the
+    // tail, so a reader must see a consistent (buffer, fill, pageId) set: reading those fields separately
+    // lets a concurrent seal swap the buffer between them, and the reader then slices the fresh empty one
+    // and reports a miss for a key that exists. Bytes below Fill are never rewritten, and SealTail installs
+    // a new buffer rather than reusing this one, so a snapshot stays valid for as long as anyone holds it.
+    private sealed record TailSnapshot(byte[] Buffer, int Fill, long PageId);
+
     private sealed class SegState
     {
         public required PagedSegment Segment;
         public long LiveBytes;
         public long DeadBytes;
+        public volatile TailSnapshot? Tail; // non-null only while this is the active segment
     }
 
     private readonly string _basePath;
@@ -35,11 +43,14 @@ public sealed class SegmentSet : IDisposable
 
     private PagedSegment _active = null!;
     private SegState _activeState = null!;
-    private byte[] _tail;
+    // volatile: readers may slice the unsealed tail (deferred-flush mode publishes into it), and SealTail
+    // swaps in a fresh array rather than reusing this one, so a reader must not cache a stale reference.
+    private volatile byte[] _tail;
     private int _tailFill;
     private bool _disposed;
 
     public uint ActiveSegmentId => _active.SegmentId;
+    public long ActiveSegmentPageCount => _active.PageCount;
     public long ActiveLogicalHwm => (long)_active.PageCount * _pageSize + _tailFill;
     // ~1 MiB of readahead per I/O: enough to amortize the per-operation cost of async I/O over a
     // sequential walk without pinning much of the page-cache budget.
@@ -111,6 +122,16 @@ public sealed class SegmentSet : IDisposable
         return TryReadAt(st, loc.Offset, cancellationToken);
     }
 
+    // Abandons the current active segment and starts a fresh one. Deferred-flush mode calls this on open:
+    // a crash there can lose whole unwritten pages, so PageCount comes back lower and appends would reuse
+    // those page ids — and the GCM nonce is a pure function of (fileSalt, pageId). A new segment gets a new
+    // random salt, so its nonce space is disjoint and reuse is structurally impossible.
+    public async ValueTask RollToNewSegment(CancellationToken cancellationToken = default)
+    {
+        await SealTail(cancellationToken).ConfigureAwait(false);
+        await StartNewSegment(cancellationToken).ConfigureAwait(false);
+    }
+
     public ValueTask Prefetch(uint segmentId, long fromPageId, int maxPages, CancellationToken cancellationToken = default)
         => _states.TryGetValue(segmentId, out var st)
             ? st.Segment.Prefetch(fromPageId, maxPages, cancellationToken)
@@ -125,14 +146,15 @@ public sealed class SegmentSet : IDisposable
         if (!_states.TryGetValue(loc.SegmentId, out var st))
             return false;
 
+        var tail = st.Tail; // one read: everything below must agree on the same tail generation
         long offset = loc.Offset;
-        var len = LogicalLength(st);
+        var len = LogicalLength(st, tail);
         if (offset >= len)
             return false;
 
         var pageId = offset / _pageSize;
         var inPage = (int)(offset % _pageSize);
-        if (!TryGetLogicalPageCached(st, pageId, out var firstPage))
+        if (!TryGetLogicalPageCached(st, tail, pageId, out var firstPage))
             return false;
 
         var span = firstPage.Span;
@@ -155,13 +177,14 @@ public sealed class SegmentSet : IDisposable
 
     private async ValueTask<RecordRead> TryReadAt(SegState st, long offset, CancellationToken cancellationToken)
     {
-        var len = LogicalLength(st);
+        var tail = st.Tail; // one read: everything below must agree on the same tail generation
+        var len = LogicalLength(st, tail);
         if (offset < 0 || offset >= len)
             return default;
 
         var pageId = offset / _pageSize;
         var inPage = (int)(offset % _pageSize);
-        var firstPage = await GetLogicalPage(st, pageId, cancellationToken).ConfigureAwait(false);
+        var firstPage = await GetLogicalPage(st, tail, pageId, cancellationToken).ConfigureAwait(false);
         int totalLen;
         {
             var span = firstPage.Span;
@@ -190,7 +213,7 @@ public sealed class SegmentSet : IDisposable
         var pid = pageId;
         var start = inPage;
         while (copied < totalLen) {
-            var page = await GetLogicalPage(st, pid, cancellationToken).ConfigureAwait(false);
+            var page = await GetLogicalPage(st, tail, pid, cancellationToken).ConfigureAwait(false);
             var n = CopyPart(page, start, buf, copied, totalLen);
             if (n < 0)
                 return default;
@@ -320,6 +343,7 @@ public sealed class SegmentSet : IDisposable
         var offset = (long)_active.PageCount * _pageSize + _tailFill;
         RecordCodec.Encode(_tail.AsSpan(_tailFill), flags, valType, key.Span, value.Span, isTombstone);
         _tailFill += recordLength;
+        PublishTail();
         _activeState.LiveBytes += recordLength;
         return new Locator(_active.SegmentId, checked((uint)offset));
     }
@@ -349,6 +373,7 @@ public sealed class SegmentSet : IDisposable
             else {
                 _tailFill = 0;
             }
+            PublishTail();
         }
         finally {
             ArrayPool<byte>.Shared.Return(buf);
@@ -365,6 +390,7 @@ public sealed class SegmentSet : IDisposable
         await _active.AppendPage(_tail, cancellationToken).ConfigureAwait(false);
         _tail = new byte[_pageSize]; // fresh buffer so any handed-out zero-copy slice stays immutable
         _tailFill = 0;
+        PublishTail();
     }
 
     private async ValueTask RollIfNeeded(CancellationToken cancellationToken)
@@ -383,9 +409,12 @@ public sealed class SegmentSet : IDisposable
             .ConfigureAwait(false);
         var st = new SegState { Segment = seg };
         _states[newId] = st;
+        var previous = _activeState;
         _active = seg;
         _activeState = st;
         _tailFill = 0;
+        PublishTail();
+        previous.Tail = null; // the old segment is sealed now; its pages come from the cache
     }
 
     private async ValueTask Discover(CancellationToken cancellationToken)
@@ -402,6 +431,7 @@ public sealed class SegmentSet : IDisposable
             _states[firstId] = st;
             _active = seg;
             _activeState = st;
+            PublishTail();
             return;
         }
         ids.Sort();
@@ -414,6 +444,7 @@ public sealed class SegmentSet : IDisposable
             }
             _activeState = _states[ids[^1]];
             _active = _activeState.Segment;
+            PublishTail();
             // Validate the key with a single-page decrypt instead of scanning the whole log (§6.5): a
             // wrong key / tampered page 0 throws here → the caller wipes & recreates. Accounting is
             // seeded later from the loaded index (SeedAccountingFromIndex), keeping open O(index).
@@ -456,22 +487,32 @@ public sealed class SegmentSet : IDisposable
         return ids;
     }
 
-    private long LogicalLength(SegState st)
-        => (long)st.Segment.PageCount * _pageSize + (ReferenceEquals(st, _activeState) ? _tailFill : 0);
+    // All three helpers below take the caller's single snapshot read, so one operation can't observe the
+    // tail from two different generations.
+    private long LogicalLength(SegState st) => LogicalLength(st, st.Tail);
 
-    private ValueTask<ReadOnlyMemory<byte>> GetLogicalPage(SegState st, long pageId, CancellationToken cancellationToken)
-        => ReferenceEquals(st, _activeState) && pageId == _active.PageCount
-            ? new ValueTask<ReadOnlyMemory<byte>>(_tail.AsMemory(0, _tailFill))
+    private long LogicalLength(SegState st, TailSnapshot? tail)
+        => tail is { } t ? t.PageId * _pageSize + t.Fill : (long)st.Segment.PageCount * _pageSize;
+
+    private static ValueTask<ReadOnlyMemory<byte>> GetLogicalPage(
+        SegState st, TailSnapshot? tail, long pageId, CancellationToken cancellationToken)
+        => tail is { } t && t.PageId == pageId
+            ? new ValueTask<ReadOnlyMemory<byte>>(t.Buffer.AsMemory(0, t.Fill))
             : st.Segment.GetPage(pageId, cancellationToken);
 
-    private bool TryGetLogicalPageCached(SegState st, long pageId, out ReadOnlyMemory<byte> page)
+    private static bool TryGetLogicalPageCached(
+        SegState st, TailSnapshot? tail, long pageId, out ReadOnlyMemory<byte> page)
     {
-        if (ReferenceEquals(st, _activeState) && pageId == _active.PageCount) {
-            page = _tail.AsMemory(0, _tailFill);
+        if (tail is { } t && t.PageId == pageId) {
+            page = t.Buffer.AsMemory(0, t.Fill);
             return true;
         }
         return st.Segment.TryGetCachedPage(pageId, out page);
     }
+
+    // Writer-only: republishes the tail so readers pick up the newly appended bytes.
+    private void PublishTail()
+        => _activeState.Tail = new TailSnapshot(_tail, _tailFill, _active.PageCount);
 
     private static int CopyPart(ReadOnlyMemory<byte> page, int start, byte[] destination, int copied, int totalLen)
     {

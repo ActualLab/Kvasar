@@ -29,6 +29,10 @@ public sealed class KvasarStore : IAsyncDisposable
     private FileStream? _kidxDelta;   // held open across the store's life so each delta is one buffered write, not a file open
     private long _deltaCount;
     private bool _checkpointDue;
+    private readonly TimeSpan _flushDelay;
+    private readonly CancellationTokenSource _disposeCts = new();
+    private Task? _flushLoop;
+    private int _dirty;
     private bool _disposed;
 
     public KvasarStats Stats
@@ -66,6 +70,7 @@ public sealed class KvasarStore : IAsyncDisposable
             _ => _hasher.IsKeyed,
         };
 
+        _flushDelay = options.FlushDelay;
         _lock = storeLock;
     }
 
@@ -182,8 +187,7 @@ public sealed class KvasarStore : IAsyncDisposable
         try {
             ObjectDisposedException.ThrowIf(_disposed, this);
             var appended = await AppendOne(key, value, cancellationToken).ConfigureAwait(false);
-            // Seal the tail so the published locator points at an immutable page.
-            await _segments.Flush(false, cancellationToken).ConfigureAwait(false);
+            await SealOrDefer(cancellationToken).ConfigureAwait(false);
             await Publish(key, appended, cancellationToken).ConfigureAwait(false);
             await MaybeCheckpoint(cancellationToken).ConfigureAwait(false);
         }
@@ -215,7 +219,7 @@ public sealed class KvasarStore : IAsyncDisposable
                 var appended = await AppendOne(key, value, cancellationToken).ConfigureAwait(false);
                 pending.Add((key, appended));
             }
-            await _segments.Flush(false, cancellationToken).ConfigureAwait(false); // seal once for the whole batch
+            await SealOrDefer(cancellationToken).ConfigureAwait(false); // seal once for the whole batch
             foreach (var p in pending)
                 await Publish(p.Key, p.Appended, cancellationToken).ConfigureAwait(false);
             await MaybeCheckpoint(cancellationToken).ConfigureAwait(false);
@@ -247,7 +251,12 @@ public sealed class KvasarStore : IAsyncDisposable
         }
     }
 
-    public async ValueTask Flush(bool fsync = false, CancellationToken cancellationToken = default)
+    // No CancellationToken: a flush can't be meaningfully abandoned partway, and the returned Task is the
+    // caller's signal that everything written so far is on disk. fsync stays opt-in via the overload.
+    public Task Flush()
+        => Flush(false, CancellationToken.None).AsTask();
+
+    public async ValueTask Flush(bool fsync, CancellationToken cancellationToken = default)
     {
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try {
@@ -279,6 +288,17 @@ public sealed class KvasarStore : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        // Stop the background flusher before taking the lock, so it can't be mid-flush while we tear down.
+        await _disposeCts.CancelAsync().ConfigureAwait(false);
+        if (_flushLoop is { } flushLoop) {
+            try {
+                await flushLoop.ConfigureAwait(false);
+            }
+            catch {
+                // Already best-effort; dispose still has to run.
+            }
+        }
+
         await _writeLock.WaitAsync().ConfigureAwait(false);
         try {
             if (_disposed)
@@ -288,6 +308,8 @@ public sealed class KvasarStore : IAsyncDisposable
                 await _segments.Flush(true).ConfigureAwait(false);
                 await WriteCheckpoint(CancellationToken.None).ConfigureAwait(false);
                 await DisposeDeltaStream().ConfigureAwait(false);
+                // Everything is on disk, so the next open can safely append to the active segment.
+                WriteCleanMarker();
             }
             catch {
                 // Best-effort flush on dispose; a regenerable cache tolerates losing the last writes.
@@ -341,6 +363,17 @@ public sealed class KvasarStore : IAsyncDisposable
         _index = new HashIndex();
         await LoadIndex(cancellationToken).ConfigureAwait(false);
         OpenDeltaStream();
+        if (_flushDelay > TimeSpan.Zero) {
+            // See RollToNewSegment: deferred flushing can lose whole unwritten pages on a crash, which
+            // would otherwise let the next run re-encrypt different data under an already-used page nonce.
+            // A graceful close flushes everything and leaves a marker, so only an unclean shutdown needs
+            // the roll — otherwise every launch would strand another segment. An empty active segment has
+            // no pages to collide with either.
+            var closedCleanly = TryConsumeCleanMarker();
+            if (!closedCleanly && _segments.ActiveSegmentPageCount > 0)
+                await _segments.RollToNewSegment(cancellationToken).ConfigureAwait(false);
+            _flushLoop = Task.Run(RunFlushLoop, CancellationToken.None);
+        }
     }
 
     private async ValueTask<ReadOnlyMemory<byte>?> GetSlow(
@@ -434,6 +467,70 @@ public sealed class KvasarStore : IAsyncDisposable
         }
         catch {
             // .kidx is a rebuildable hint; a failed lazy delta is non-fatal.
+        }
+    }
+
+    // Present only between a graceful close and the next open, so its absence means "the last run may have
+    // died with unflushed pages". Deleted on open so a crash during this session leaves it absent.
+    private string CleanMarkerPath => _options.BasePath + ".clean";
+
+    private bool TryConsumeCleanMarker()
+    {
+        try {
+            if (!File.Exists(CleanMarkerPath))
+                return false;
+            File.Delete(CleanMarkerPath);
+            return true;
+        }
+        catch {
+            return false; // can't prove a clean shutdown ⇒ assume the unsafe case
+        }
+    }
+
+    private void WriteCleanMarker()
+    {
+        try {
+            File.WriteAllBytes(CleanMarkerPath, []);
+        }
+        catch {
+            // Best-effort: a missing marker only costs one extra segment on the next open.
+        }
+    }
+
+    private ValueTask SealOrDefer(CancellationToken cancellationToken)
+    {
+        // Durable mode seals the tail before publishing, so a published locator always points at an
+        // immutable page. Deferred mode publishes into the *unsealed* tail instead, which readers already
+        // handle: the writer only ever appends past _tailFill, and SealTail swaps in a fresh array rather
+        // than rewriting this one, so bytes under a handed-out slice never change. Skipping the seal is
+        // what makes an unbatched Set cheap — sealing per call pads a whole page per record.
+        if (_flushDelay <= TimeSpan.Zero)
+            return _segments.Flush(false, cancellationToken);
+        Volatile.Write(ref _dirty, 1);
+        return default;
+    }
+
+    private async Task RunFlushLoop()
+    {
+        // Bounds how long a write can sit unflushed. Losing writes newer than the last flush is the
+        // accepted cost of FlushDelay; losing anything older would not be, so failures only retry.
+        try {
+            while (!_disposeCts.IsCancellationRequested) {
+                await Task.Delay(_flushDelay, _disposeCts.Token).ConfigureAwait(false);
+                if (Interlocked.Exchange(ref _dirty, 0) == 0)
+                    continue;
+                try {
+                    await Flush(false, _disposeCts.Token).ConfigureAwait(false);
+                }
+                catch (Exception e) when (e is not OperationCanceledException) {
+                    // Best-effort: a failed background flush costs durability, never consistency, so the
+                    // next tick simply tries again.
+                    Volatile.Write(ref _dirty, 1);
+                }
+            }
+        }
+        catch (OperationCanceledException) {
+            // Disposed.
         }
     }
 
@@ -649,7 +746,7 @@ public sealed class KvasarStore : IAsyncDisposable
             return;
         foreach (var file in Directory.EnumerateFiles(dir, name + ".*")) {
             var ext = Path.GetExtension(file);
-            if (ext is ".klog" or ".kidx" || file.EndsWith(".kidx.tmp", StringComparison.Ordinal)
+            if (ext is ".klog" or ".kidx" or ".clean" || file.EndsWith(".kidx.tmp", StringComparison.Ordinal)
                     || Path.GetFileName(file).EndsWith(".klog", StringComparison.Ordinal)) {
                 try { File.Delete(file); }
                 catch { /* best-effort */ }

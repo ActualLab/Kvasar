@@ -111,7 +111,8 @@ public sealed class KvasarStore : IAsyncDisposable
     public ValueTask Clear(CancellationToken ct = default);              // wipe everything (fast reset)
 
     // --- lifecycle ---
-    public ValueTask Flush(bool fsync = false, CancellationToken ct = default);
+    public Task Flush();                                                 // completes when durable; no ct
+    public ValueTask Flush(bool fsync, CancellationToken ct = default);
     public ValueTask Compact(CancellationToken ct = default);
     public ValueTask DisposeAsync();
 
@@ -127,6 +128,7 @@ public sealed record KvasarOptions
     public long PageCacheBytes { get; init; } = 16 * 1024 * 1024;        // decrypted-page LRU budget
     public int  MaxValueBytes { get; init; } = 8 * 1024 * 1024;
     public int  MaxInlineValueBytes { get; init; } = 0;                 // 0 => PageSize; ≤ this stays single-page (zero-copy, §5.2)
+    public TimeSpan FlushDelay { get; init; } = TimeSpan.FromSeconds(0.5); // 0 => every Set durable on return
     // Pluggable crypto — secure defaults (§5.3)
     public IKeyHasher      Hasher { get; init; } = KeyHashers.SipHash24;      // keyed PRF (default)
     public IKeyDerivation  Kdf    { get; init; } = KeyDerivations.HkdfSha256; // master key -> subkeys

@@ -24,6 +24,9 @@ var store = await KvasarStore.Open(new KvasarOptions {
     PageSize = pageSize,
     PageCacheBytes = 4L * 1024 * 1024,
     SegmentBytes = 8 * 1024 * 1024,
+    // Durable mode: the parent test asserts that every acknowledged write survives the kill, which only
+    // holds when Set is durable before it returns. Deferred flushing is covered by FlushDelayTests.
+    FlushDelay = TimeSpan.Zero,
 }).ConfigureAwait(false);
 
 await using (store.ConfigureAwait(false)) {
