@@ -332,6 +332,22 @@ public class EdgeCaseTests : IDisposable
     }
 
     [Fact]
+    public async Task DoubleDisposeIsSafe()
+    {
+        // I33: _writeLock and _disposeCts were never disposed. Disposing them means a second
+        // DisposeAsync must bail before it waits on a semaphore the first one already disposed.
+        var store = await KvasarStore.Open(Options());
+        await store.Set(K("a"), K("alpha"));
+
+        await store.DisposeAsync();
+        await store.DisposeAsync();
+
+        // ... and the store lock really was released, so the path can be reopened.
+        await using var reopened = await KvasarStore.Open(Options());
+        (await reopened.Get(K("a")))!.Value.ToArray().Should().Equal(K("alpha"));
+    }
+
+    [Fact]
     public async Task WipeLeavesNeighbouringFilesAlone()
     {
         // I31: the wipe glob accepted any "<base>.*" ending in .klog, so wiping `store` also deleted

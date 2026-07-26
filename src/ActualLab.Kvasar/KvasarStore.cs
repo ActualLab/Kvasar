@@ -34,6 +34,7 @@ public sealed class KvasarStore : IAsyncDisposable
     private readonly CancellationTokenSource _disposeCts = new();
     private Task? _flushLoopTask;
     private int _isDirty;
+    private int _isDisposeStarted;
     private bool _isDisposed;
 
     public KvasarStats Stats
@@ -127,6 +128,11 @@ public sealed class KvasarStore : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        // Interlocked rather than _isDisposed, which is only set further down under the write lock: the
+        // second caller has to bail out *before* touching _writeLock, since the first disposes it below.
+        if (Interlocked.Exchange(ref _isDisposeStarted, 1) != 0)
+            return;
+
         // Stop the background flusher before taking the lock, so it can't be mid-flush while we tear down.
         await _disposeCts.CancelAsync().ConfigureAwait(false);
         if (_flushLoopTask is { } flushLoopTask) {
@@ -140,8 +146,6 @@ public sealed class KvasarStore : IAsyncDisposable
 
         await _writeLock.WaitAsync().ConfigureAwait(false);
         try {
-            if (_isDisposed)
-                return;
             _isDisposed = true;
             try {
                 await _segments.Flush(true).ConfigureAwait(false);
@@ -164,6 +168,9 @@ public sealed class KvasarStore : IAsyncDisposable
         finally {
             _writeLock.Release();
         }
+        // After the release, so a waiter never blocks on an already-disposed semaphore (I33).
+        _writeLock.Dispose();
+        _disposeCts.Dispose();
     }
 
     // --- Reads (lock-free) --------------------------------------------------
