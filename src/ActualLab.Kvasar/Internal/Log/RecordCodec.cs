@@ -89,7 +89,12 @@ public static class RecordCodec
 
         var body = src.Slice(recLenBytes, bodyLen);
         flags = (RecordFlags)body[0];
-        valueKind = (KvasarValueKind)body[1];
+        // An unknown value kind is corruption or a forward format (§4.3) — never serve it as Raw.
+        var kind = (KvasarValueKind)body[1];
+        if (!Enum.IsDefined(kind))
+            return false;
+
+        valueKind = kind;
         isTombstone = (flags & RecordFlags.Tombstone) != 0;
         if (!Varint.TryRead(body[2..], out var keyLenU, out var keyLenBytes))
             return false;

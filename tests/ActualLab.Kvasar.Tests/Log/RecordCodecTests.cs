@@ -69,6 +69,25 @@ public class RecordCodecTests
             RecordCodec.TryDecode(buf.AsMemory(0, cut), out _, out _).Should().BeFalse($"cut at {cut}");
     }
 
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(255)]
+    public void UnknownValueKindFails(byte kind)
+    {
+        var key = RandomBytes(4, 8);
+        var value = RandomBytes(16, 9);
+        var buf = new byte[RecordCodec.MaxHeaderSize(key.Length) + value.Length];
+        var written = RecordCodec.Encode(buf, RecordFlags.None, KvasarValueKind.Raw, key, value, false);
+
+        // The body is < 128 bytes, so recordLen is a single varint byte and valueKind lands at buf[2].
+        buf[2].Should().Be((byte)KvasarValueKind.Raw);
+        buf[2] = kind;
+
+        RecordCodec.TryDecode(buf.AsMemory(0, written), out _, out _).Should().BeFalse();
+        RecordCodec.TryDecode(buf.AsSpan(0, written), out _, out _).Should().BeFalse();
+    }
+
     [Fact]
     public void EmptyOrZeroBufferFails()
     {
