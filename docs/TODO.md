@@ -338,7 +338,7 @@ so the copier and the writer share one append stream and last-writer-wins by off
 batches. Do not attempt the lock release without the redirect.
 
 ### C4. Compaction can serve a torn value — **OPEN P0, not fixed** (serves garbage)
-`ConcurrencyTests.ReadersDuringCompaction` / `ScanDuringWrites` fail in roughly **2 of 12** runs with
+`ConcurrencyTests.ReadersDuringCompaction` / `ScanDuringWrites` fail in roughly **1 of 12** runs with
 `Torn/garbage GetMany value` or `Scan yielded inconsistent value`. Every bad value has a
 self-consistent header and filler from a *different version of the same key* — a record assembled
 across two incarnations of a recycled slot. This is the top-severity failure kind under the review's
@@ -347,8 +347,10 @@ own model: bytes the caller never stored, returned as valid.
 **Introduced by the v2 two-slot model.** Segments were unlinked, so a stale locator resolved to
 nothing; slots are recycled *in place*, so it can resolve into the slot's next life.
 
-Three real races were found and closed. **None changed the failure rate** (2/10 → 4/12 → 2/12), so
-the operative cause is still unidentified — do not assume these were it:
+Three real races were found and closed. **None changed the failure rate**, so the operative cause is
+still unidentified — do not assume these were it. (The rates measured while chasing it, 2/10 → 4/12 →
+2/12, were inflated by the leaked worker in T6; with the machine clean it is ~1/12. Lower frequency,
+same defect.)
 1. `PagedFile` read `FileId` and `_cipher` as separate fields under lock-free readers, so a reader
    could decrypt with the old cipher and publish under the new cache id. Now one immutable
    `Incarnation` record swapped atomically.
@@ -368,6 +370,24 @@ page is authenticated — that asymmetry is the sharpest clue available and shou
 attempt.
 
 **Do not ship this.** Until it is understood, compaction can serve bytes the caller never wrote.
+
+### P5. The benchmark comparison is no longer durability-matched (S)
+`Durability` defaults to `Buffered` and `Flush(fsync: true)` ignores the flag, so Kvasar ends a
+benchmark run *not* fsynced while SQLite still runs `wal_checkpoint(TRUNCATE)`. That contradicts
+[`BENCHMARKS.md`](BENCHMARKS.md)'s own rule ("neither side is credited for work it merely deferred")
+and accounts for most of the chat scenario's apparent v2 gain — flush went 2.8 ms → 0.2 ms. Add a
+`--durability` arg to the harness and record a `Flushed` row beside the `Buffered` one.
+
+### T6. `ProcessCrashRecoveryTests` leaks worker processes (M)
+Found while collecting coverage: a `ActualLab.Kvasar.CrashWorker` process from an earlier run was
+still alive, holding `ActualLab.Kvasar.dll` and **failing every subsequent build** with MSB3027. It
+also burns CPU and disk against a live store directory, which inflates anything measured next to it —
+the observed C4 failure rate was 2–4 in 12 with a leaked worker present and 1 in 12 without.
+
+So it is not merely untidy: it silently contaminates both the flake rates and the benchmarks this
+repo relies on. The harness should kill the worker in a `finally`/`IDisposable` and assert no worker
+survives the fixture. Worth checking whether it also explains **T4** — a leaked worker still writing
+to a store the test then reopens is a plausible cause of "an acknowledged key missing from `Scan`".
 
 ### C5. Test host crashes intermittently — **OPEN, undiagnosed**
 Roughly 1 full-suite run in 3 aborts with `Test host process crashed` after ~323 tests, with no stack

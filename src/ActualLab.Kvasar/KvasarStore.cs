@@ -12,6 +12,10 @@ namespace ActualLab.Kvasar;
 /// </summary>
 public sealed class KvasarStore : IAsyncDisposable
 {
+    // Below this, a GetMany batch cannot consume the ~1 MiB run a prefetch pulls, so it costs more
+    // than it saves. See the note in GetMany.
+    private const int MinPrefetchBatchSize = 8;
+
     private readonly KvasarOptions _options;
     private readonly uint _formatVer;
     private readonly IKeyHasher _hasher;
@@ -246,11 +250,15 @@ public sealed class KvasarStore : IAsyncDisposable
         }
         Array.Sort(order, static (a, b) => a.Packed.CompareTo(b.Packed));
 
-        var prefetchPages = _data.PrefetchPages;
+        // Readahead only pays when the batch is big enough to consume the run it pulls. A run is
+        // PrefetchPages (~1 MiB), so issuing one for a 2-key batch reads a megabyte to serve two
+        // records — which is what `BatchingKvas` in front of the store actually produces (keys/op ≈ 1.1),
+        // and it cost more than the batching saved. Large cold batches, the case §6.4 is about, still get it.
+        var prefetchPages = keys.Count >= MinPrefetchBatchSize ? _data.PrefetchPages : 0;
         var prefetchedFile = uint.MaxValue;
         var nextPrefetchPage = 0L;
         foreach (var (packed, index) in order) {
-            if (packed != ulong.MaxValue) {
+            if (packed != ulong.MaxValue && prefetchPages > 0) {
                 var loc = Locator.FromPacked(packed);
                 var pageId = loc.Offset / _pageSize;
                 if (loc.FileId != prefetchedFile || pageId >= nextPrefetchPage) {

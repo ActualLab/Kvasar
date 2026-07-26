@@ -133,6 +133,12 @@ is +56% writes, −31% file size, and −51% startup.
 Working and tested — not yet released. The library multi-targets **net10.0** (default) and
 **net9.0**, is AOT- and trimming-safe, and depends on exactly one package (`System.IO.Hashing`).
 
+On the workload it exists for — ActualChat's cold start, a phone opening its cache and rendering the
+UI — Kvasar is **9.7–11.6× faster than SQLite + SQLCipher** end to end (5.3 ms vs 51.3 ms on a 12 MB
+cache; 8.6 ms vs 99.8 ms on 25 MB), and it needs no batching layer in front of it to get there. See
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md), including the note that the current comparison is not
+durability-matched.
+
 **Durability:** Kvasar buys **atomicity, not durability** — after any crash it reopens at the state
 of some commit that completed, never at a partial or mixed one. It does *not* promise that the most
 recent commit survives; for a regenerable cache a lost write costs one upstream lookup, while a torn
