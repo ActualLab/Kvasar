@@ -206,6 +206,15 @@ to be noise against AES-GCM plus I/O, but that's a prediction, not a measurement
 
 ## T — Testing & verification gaps
 
+### T3. I28's fix has no test that isolates it (S, blocked on the store rewrite)
+The fix is in (`KvasarStore.cs:235`, `:443` — the filters now let `OperationCanceledException`
+through). The regression test is not, and the reason is worth recording: `PagedSegment.Prefetch`
+already rethrows `OperationCanceledException`, and `Scan` calls it **outside** the try/catch, so a
+cancelled scan throws via prefetch whether or not the filter is fixed. A test written the obvious way
+passes against the unfixed code — verified by reverting the fix and watching it still pass. Isolating
+the filter needs cancellation injected at the `TryReadRecord` call specifically, which becomes
+straightforward once the store runs on `IStorageBackend` and the fake can inject it. Write it then.
+
 ### T1. Cancellation tests are timing-based, not deterministic (M)
 `Store/CancellationTests` cancels on sub-millisecond timers, so on a fast machine the token may never
 land mid-append — they're smoke tests, not proof that the uninterruptible-write contract holds. The

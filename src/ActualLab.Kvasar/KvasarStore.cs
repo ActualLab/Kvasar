@@ -232,7 +232,7 @@ public sealed class KvasarStore : IAsyncDisposable
             try {
                 read = await _segments.TryReadRecord(e.Locator, cancellationToken).ConfigureAwait(false);
             }
-            catch (Exception ex) when (ex is not KvasarCorruptException) {
+            catch (Exception ex) when (ex is not (KvasarCorruptException or OperationCanceledException)) {
                 continue; // a segment compacted away mid-scan ⇒ skip (rare; cache-safe)
             }
             if (!read.IsFound || read.View.IsTombstone)
@@ -440,7 +440,7 @@ public sealed class KvasarStore : IAsyncDisposable
                 return null; // hash collision ⇒ different key
             return new KvasarValue(read.View.Value, read.View.ValueKind);
         }
-        catch (Exception e) when (e is not KvasarCorruptException) {
+        catch (Exception e) when (e is not (KvasarCorruptException or OperationCanceledException)) {
             return null; // transient (e.g. segment compacted away) ⇒ treat as miss
         }
     }
