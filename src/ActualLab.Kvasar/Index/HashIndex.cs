@@ -9,8 +9,9 @@ namespace ActualLab.Kvasar.Internal;
 /// </summary>
 public sealed class HashIndex
 {
-    // Reserved locator sentinels. Empty == Locator.None (packed 0). Tombstone is a value a real
-    // locator can never take (SegmentId==Offset==uint.MaxValue is out of range for the log).
+    // Reserved locator sentinels. Empty == Locator.None (packed 0), unreachable because FileId is
+    // 1-based. Tombstone is a value a real locator can never take (FileId would have to exceed
+    // Locator.MaxFileId).
     internal const ulong Empty = 0UL;
     internal const ulong Tombstone = ulong.MaxValue;
 
@@ -157,8 +158,7 @@ public sealed class HashIndex
                 continue;
             yield return new IndexEntry {
                 KeyHash = hashes[i],
-                SegmentId = (uint)(packed >> 32),
-                Offset = (uint)packed,
+                PackedLocator = packed,
                 Length = (uint)lengths[i],
                 Flags = 0,
             };

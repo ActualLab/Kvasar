@@ -421,7 +421,7 @@ public class FormatFuzzTests
     }
 
     private static IndexEntry Entry(ulong keyHash, uint segmentId, uint offset, uint length)
-        => new() { KeyHash = keyHash, SegmentId = segmentId, Offset = offset, Length = length, Flags = 0 };
+        => new() { KeyHash = keyHash, PackedLocator = new Locator(segmentId, offset).Packed, Length = length, Flags = 0 };
 
     private static string TempPath(string prefix)
         => Path.Combine(Path.GetTempPath(), $"{prefix}-{Guid.NewGuid():N}.bin");

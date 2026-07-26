@@ -22,7 +22,7 @@ public sealed class IndexFileTests : IDisposable
 
     private static IndexEntry Entry(ulong keyHash, uint seg, uint off, uint len, bool tombstone = false)
         => new() {
-            KeyHash = keyHash, SegmentId = seg, Offset = off, Length = len,
+            KeyHash = keyHash, PackedLocator = new Locator(seg, off).Packed, Length = len,
             Flags = tombstone ? (byte)RecordFlags.Tombstone : (byte)RecordFlags.None,
         };
 
@@ -79,11 +79,11 @@ public sealed class IndexFileTests : IDisposable
 
         var map = loaded!.Value.Entries.ToDictionary(e => e.KeyHash);
         map.Should().HaveCount(3);
-        map[10].Offset.Should().Be(500);
+        map[10].Locator.Offset.Should().Be(500);
         map[10].Length.Should().Be(50);
-        map[20].Offset.Should().Be(600);
-        map[30].SegmentId.Should().Be(2);
-        map[30].Offset.Should().Be(800);
+        map[20].Locator.Offset.Should().Be(600);
+        map[30].Locator.FileId.Should().Be(2u);
+        map[30].Locator.Offset.Should().Be(800);
     }
 
     [Fact]

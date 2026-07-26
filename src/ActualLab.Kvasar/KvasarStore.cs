@@ -213,9 +213,7 @@ public sealed class KvasarStore : IAsyncDisposable
         // Scan order is unspecified (§4), so walk the log in write order rather than hash order: the index
         // snapshot is in hash order, which turns a full scan into random page faults. Sorting makes access
         // sequential, which is what lets the readahead below pull whole runs in one I/O.
-        Array.Sort(entries, static (a, b) => a.SegmentId != b.SegmentId
-            ? a.SegmentId.CompareTo(b.SegmentId)
-            : a.Offset.CompareTo(b.Offset));
+        Array.Sort(entries, static (a, b) => a.PackedLocator.CompareTo(b.PackedLocator));
 
         var prefetchPages = _segments.PrefetchPages;
         var prefetchedSegment = uint.MaxValue;
@@ -223,10 +221,11 @@ public sealed class KvasarStore : IAsyncDisposable
         foreach (var e in entries) {
             if (e.IsTombstone)
                 continue;
-            var pageId = e.Offset / _pageSize;
-            if (e.SegmentId != prefetchedSegment || pageId >= nextPrefetchPage) {
-                await _segments.Prefetch(e.SegmentId, pageId, prefetchPages, cancellationToken).ConfigureAwait(false);
-                prefetchedSegment = e.SegmentId;
+            var loc = e.Locator;
+            var pageId = loc.Offset / _pageSize;
+            if (loc.FileId != prefetchedSegment || pageId >= nextPrefetchPage) {
+                await _segments.Prefetch(loc.FileId, pageId, prefetchPages, cancellationToken).ConfigureAwait(false);
+                prefetchedSegment = loc.FileId;
                 nextPrefetchPage = pageId + prefetchPages;
             }
             RecordRead read;
@@ -491,8 +490,7 @@ public sealed class KvasarStore : IAsyncDisposable
             return;
         var entry = new IndexEntry {
             KeyHash = keyHash,
-            SegmentId = loc.SegmentId,
-            Offset = loc.Offset,
+            PackedLocator = loc.Packed,
             Length = (uint)length,
             Flags = isTombstone ? (byte)RecordFlags.Tombstone : (byte)0,
         };
@@ -646,7 +644,7 @@ public sealed class KvasarStore : IAsyncDisposable
         // repointing the index and dropping the drained segment — must run as a whole.
         var pending = new List<(ulong Hash, Locator NewLoc, int NewLen, Locator OldLoc, int OldLen)>();
         await foreach (var (loc, view, recordLength) in _segments.ScanAll(cancellationToken).ConfigureAwait(false)) {
-            if (loc.SegmentId != target || view.IsTombstone)
+            if (loc.FileId != target || view.IsTombstone)
                 continue;
             var h = _hasher.Hash(view.Key.Span, _hashKey);
             if (!_index.TryGetFirst(h, out var cur, out _) || cur != loc)
@@ -700,7 +698,7 @@ public sealed class KvasarStore : IAsyncDisposable
         // Seed live/dead bytes from the final index (no extra decrypt) instead of scanning the log.
         var live = new Dictionary<uint, long>();
         foreach (var e in _index.Snapshot())
-            live[e.SegmentId] = live.GetValueOrDefault(e.SegmentId) + e.Length;
+            live[e.Locator.FileId] = live.GetValueOrDefault(e.Locator.FileId) + e.Length;
         _segments.SeedAccountingFromIndex(live);
     }
 

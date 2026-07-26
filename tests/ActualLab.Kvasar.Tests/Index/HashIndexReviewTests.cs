@@ -11,10 +11,15 @@ public class HashIndexReviewTests
     private const int Threshold1K = (int)(Capacity1K * 0.7);
 
     private static ulong H(int i) => ((ulong)i << 20) | 5;
-    private static Locator Loc(ulong h) => new((uint)(h >> 20) + 1, ((uint)(h >> 20) * 64) + 7);
+    // These tests mint far more synthetic ids than Locator.MaxFileId allows, so the per-key variation
+    // lives in the offset. Locators stay unique because the offsets do — and Loc/FillerLoc offsets are
+    // 7 and 3 mod 8, so the two families can never collide either.
+    private static Locator Loc(ulong h)
+        => new((uint)((h >> 20) % Locator.MaxFileId) + 1, ((long)(h >> 20) * 64) + 7);
     private static int Len(ulong h) => ((int)(h >> 20) * 3) + 1;
     private static ulong Filler(int j) => (0xBEEFUL << 48) | ((ulong)j << 20) | 9;
-    private static Locator FillerLoc(int j) => new((uint)j + 5000, ((uint)j * 8) + 11);
+    private static Locator FillerLoc(int j)
+        => new((uint)(j % Locator.MaxFileId) + 1, ((long)j * 8) + 11);
 
     [Fact]
     public void ProbeTerminatesAtMaxLoadFactor()
@@ -190,8 +195,7 @@ public class HashIndexReviewTests
             for (var i = 1; i <= keyCount; i++)
                 entries.Add(new IndexEntry {
                     KeyHash = H(i),
-                    SegmentId = (uint)rev,
-                    Offset = (uint)((i * 16) + rev),
+                    PackedLocator = new Locator((uint)rev, (i * 16) + rev).Packed,
                     Length = (uint)((i * 2) + rev),
                     Flags = 0,
                 });

@@ -117,7 +117,7 @@ public sealed class SegmentSet : IDisposable
 
     public ValueTask<RecordRead> TryReadRecord(Locator loc, CancellationToken cancellationToken = default)
     {
-        if (!_states.TryGetValue(loc.SegmentId, out var st))
+        if (!_states.TryGetValue(loc.FileId, out var st))
             return default;
         return TryReadAt(st, loc.Offset, cancellationToken);
     }
@@ -143,7 +143,7 @@ public sealed class SegmentSet : IDisposable
         // common case. Anything else (miss, or a record spanning pages) returns false so the caller awaits
         // the general path; it never returns a wrong answer, only "not right now".
         view = default;
-        if (!_states.TryGetValue(loc.SegmentId, out var st))
+        if (!_states.TryGetValue(loc.FileId, out var st))
             return false;
 
         var tail = st.Tail; // one read: everything below must agree on the same tail generation
@@ -253,7 +253,7 @@ public sealed class SegmentSet : IDisposable
                 }
                 var read = await TryReadAt(st, p, cancellationToken).ConfigureAwait(false);
                 if (read.IsFound) {
-                    yield return (new Locator(segId, (uint)p), read.View, read.TotalLength);
+                    yield return (new Locator(segId, p), read.View, read.TotalLength);
                     p += read.TotalLength;
                 }
                 else {
@@ -271,7 +271,7 @@ public sealed class SegmentSet : IDisposable
 
     public void OnSuperseded(Locator oldLoc, int oldRecordLength)
     {
-        if (!_states.TryGetValue(oldLoc.SegmentId, out var st))
+        if (!_states.TryGetValue(oldLoc.FileId, out var st))
             return;
         st.LiveBytes -= oldRecordLength;
         st.DeadBytes += oldRecordLength;
@@ -354,7 +354,7 @@ public sealed class SegmentSet : IDisposable
         _tailFill += recordLength;
         PublishTail();
         _activeState.LiveBytes += recordLength;
-        return new Locator(_active.SegmentId, checked((uint)offset));
+        return new Locator(_active.SegmentId, offset);
     }
 
     private async ValueTask<Locator> AppendMultiPage(
@@ -386,7 +386,7 @@ public sealed class SegmentSet : IDisposable
             ArrayPool<byte>.Shared.Return(buf);
         }
         _activeState.LiveBytes += recordLength;
-        return new Locator(_active.SegmentId, checked((uint)offset));
+        return new Locator(_active.SegmentId, offset);
     }
 
     private async ValueTask SealTail()

@@ -188,8 +188,7 @@ public class HashIndexTests
                 continue;
             entries.Add(new IndexEntry {
                 KeyHash = h,
-                SegmentId = (uint)((h % 200) + 1),
-                Offset = (uint)((h % 9000) + 1),
+                PackedLocator = new Locator((uint)((h % 200) + 1), (long)((h % 9000) + 1)).Packed,
                 Length = (uint)((h % 777) + 1),
                 Flags = 0,
             });
@@ -218,10 +217,10 @@ public class HashIndexTests
     public void BulkLoadSkipsTombstonesAndLastDupWins()
     {
         var entries = new List<IndexEntry> {
-            new() { KeyHash = 100, SegmentId = 1, Offset = 10, Length = 1, Flags = 0 },
-            new() { KeyHash = 200, SegmentId = 1, Offset = 20, Length = 2, Flags = (byte)RecordFlags.Tombstone },
-            new() { KeyHash = 100, SegmentId = 5, Offset = 50, Length = 9, Flags = 0 }, // later dup wins
-            new() { KeyHash = 300, SegmentId = 2, Offset = 30, Length = 3, Flags = 0 },
+            new() { KeyHash = 100, PackedLocator = new Locator(1, 10).Packed, Length = 1, Flags = 0 },
+            new() { KeyHash = 200, PackedLocator = new Locator(1, 20).Packed, Length = 2, Flags = (byte)RecordFlags.Tombstone },
+            new() { KeyHash = 100, PackedLocator = new Locator(5, 50).Packed, Length = 9, Flags = 0 }, // later dup wins
+            new() { KeyHash = 300, PackedLocator = new Locator(2, 30).Packed, Length = 3, Flags = 0 },
         };
         var index = new HashIndex();
         index.BulkLoad(CollectionsMarshal.AsSpan(entries));
@@ -238,18 +237,18 @@ public class HashIndexTests
     public void ApplyDeltasWithTombstones()
     {
         var index = new HashIndex();
-        index.Apply(new IndexEntry { KeyHash = 1, SegmentId = 1, Offset = 1, Length = 1, Flags = 0 });
-        index.Apply(new IndexEntry { KeyHash = 2, SegmentId = 1, Offset = 2, Length = 2, Flags = 0 });
+        index.Apply(new IndexEntry { KeyHash = 1, PackedLocator = new Locator(1, 1).Packed, Length = 1, Flags = 0 });
+        index.Apply(new IndexEntry { KeyHash = 2, PackedLocator = new Locator(1, 2).Packed, Length = 2, Flags = 0 });
         index.Count.Should().Be(2);
 
         // Tombstone removes by hash regardless of locator.
-        index.Apply(new IndexEntry { KeyHash = 1, SegmentId = 999, Offset = 999, Length = 0, Flags = (byte)RecordFlags.Tombstone });
+        index.Apply(new IndexEntry { KeyHash = 1, PackedLocator = new Locator(999, 999).Packed, Length = 0, Flags = (byte)RecordFlags.Tombstone });
         index.Count.Should().Be(1);
         index.TryGetFirst(1, out _, out _).Should().BeFalse();
 
         // Re-add then last-writer-wins update.
-        index.Apply(new IndexEntry { KeyHash = 1, SegmentId = 3, Offset = 3, Length = 3, Flags = 0 });
-        index.Apply(new IndexEntry { KeyHash = 1, SegmentId = 4, Offset = 4, Length = 4, Flags = 0 });
+        index.Apply(new IndexEntry { KeyHash = 1, PackedLocator = new Locator(3, 3).Packed, Length = 3, Flags = 0 });
+        index.Apply(new IndexEntry { KeyHash = 1, PackedLocator = new Locator(4, 4).Packed, Length = 4, Flags = 0 });
         index.TryGetFirst(1, out var loc, out var len).Should().BeTrue();
         loc.Should().Be(new Locator(4, 4));
         len.Should().Be(4);

@@ -100,7 +100,7 @@ public class HardeningTests : IDisposable
         const ulong hashB = 0x2222_2222_0000_0002;
         var entries = new[] {
             NewEntry(hashA, 1, 100, 10),
-            new IndexEntry { KeyHash = 0, SegmentId = 0, Offset = 0, Length = 0, Flags = 0 }, // sentinel
+            new IndexEntry { KeyHash = 0, PackedLocator = new Locator(0, 0).Packed, Length = 0, Flags = 0 }, // sentinel
             NewEntry(hashB, 1, 200, 20),
         };
 
@@ -174,7 +174,7 @@ public class HardeningTests : IDisposable
         };
 
     private static IndexEntry NewEntry(ulong keyHash, uint segmentId, uint offset, uint length)
-        => new() { KeyHash = keyHash, SegmentId = segmentId, Offset = offset, Length = length, Flags = 0 };
+        => new() { KeyHash = keyHash, PackedLocator = new Locator(segmentId, offset).Packed, Length = length, Flags = 0 };
 
     private static KvasarKey Key(string s) => Encoding.UTF8.GetBytes(s);
     private static KvasarValue Val(string s) => Encoding.UTF8.GetBytes(s);
