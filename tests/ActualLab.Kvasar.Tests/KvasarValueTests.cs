@@ -15,10 +15,10 @@ public class KvasarValueTests
         KvasarValue fromByteMemory = new ReadOnlyMemory<byte>(expected);
 
         fromString.ToArray().Should().Equal(expected);
-        fromChars.Should().Be(fromString);
-        fromCharMemory.Should().Be(fromString);
-        fromBytes.Should().Be(fromString);
-        fromByteMemory.Should().Be(fromString);
+        fromChars.ToArray().Should().Equal(expected);
+        fromCharMemory.ToArray().Should().Equal(expected);
+        fromBytes.ToArray().Should().Equal(expected);
+        fromByteMemory.ToArray().Should().Equal(expected);
         fromString.AsString.Should().Be("значение/value");
     }
 
@@ -58,16 +58,4 @@ public class KvasarValueTests
         lifted.HasValue.Should().BeTrue();
     }
 
-    [Fact]
-    public void EqualityIsByContent()
-    {
-        KvasarValue a = "abc";
-        KvasarValue b = Encoding.UTF8.GetBytes("abc");
-        KvasarValue c = "abd";
-
-        (a == b).Should().BeTrue();
-        (a != c).Should().BeTrue();
-        a.GetHashCode().Should().Be(b.GetHashCode());
-        a.Equals((object)b).Should().BeTrue();
-    }
 }

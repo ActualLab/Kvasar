@@ -132,11 +132,12 @@ public readonly struct KvasarKey : IEquatable<KvasarKey>
     // KvasarKeyExt.AsString: UTF-8 decode
 }
 
-public readonly struct KvasarValue : IEquatable<KvasarValue>   // same shape as KvasarKey, plus:
+public readonly struct KvasarValue        // same shape as KvasarKey, minus equality, plus:
 {
     public KvasarValueKind Kind { get; }                                 // Raw in v1 (§4.3)
     public KvasarValue Require(KvasarValueKind kind);                    // throws on a kind mismatch
     // every conversion *out* of a value (operators, KvasarValueExt.AsString) goes through Require
+    // no IEquatable: values are the large side, and a content GetHashCode over megabytes is a trap
 }
 
 public sealed record KvasarOptions
@@ -331,6 +332,13 @@ random salt). **Safety rule:** `.kidx` may be unencrypted only with a keyed-PRF 
 2. On a fingerprint hit, read the record and **compare the full key** (handles the
    astronomically-rare 64-bit hash collision correctly).
 3. Continue open-addressing probes until match or empty slot (= miss).
+
+Reads fan out across colliding keys; **writes don't** (see TODO C1). Two distinct keys sharing a full
+64-bit hash collapse onto one index slot, and the later write shadows the earlier key — a lookup still
+never returns another key's value, but the shadowed key is lost until it's written again. Keys must
+therefore hash distinctly under the configured `Hasher`. With the default keyed SipHash-2-4 that is
+≈ n²/2⁶⁵ (~3·10⁻⁸ at 10⁶ keys) and unaimable without the store key; the unkeyed `XxHash3` lets
+attacker-chosen keys collide on purpose, so use it only for trusted key sets.
 
 ### 6.3 Zero-copy read path  ← core to "fastest"
 Decrypted pages are **immutable `byte[]` buffers**. On a hit, the value is returned as a

@@ -135,8 +135,65 @@ Tracked by the skipped `EdgeCaseTests.HashCollisionFanOut_KnownBug`. `HashIndex`
 64-bit hash alone (full keys aren't in RAM by design, §6.1), so `Set`/`Scan`/`Remove` treat any two
 same-hash keys as one entry and a later `Set` silently evicts the earlier one. On-disk full-key
 verification prevents returning a *wrong* value but doesn't provide the collision fan-out §14
-implies. Astronomically rare under SipHash-2-4; reachable with a caller-supplied hasher such as the
-built-in xxHash3. Unskip the test when the index can disambiguate.
+implies. **Investigated 2026-07-25; deliberately postponed — the test stays skipped.**
+
+#### What the code actually does
+
+*Reads are already fan-out ready.* `Get`/`GetSlow` walk every candidate `ProbeCursor` yields, skip the
+ones whose `CurrentHash` differs, and full-key-verify the rest on disk; `Scan` walks `Snapshot()` slot
+by slot. Nothing on the read path assumes one slot per hash — so no read change is needed at all.
+
+*The writer loses the fan-out, and not only in `HashIndex.Set`.* Five places collapse same-hash keys:
+
+- `HashIndex.Scan` (behind `Set`) and `RemoveCore` both stop at the **first** live slot whose hash
+  matches, so an update and a remove hit whichever colliding key got there first.
+- `KvasarStore.Publish` and `ApplyLoaded` pick that victim with `TryGetFirst(h)` — first slot for the
+  hash, no key check — for the index update **and** for the `OnSuperseded` dead-byte accounting.
+- `TryCompactOne` calls a record dead when `TryGetFirst(h) != loc`, so with two slots the loser's live
+  record is dropped by the next compaction (data loss, not just shadowing).
+- `IndexFile.Parse` resolves checkpoint + delta tail through a `Dictionary<ulong, IndexEntry>` keyed by
+  `KeyHash`, and `HashIndex.BulkLoad` is last-writer-wins per hash. Even a perfect in-RAM index
+  collapses back to one entry per hash on the next open.
+
+So **no** — fixing eviction in `Set` alone does not buy fan-out. `Set` can't even tell "same key" from
+"same hash": the only datum that distinguishes two slots is the locator, which only the store knows how
+to match against a key, and only by reading the record.
+
+#### Options
+
+**A. True fan-out.** `HashIndex` becomes locator-addressed: `Set(hash, oldLoc, newLoc, len)` (insert
+when `oldLoc` is `None`), `Remove`/`Scan` probe past hash matches whose locator differs, plus a cheap
+`Contains(hash, loc)` for compaction's liveness test. `Publish` must then decide *which* slot belongs
+to the key it is writing, and only the key bytes on disk can tell it — a record read (page decrypt when
+uncached) **per overwrite and per delete**, on a write path that today never reads. The `.kidx` must
+also say which entry a delta supersedes: either widen `IndexEntry` with the superseded locator (+8 B on
+a 21-byte entry, ~38%) or write two deltas per overwrite (a locator-matched remove + an add) and key
+`Parse`'s resolution by `(hash, locator)`. Either way the delta stream changes meaning ⇒ a
+`FormatVersion` bump ⇒ every existing store is wiped on upgrade. Touches `HashIndex`'s hot path, all
+eight mutating index call sites in `KvasarStore`, and `IndexFile`.
+
+**B. Make collisions unreachable rather than handled.** Widen the index hash to 128 bits: `IKeyHasher`
+(public) returns 128 bits, `IndexEntry` grows 8 B, the table grows 8 B/slot, every hasher is
+reimplemented. It doesn't satisfy §14's fan-out wording, but it removes the failure mode *including*
+for attacker-chosen keys, which is the only realistic way in.
+
+**C. Detect instead of silently losing.** Full-key-verify the single candidate at write time and
+throw/log on a genuine collision. Pays A's per-overwrite read without fixing anything, and converts a
+silent single-key loss into a hard failure for that key.
+
+**D. Constrain the contract and say so.** Keys must have distinct 64-bit hashes under the configured
+hasher. With the default keyed SipHash-2-4 the chance that *any* pair of n keys collides is ≈ n²/2⁶⁵ —
+about 3·10⁻⁸ at n = 10⁶ — and an attacker can't aim without the store key. With the built-in unkeyed
+`XxHash3`, collisions are constructible offline, so a store fed attacker-chosen keys can be made to
+drop entries at will. Zero code, and it's the part that's currently under-documented.
+
+#### Recommendation
+
+**D now**; **B** if Kvasar ever ingests untrusted keys under a non-keyed hasher; **A** only inside a
+change that already rewrites the `.kidx` format (it composes with D1's fsync-before-rename and I34's
+entry padding) — not on its own, and not while `HashIndex` is being rewritten for other reasons. The
+current behavior is a bounded single-key loss on a regenerable cache that self-heals on the next miss,
+which does not justify a read per overwrite plus a format break.
 
 ### C2. An unknown value-kind tag is not rejected (S)
 SPEC §4.3 says an unknown tag ⇒ corrupt ⇒ regenerate, but `RecordCodec.TryParse` casts
@@ -159,10 +216,15 @@ author meant a delete. Options: drop the nullable-source conversions and require
 and the comment above its conversion operators now state the behaviour, covered by
 `KvasarValueTests.NullStringOrArrayIsAPresentEmptyValue`.
 
-### A2. `KvasarValue` equality/`GetHashCode` is speculative API (S)
-Added for symmetry with `KvasarKey`; nothing uses it, and `GetHashCode` over a multi-megabyte value
-is a footgun with no current caller. `KvasarKey`'s equality is justified (dictionary keys).
-Consider removing the value-side implementation.
+### A2. `KvasarValue` equality/`GetHashCode` was speculative API — **removed**
+`IEquatable<KvasarValue>`, `Equals`, `GetHashCode` and `==`/`!=` are gone; `KvasarKey` keeps its own
+(it really is used as a dictionary key). Rationale: nothing in the library, tests or benchmarks
+compared values; values are the large side of the store (up to `MaxValueBytes`, 8 MiB by default), so
+a content `GetHashCode` is an O(n) trap that a `HashSet<KvasarValue>` or `Distinct()` would spring
+invisibly; and adding an implementation back later is source-compatible, while removing one isn't.
+The known cost: `a.Equals(b)` still compiles and now means `ValueType.Equals`, i.e. "same slice of the
+same array" rather than "same bytes" — `a == b` no longer compiles at all, which is the louder half.
+Callers wanting content equality write `a.Span.SequenceEqual(b.Span)`.
 
 ### A3. `Kind` / `Require` are inert in v1 (no action, note only)
 Only `Raw` exists and user code can't construct another kind, so `Require(Raw)` can never throw
@@ -220,11 +282,15 @@ passes against the unfixed code — verified by reverting the fix and watching i
 the filter needs cancellation injected at the `TryReadRecord` call specifically, which becomes
 straightforward once the store runs on `IStorageBackend` and the fake can inject it. Write it then.
 
-### T1. Cancellation tests are timing-based, not deterministic (M)
-`Store/CancellationTests` cancels on sub-millisecond timers, so on a fast machine the token may never
-land mid-append — they're smoke tests, not proof that the uninterruptible-write contract holds. The
-repo already has the fault-injection machinery (`FakePageCipher`, the crash-fuzz harness); the real
-test injects cancellation deterministically at page N of a multi-page append.
+### T1. Cancellation tests are timing-based, not deterministic — **done**
+`Store/CancellationTests` now has three gate-driven tests alongside the timer-based smoke ones. A
+`Gate` parks the writer at an exact point and the test thread cancels while it's parked, so the token
+provably lands mid-write: `GatedMemory` (a `MemoryManager<byte>` behind the value) parks inside the
+multi-page append itself, `GatedHasher` parks between the append and the index publish, and the third
+test cancels a writer queued on the write lock. Each asserts the write is invisible while parked, then
+that it landed whole (and survives a reopen) — or, for the queued writer, that nothing landed at all.
+The one seam still missing is per-page injection: `IPageCipherFactory` isn't reachable from
+`KvasarOptions`, so "cancel between page 3 and 4" can't be expressed through the public API.
 
 ### T2. No durability item (D1–D5) is testable in this suite (L)
 `CrashFuzzTests`/`ProcessCrashRecoveryTests` kill a process, which does **not** drop the OS page
