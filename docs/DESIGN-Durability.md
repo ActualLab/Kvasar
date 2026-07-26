@@ -1,7 +1,9 @@
 # Kvasar — durability principles, file set, and commit protocol
 
-Status: **proposal**, not yet implemented. If adopted it supersedes the durability parts of
-[`DESIGN.md`](DESIGN.md) and rewrites the storage model in [`SPEC.md`](SPEC.md) §5 / §9.
+Status: **implemented**. It supersedes the durability parts of [`DESIGN.md`](DESIGN.md) and the storage
+model in [`SPEC.md`](SPEC.md) §5 / §9, both of which still describe the segment model and are now stale.
+§14 records the four places this document turned out to be wrong or under-specified once `KvasarStore`
+was actually built against it.
 
 This document states the durability goal, enumerates every file Kvasar maintains and the rule that
 governs it, gives the commit protocol, and **proves** the protocol delivers the goal. It ends with
@@ -653,3 +655,75 @@ is changing anyway).
 5. Level B/C Docker harnesses as the cross-check on 2–4.
 
 Steps 1 and 2 are independent of everything still open in §12 and are not wasted under any outcome.
+
+## 14. Corrections from the implementation
+
+Four things this document got wrong or left under-specified. Each was found by a test, not by reading.
+
+### 14.1 "Rotate the index on unclean recovery" is too narrow — rotate whenever recovery replayed
+
+§3.3 ties index rotation to an *unclean* open, and §5.2.1 ties it to a burned range. Both are too narrow,
+and the gap is a live data-loss bug: if the index prefix recovery read was **shorter than the commit
+named** — the tail was lost, or a fault truncated the file — then recovery replays past it and the store
+carries on appending deltas to that same file. Those new deltas land immediately after the surviving
+ones, so the file's *length* grows back past the commit's `indexCommitLength` while its *contents* have a
+hole. The next open sees a prefix as long as the commit named, concludes there is nothing to replay, and
+adopts an index that is missing every entry the truncation removed.
+
+This is **I3 by another route**: an index appended to after a gap. §3.3 already names the rule —
+"index files rotate rather than being appended after a hole" — it just attaches it to the wrong trigger.
+The condition is not "was the shutdown unclean" but **"did this recovery have to replay anything"**, which
+is the same question as "is the prefix we read as long as the commit named". `CrashFuzzTests`' `TruncateIndex`
+fault fails on every seed without it.
+
+### 14.2 The switch is atomic only for readers that re-resolve through the index
+
+§4: "the switch is one superblock write, so it is atomic and instantaneous from a reader's perspective."
+That holds for a reader that resolves a key through the index on each read. It does **not** hold for one
+holding a locator taken *before* the switch — `Scan`'s snapshot is exactly that.
+
+In the segment model a stale locator was harmless: compaction unlinked the drained segment, so it
+resolved to nothing. Two fixed slots recycle the drained file **in place**, so a stale locator can land
+inside the slot's new contents and decode as a different, entirely valid record. AES-GCM cannot catch it
+— the page is genuine, it just isn't the one the locator meant.
+
+`Get`/`GetMany` were never exposed, because the full-key compare against the caller's bytes *is* this
+check. `Scan` has no key to compare, so it must re-hash the decoded key against the index entry's
+`KeyHash`; the compaction copy loop needs the same guard. `ConcurrencyTests.ScanDuringWrites` catches it
+once compaction fires on its own trigger.
+
+### 14.3 The never-rewind rule makes a failing page reachable from an ordinary read
+
+§5.3 says a page that fails authentication "surfaces as a miss, not as garbage", and that is now
+load-bearing rather than a remark. Rounding `pageCount` **up** past a torn tail puts burned page ids
+*inside* the file's logical length, so an index entry that predates a truncation resolves to a page that
+can never authenticate. Every read path — `Get`, `Scan` and compaction's copy loop — has to treat
+`KvasarCorruptException` from a page decrypt as a miss. Only `Open` may still read it as "wipe".
+
+### 14.4 `ScanFrom` cannot deliver §5.2 step 3
+
+Step 3 says recovery verifies the pages a commit added and, on failure, **discards that generation and
+falls back**. The implementation cannot: `DataLog.ScanFrom` swallows a page's `KvasarCorruptException`
+and ends the walk, because that is the right answer for the torn-tail walk it was built for. A page that
+fails inside the committed extent therefore silently *truncates the replay* instead of triggering the
+fallback.
+
+What survives of step 3 is the check `PagedFile.Open` does — a slot naming more data than its file holds
+is not adoptable — which covers the realistic failure (the tail pages never landed) and is what the
+`Buffered` fallback rests on. A page present but torn *within* the extent is not caught at open; per §5.3
+it surfaces later as a read miss. Closing this properly needs an authenticate-only pass over
+`(L_{G*-1}, L_{G*}]` that reports failure instead of stopping — worth adding, not added here.
+
+### 14.5 Smaller notes
+
+- **The drained slot must not be counted.** Its bytes sit on disk until the next `BeginCompaction`
+  truncates them, but counting them as dead re-arms the trigger the compaction just satisfied and the
+  store ping-pongs between slots forever. They are zeroed at the switch; the disk is reclaimed one
+  compaction later. §4's "peak disk = store size + live size" already budgets for this.
+- **Recovery confirms its adoption.** With two slots, rotating an index or recycling a data file right
+  after recovery would clobber the generation below the one just adopted. Re-writing the adopted state
+  as generation *G+1* (same extents, one 512-byte write) invalidates it first and makes both free slots
+  immediately recyclable — cheaper than carrying a "which slot is still referenced" rule through open.
+- **`Clear` is the one place that unlinks.** Recycling a slot would leave the cleared data on disk under
+  a store whose caller just asked for it to be gone. A crash mid-`Clear` reads back as an uninitialized
+  store, which §3.4 already accepts as a defined outcome.

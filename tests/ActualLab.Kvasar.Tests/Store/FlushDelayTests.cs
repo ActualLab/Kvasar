@@ -130,47 +130,65 @@ public class FlushDelayTests : IDisposable
     }
 
     [Fact]
-    public async Task UncleanShutdownStartsANewSegmentSoPageNoncesAreNeverReused()
+    public async Task UncleanShutdownNeverReusesAPageIdItMayHaveLost()
     {
-        // A crash under deferred flush can lose whole unwritten pages, so PageCount comes back lower and
-        // appends would otherwise reuse those page ids — re-encrypting different data under an already-used
-        // GCM nonce. Recovery must therefore never append into that segment.
+        // A crash under deferred commit can leave a half-written trailing page, so appending at the
+        // committed extent would re-encrypt different data under an already-used GCM nonce. The
+        // never-rewind rule resumes at the *physical* end instead, so the file only ever grows — which is
+        // what replaced the .clean marker and the roll-to-a-new-segment this test used to assert (§5.2.1).
         var basePath = Path.Combine(_dir, "nonce");
         var snapshotDir = Path.Combine(_dir, "nonce-snap");
         await using (var store = await KvasarStore.Open(Options(basePath, TimeSpan.FromSeconds(30)))) {
             for (var i = 0; i < 50; i++)
                 await store.Set(Key(i), Value(i, 300));
             await store.Flush(true);
-            Snapshot(basePath, snapshotDir); // copy while open == killed process, so no clean marker
+            Snapshot(basePath, snapshotDir); // copy while open == killed process
         }
 
         var snapshotBase = Path.Combine(snapshotDir, "nonce");
-        File.Exists($"{snapshotBase}.001.klog").Should().BeTrue();
+        var dataPath = $"{snapshotBase}.0.kdat";
+        File.Exists(dataPath).Should().BeTrue();
+        // Tear the tail, which is what an abort mid-page leaves behind.
+        using (var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Write))
+            fs.SetLength(fs.Length - 11);
+        var tornLength = new FileInfo(dataPath).Length;
+
         await using (var recovered = await KvasarStore.Open(Options(snapshotBase, TimeSpan.FromSeconds(30)))) {
             await recovered.Set(Key(1000), Value(1000, 300));
             await recovered.Flush(true);
         }
-        File.Exists($"{snapshotBase}.002.klog").Should()
-            .BeTrue("an unclean shutdown must not append into a segment whose page ids it may have lost");
+
+        new FileInfo(dataPath).Length.Should().BeGreaterThan(tornLength,
+            "recovery must append above the torn page rather than re-issue its page id");
+        Directory.GetFiles(snapshotDir, "nonce.*.kdat").Should()
+            .HaveCount(2, "the file set is fixed: recovery never creates a file");
+
+        await using var reopened = await KvasarStore.Open(Options(snapshotBase, TimeSpan.FromSeconds(30)));
+        (await reopened.Get(Key(1000))).Should().NotBeNull("the post-recovery write must survive");
     }
 
     [Fact]
-    public async Task CleanShutdownKeepsAppendingToTheSameSegment()
+    public async Task CleanShutdownKeepsAppendingToTheSameFile()
     {
-        // The counterpart: a graceful close flushes everything and records that, so reopening must NOT
-        // strand a segment — otherwise every launch would leak one.
+        // The counterpart: a graceful close commits everything, so there is no burned range and reopening
+        // costs nothing — and, unlike the segment model, cannot strand a file per launch.
         var basePath = Path.Combine(_dir, "clean");
         await using (var store = await KvasarStore.Open(Options(basePath, TimeSpan.FromSeconds(30)))) {
             for (var i = 0; i < 50; i++)
                 await store.Set(Key(i), Value(i, 300));
         }
+        var lengthAfterClose = new FileInfo($"{basePath}.0.kdat").Length;
 
         await using (var reopened = await KvasarStore.Open(Options(basePath, TimeSpan.FromSeconds(30)))) {
             await reopened.Set(Key(1000), Value(1000, 300));
             (await reopened.Get(Key(0))).Should().NotBeNull("a clean close must persist everything");
+            await reopened.Flush(true);
         }
-        File.Exists($"{basePath}.002.klog").Should()
-            .BeFalse("a clean shutdown leaves nothing to protect against, so no roll is needed");
+
+        // The reopen appended into the same file: no page id was burned, so nothing was skipped either.
+        var lengthAfterReopen = new FileInfo($"{basePath}.0.kdat").Length;
+        lengthAfterReopen.Should().BeGreaterThan(lengthAfterClose);
+        lengthAfterReopen.Should().BeLessThan(lengthAfterClose * 2);
     }
 
     // Private methods

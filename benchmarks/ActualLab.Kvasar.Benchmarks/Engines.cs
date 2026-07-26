@@ -23,7 +23,7 @@ public interface IKvEngine : IAsyncDisposable
     public ValueTask<byte[]?[]> GetMany(IReadOnlyList<byte[]> keys); // one batched backend call, results by index
     public ValueTask<long> ScanAll();                     // enumerate ALL entries (the cache's startup hydration); returns count
     public long FileBytes { get; }
-    public string? IndexHintFile { get; }                 // .kidx path for Kvasar (deletable to force rebuild); null otherwise
+    public string[] IndexHintFiles { get; }               // .kidx paths for Kvasar (deletable to force rebuild); empty otherwise
 }
 
 public sealed class KvasarEngine(
@@ -98,7 +98,7 @@ public sealed class KvasarEngine(
     }
 
     public long FileBytes => _store.Stats.FileBytes;
-    public string? IndexHintFile => basePath + ".kidx";
+    public string[] IndexHintFiles => [basePath + ".0.kidx", basePath + ".1.kidx"];
 
     public ValueTask DisposeAsync() => Close();
 }
@@ -233,7 +233,7 @@ public sealed class SqliteEngine(string dbPath, byte[] key) : IKvEngine
         }
     }
 
-    public string? IndexHintFile => null;
+    public string[] IndexHintFiles => [];
 
     public ValueTask DisposeAsync() => Close();
 

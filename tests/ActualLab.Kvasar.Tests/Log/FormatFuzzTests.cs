@@ -1,10 +1,11 @@
 using System.Buffers.Binary;
 using ActualLab.Kvasar.Internal;
+using ActualLab.Kvasar.Internal.Storage;
 
 namespace ActualLab.Kvasar.Tests.Log;
 
 /// <summary>
-/// Adversarial coverage for the on-disk parsers (§5.2 records, §6.5 <c>.kidx</c>, §5.3 segment header):
+/// Adversarial coverage for the on-disk parsers (§5.2 records, §3.3 <c>.kidx</c>, §3.2 data-file header):
 /// mutated/truncated input must be rejected cleanly, never with a bounds/overflow exception.
 /// </summary>
 public class FormatFuzzTests
@@ -172,19 +173,19 @@ public class FormatFuzzTests
     // --- .kidx --------------------------------------------------------------
 
     [Fact]
-    public async Task IndexFileSurvivesRandomMutations()
+    public async Task IndexLogSurvivesRandomMutations()
     {
         var rnd = new Random(Seed + 2);
         var path = TempPath("kidx-fuzz");
         try {
             for (var i = 0; i < 500; i++) {
-                var original = await BuildIndexFile(rnd);
+                var original = await BuildIndexLog(rnd);
                 var mutated = Mutate(original, rnd);
                 if (rnd.Next(3) == 0 && mutated.Length > 0)
                     mutated = mutated[..rnd.Next(mutated.Length)];
                 await File.WriteAllBytesAsync(path, mutated);
                 await NoCrash(async () => {
-                    var loaded = await IndexFile.TryLoad(path, FormatVer);
+                    var loaded = await ReadIndexLog(path);
                     if (loaded is { } cp)
                         cp.Entries.Should().NotBeNull();
                 });
@@ -196,19 +197,16 @@ public class FormatFuzzTests
     }
 
     [Fact]
-    public async Task IndexFileTruncatedAtAnyLengthIsClean()
+    public async Task IndexLogTruncatedAtAnyLengthIsClean()
     {
         var path = TempPath("kidx-cut");
         try {
-            var entries = Entries(6);
-            await IndexFile.WriteCheckpoint(path, entries, (3u, 999u), FormatVer);
-            for (var i = 0; i < 4; i++)
-                await IndexFile.AppendDelta(path, Entry((ulong)(100 + i), 2, (uint)(i * 8), 8));
+            await WriteIndexLog(path, Entries(6), 999, 4);
             var full = await File.ReadAllBytesAsync(path);
 
             for (var cut = 0; cut <= full.Length; cut++) {
                 await File.WriteAllBytesAsync(path, full[..cut]);
-                await NoCrash(async () => await IndexFile.TryLoad(path, FormatVer));
+                await NoCrash(async () => await ReadIndexLog(path));
             }
         }
         finally {
@@ -217,20 +215,19 @@ public class FormatFuzzTests
     }
 
     [Fact]
-    public async Task IndexFilePartialTrailingDeltaOfAnyLengthIsDropped()
+    public async Task IndexLogPartialTrailingDeltaOfAnyLengthIsDropped()
     {
         var path = TempPath("kidx-tail");
         try {
-            for (var partial = 1; partial < IndexFile.EntrySize; partial++) {
-                await IndexFile.WriteCheckpoint(path, Entries(2), (1u, 0u), FormatVer);
-                await IndexFile.AppendDelta(path, Entry(50, 1, 200, 20));
+            for (var partial = 1; partial < IndexLog.EntrySize; partial++) {
+                await WriteIndexLog(path, Entries(2), 0, 1);
                 var bytes = await File.ReadAllBytesAsync(path);
                 await File.WriteAllBytesAsync(path, [..bytes, ..new byte[partial]]);
 
-                var loaded = await IndexFile.TryLoad(path, FormatVer);
+                var loaded = await ReadIndexLog(path);
                 loaded.Should().NotBeNull();
                 loaded!.Value.Entries.Should().HaveCount(3);
-                loaded.Value.Entries.Select(e => e.KeyHash).Should().Contain(50UL);
+                loaded.Value.Entries.Select(e => e.KeyHash).Should().Contain(DeltaHash(0));
             }
         }
         finally {
@@ -239,21 +236,21 @@ public class FormatFuzzTests
     }
 
     [Fact]
-    public async Task IndexFileCheckpointCountBeyondTheFileIsRejected()
+    public async Task IndexLogCheckpointCountBeyondTheFileIsRejected()
     {
         var path = TempPath("kidx-count");
         try {
-            await IndexFile.WriteCheckpoint(path, Entries(3), (1u, 0u), FormatVer);
+            await WriteIndexLog(path, Entries(3), 0, 0);
             var bytes = await File.ReadAllBytesAsync(path);
             foreach (var count in new long[] { 4, 100, 1L << 20, int.MaxValue }) {
                 BinaryPrimitives.WriteInt64LittleEndian(bytes.AsSpan(16), count);
                 await File.WriteAllBytesAsync(path, bytes);
-                await NoCrash(async () => (await IndexFile.TryLoad(path, FormatVer)).Should().BeNull());
+                await NoCrash(async () => (await ReadIndexLog(path)).Should().BeNull());
             }
             // A negative count must be rejected rather than sign-extended into a span length.
             BinaryPrimitives.WriteInt64LittleEndian(bytes.AsSpan(16), -1);
             await File.WriteAllBytesAsync(path, bytes);
-            await NoCrash(async () => (await IndexFile.TryLoad(path, FormatVer)).Should().BeNull());
+            await NoCrash(async () => (await ReadIndexLog(path)).Should().BeNull());
         }
         finally {
             TryDelete(path);
@@ -261,16 +258,16 @@ public class FormatFuzzTests
     }
 
     [Fact]
-    public async Task IndexFileEntrySizeMismatchIsRejected()
+    public async Task IndexLogEntrySizeMismatchIsRejected()
     {
         var path = TempPath("kidx-esize");
         try {
-            await IndexFile.WriteCheckpoint(path, Entries(3), (1u, 0u), FormatVer);
+            await WriteIndexLog(path, Entries(3), 0, 0);
             var bytes = await File.ReadAllBytesAsync(path);
-            BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(8), (uint)IndexFile.EntrySize + 1);
+            BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(8), (uint)IndexLog.EntrySize + 1);
             await File.WriteAllBytesAsync(path, bytes);
 
-            (await IndexFile.TryLoad(path, FormatVer)).Should().BeNull();
+            (await ReadIndexLog(path)).Should().BeNull();
         }
         finally {
             TryDelete(path);
@@ -396,21 +393,37 @@ public class FormatFuzzTests
         return bytes;
     }
 
-    private static async Task<byte[]> BuildIndexFile(Random rnd)
+    private static async Task<byte[]> BuildIndexLog(Random rnd)
     {
         var path = TempPath("kidx-src");
         try {
-            await IndexFile.WriteCheckpoint(
-                path, Entries(rnd.Next(0, 8)), ((uint)rnd.Next(1, 4), (uint)rnd.Next(0, 1 << 16)), FormatVer);
-            var deltas = rnd.Next(0, 5);
-            for (var i = 0; i < deltas; i++)
-                await IndexFile.AppendDelta(path, Entry((ulong)rnd.Next(1, 100), 1, (uint)rnd.Next(), 16));
+            await WriteIndexLog(path, Entries(rnd.Next(0, 8)), rnd.Next(0, 1 << 16), rnd.Next(0, 5));
             return await File.ReadAllBytesAsync(path);
         }
         finally {
             TryDelete(path);
         }
     }
+
+    private static async Task WriteIndexLog(
+        string path, IndexEntry[] checkpoint, long dataCommitLength, int deltaCount)
+    {
+        TryDelete(path);
+        var file = await FileStorageBackend.Instance.Open(path);
+        await using var log = await IndexLog.Open(file, FormatVer);
+        await log.WriteCheckpoint(checkpoint, dataCommitLength);
+        for (var i = 0; i < deltaCount; i++)
+            await log.AppendDelta(Entry(DeltaHash(i), 2, (uint)(i * 8), 8));
+    }
+
+    private static async Task<IndexSnapshot?> ReadIndexLog(string path)
+    {
+        var file = await FileStorageBackend.Instance.Open(path);
+        await using var log = await IndexLog.Open(file, FormatVer);
+        return await log.Read();
+    }
+
+    private static ulong DeltaHash(int i) => (ulong)(100 + i);
 
     private static IndexEntry[] Entries(int count)
     {
@@ -420,8 +433,8 @@ public class FormatFuzzTests
         return result;
     }
 
-    private static IndexEntry Entry(ulong keyHash, uint segmentId, uint offset, uint length)
-        => new() { KeyHash = keyHash, PackedLocator = new Locator(segmentId, offset).Packed, Length = length, Flags = 0 };
+    private static IndexEntry Entry(ulong keyHash, uint fileId, uint offset, uint length)
+        => new() { KeyHash = keyHash, PackedLocator = new Locator(fileId, offset).Packed, Length = length, Flags = 0 };
 
     private static string TempPath(string prefix)
         => Path.Combine(Path.GetTempPath(), $"{prefix}-{Guid.NewGuid():N}.bin");

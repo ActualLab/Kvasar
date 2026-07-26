@@ -91,10 +91,11 @@ async Task<Result> RunEngine(Func<IKvEngine> factory, (byte[] Key, byte[] Value)
 
     // 2b) Kvasar only: rebuild index from the log (delete .kidx) to isolate the scan cost
     double? rebuildMs = null;
-    var kidx = engine.IndexHintFile;
-    if (kidx != null) {
+    var kidxFiles = engine.IndexHintFiles;
+    if (kidxFiles.Length != 0) {
         await engine.Close();
-        try { if (File.Exists(kidx)) File.Delete(kidx); } catch { /* ignore */ }
+        foreach (var kidx in kidxFiles)
+            try { if (File.Exists(kidx)) File.Delete(kidx); } catch { /* ignore */ }
         sw.Restart();
         await engine.Open();
         sw.Stop();

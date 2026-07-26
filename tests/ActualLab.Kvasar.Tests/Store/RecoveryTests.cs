@@ -70,21 +70,10 @@ public sealed class RecoveryTests : IDisposable
         }
     }
 
-    private string[] SegmentFiles()
-    {
-        var name = Path.GetFileName(BasePath);
-        return Directory.GetFiles(_dir, name + ".*.klog");
-    }
-
-    private uint SegmentId(string path)
-    {
-        var prefix = Path.GetFileName(BasePath) + ".";
-        var fn = Path.GetFileName(path);
-        var mid = fn.Substring(prefix.Length, fn.Length - prefix.Length - ".klog".Length);
-        return uint.Parse(mid);
-    }
-
-    private string HighestSegmentFile() => SegmentFiles().OrderBy(SegmentId).Last();
+    private string[] DataFiles() => Directory.GetFiles(_dir, Path.GetFileName(BasePath) + ".*.kdat");
+    private string[] IndexFiles() => Directory.GetFiles(_dir, Path.GetFileName(BasePath) + ".*.kidx");
+    // Slot 0 is the active data file of a freshly created store, and nothing here compacts.
+    private string ActiveDataFile() => BasePath + ".0.kdat";
 
     // --- 1. Reopen preserves state -----------------------------------------
 
@@ -140,75 +129,102 @@ public sealed class RecoveryTests : IDisposable
     // --- 2. Torn tail dropped, earlier data intact -------------------------
 
     [Fact]
-    public async Task TornTailDroppedEarlierDataIntact()
+    public async Task TornTailAboveTheCommittedExtentIsDropped()
     {
-        const int mainCount = 300;
-        const int tailCount = 40;
-        const int total = mainCount + tailCount;
+        // The v2 shape of "torn tail": bytes past the committed extent are not data — not read, not
+        // parsed, not scanned (§3.1) — and the page ids they occupy are burned rather than re-issued.
+        // Everything the superblock names must survive intact.
+        const int total = 340;
         const int valueSize = 80;
         const int pageSize = 512;
+        var options = Options(encrypt: false, pageSize: pageSize);
 
-        await using (var store = await KvasarStore.Open(Options(encrypt: false, pageSize: pageSize, segmentBytes: 8 * 1024))) {
-            // Bulk writes to roll several segments.
-            for (var i = 0; i < mainCount; i++)
-                await store.Set(K(i), V(i, valueSize));
-            // Extra distinct keys land in the active (highest-numbered) segment, sealed by Flush.
-            for (var i = mainCount; i < total; i++)
-                await store.Set(K(i), V(i, valueSize));
+        var oracle = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+        await using (var store = await KvasarStore.Open(options)) {
+            for (var i = 0; i < total; i++) {
+                var v = V(i, valueSize);
+                await store.Set(K(i), v);
+                oracle[Encoding.UTF8.GetString(K(i))] = v;
+            }
             await store.Flush(true);
         }
 
-        // Multiple segments must exist for a "last segment" truncation to be meaningful.
-        SegmentFiles().Length.Should().BeGreaterThan(1);
-
-        // Truncate the LAST segment mid-write: drop a couple of full pages + a partial page.
-        var lastPath = HighestSegmentFile();
-        long newLength;
-        using (var fs = new FileStream(lastPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) {
-            var length = fs.Length;
-            newLength = Math.Max(64 + pageSize, length - (2 * pageSize + 100));
-            newLength.Should().BeLessThan(length); // we actually removed bytes
-            fs.SetLength(newLength);
+        // Append a partial page of garbage: what a process killed mid-append leaves above the extent.
+        var committedLength = new FileInfo(ActiveDataFile()).Length;
+        using (var fs = new FileStream(ActiveDataFile(), FileMode.Append, FileAccess.Write, FileShare.None)) {
+            var garbage = new byte[pageSize + 100];
+            new Random(7).NextBytes(garbage);
+            fs.Write(garbage);
         }
 
-        // Force recovery via the .klog torn-tail scan (§8): drop the .kidx so the index rebuilds
-        // purely from the log, exercising ScanAll's torn-tail truncation.
-        var kidxPath = BasePath + ".kidx";
-        if (File.Exists(kidxPath))
-            File.Delete(kidxPath);
+        // Drop the index so the store rebuilds purely from the log, which is what walks the pages.
+        foreach (var path in IndexFiles())
+            File.Delete(path);
 
-        Dictionary<string, byte[]> survivors;
-        await using (var store = await KvasarStore.Open(Options(encrypt: false, pageSize: pageSize, segmentBytes: 8 * 1024))) {
-            // Open must not throw and earlier data must be intact.
-            survivors = await ScanToMap(store);
-
-            // A nonempty subset survives; the torn tail cost us at least a few trailing entries.
-            survivors.Count.Should().BeInRange(total / 2, total - 1);
-
-            // Entries written well before the truncation point (segment 1) are present & correct.
-            for (var i = 0; i < 50; i++) {
-                var got = await store.Get(K(i));
-                got.Should().NotBeNull();
-                got!.Value.ToArray().Should().Equal(V(i, valueSize));
-            }
-
-            // The store is writable afterward.
+        await using (var store = await KvasarStore.Open(options)) {
+            await AssertMatches(store, oracle); // nothing below the committed extent was lost
             await store.Set(K("after-recovery"), V(7, 123));
             (await store.Get(K("after-recovery")))!.Value.ToArray().Should().Equal(V(7, 123));
             await store.Flush(true);
         }
+        // The garbage was never overwritten — its page ids are burned, so the file only grew.
+        new FileInfo(ActiveDataFile()).Length.Should().BeGreaterThan(committedLength + pageSize + 100);
 
-        // Recovered state (survivors + the new key) persists across another reopen.
-        await using (var store = await KvasarStore.Open(Options(encrypt: false, pageSize: pageSize, segmentBytes: 8 * 1024))) {
+        await using (var store = await KvasarStore.Open(options)) {
             (await store.Get(K("after-recovery")))!.Value.ToArray().Should().Equal(V(7, 123));
             (await store.Get(K(0)))!.Value.ToArray().Should().Equal(V(0, valueSize));
         }
     }
 
-    // --- 3. .kidx is rebuildable -------------------------------------------
+    [Fact]
+    public async Task TruncatingIntoTheCommittedExtentRebuildsRatherThanServingGarbage()
+    {
+        // The other half of the contract: a superblock slot naming more data than the file holds is not
+        // adoptable, and with no adoptable slot left the store rebuilds. It never serves a partial commit.
+        const int pageSize = 512;
+        var options = Options(encrypt: false, pageSize: pageSize);
+        await using (var store = await KvasarStore.Open(options)) {
+            for (var i = 0; i < 200; i++)
+                await store.Set(K(i), V(i, 80));
+            await store.Flush(true);
+        }
+
+        using (var fs = new FileStream(ActiveDataFile(), FileMode.Open, FileAccess.Write, FileShare.None))
+            fs.SetLength(fs.Length / 2);
+
+        await using (var store = await KvasarStore.Open(options)) {
+            await store.Set(K("fresh"), V(1, 10));
+            (await store.Get(K("fresh")))!.Value.ToArray().Should().Equal(V(1, 10));
+        }
+    }
 
     [Fact]
-    public async Task KidxIsRebuildable()
+    public async Task TheFileSetIsFixedAndNeverGrows()
+    {
+        // §3: five files, all created once. Nothing is created, renamed or deleted while the store is
+        // open — which is what removed the whole segment-lifecycle bug family.
+        var options = Options(encrypt: false, pageSize: 512) with {
+            CompactionMinBytes = 1024,
+            CompactionDeadRatio = 0.3,
+        };
+        for (var round = 0; round < 3; round++) {
+            await using var store = await KvasarStore.Open(options);
+            for (var i = 0; i < 200; i++)
+                await store.Set(K(i), V(i + round * 1000, 90));
+            await store.Compact();
+            await store.Flush(true);
+
+            DataFiles().Should().HaveCount(2);
+            IndexFiles().Should().HaveCount(2);
+            File.Exists(BasePath + ".kvs").Should().BeTrue();
+            Directory.GetFiles(_dir).Should().HaveCount(6); // + the .lock
+        }
+    }
+
+    // --- 3. The index is rebuildable ---------------------------------------
+
+    [Fact]
+    public async Task IndexIsRebuildable()
     {
         var oracle = new Dictionary<string, byte[]>(StringComparer.Ordinal);
         await using (var store = await KvasarStore.Open(Options())) {
@@ -224,19 +240,19 @@ public sealed class RecoveryTests : IDisposable
             await store.Flush(true);
         }
 
-        var kidxPath = BasePath + ".kidx";
-        File.Exists(kidxPath).Should().BeTrue("a keyed hasher persists the index");
-        File.Delete(kidxPath);
+        IndexFiles().Should().Contain(x => new FileInfo(x).Length > 0, "a keyed hasher persists the index");
+        foreach (var path in IndexFiles())
+            File.Delete(path);
 
         await using (var store = await KvasarStore.Open(Options())) {
-            await AssertMatches(store, oracle); // rebuilt from the .klog
+            await AssertMatches(store, oracle); // rebuilt from the .kdat
         }
     }
 
-    // --- 4. Stale .kidx tail gap -------------------------------------------
+    // --- 4. Stale index tail gap -------------------------------------------
 
     [Fact]
-    public async Task StaleKidxTailGapReplaysFromLog()
+    public async Task StaleIndexTailGapReplaysFromLog()
     {
         var oracle = new Dictionary<string, byte[]>(StringComparer.Ordinal);
 
@@ -250,8 +266,8 @@ public sealed class RecoveryTests : IDisposable
             await store.Flush(true);
         }
 
-        var kidxPath = BasePath + ".kidx";
-        // Snapshot the stale .kidx (checkpoint@A, HWM@A) to restore after B is written.
+        var kidxPath = BasePath + ".0.kidx";
+        // Snapshot the stale index (checkpoint + A's deltas) to restore after B is written.
         var staleKidx = File.ReadAllBytes(kidxPath);
 
         // Batch B: new keys + an overwrite of an A key. Flush persists the .klog.
@@ -267,8 +283,9 @@ public sealed class RecoveryTests : IDisposable
             await store.Flush(true);
         }
 
-        // Simulate the .kidx lagging behind the .klog: restore the pre-B checkpoint. On reopen the
-        // store must replay the .klog tail past HWM@A and recover all of B (§6.5 step 4).
+        // Simulate the index lagging behind the data: restore the pre-B image. The commit named a longer
+        // index prefix than the file now holds, so recovery stops trusting it and replays the data from
+        // the checkpoint's own stamp, recovering all of B (§5.2 step 5).
         File.WriteAllBytes(kidxPath, staleKidx);
 
         await using (var store = await KvasarStore.Open(Options())) {
@@ -276,36 +293,34 @@ public sealed class RecoveryTests : IDisposable
         }
     }
 
-    // --- 5. Interrupted compaction / leftover .kidx.tmp --------------------
+    // --- 5. A v1 file set left in place ------------------------------------
 
     [Fact]
-    public async Task LeftoverKidxTmpIsIgnoredAndCleaned()
+    public async Task PreSuperblockLeftoversAreIgnoredAndWiped()
     {
+        // Upgrading from the segment layout must not strand its files, and their presence must not
+        // confuse an open: the superblock is the only thing that names anything.
         var oracle = new Dictionary<string, byte[]>(StringComparer.Ordinal);
-        await using (var store = await KvasarStore.Open(Options(encrypt: false, pageSize: 512, segmentBytes: 8 * 1024))) {
-            // Create dead space: write keys, then overwrite them many times to roll segments.
-            for (var round = 0; round < 12; round++) {
-                for (var i = 0; i < 60; i++) {
-                    var v = V(i + round * 1000, 90);
-                    await store.Set(K(i), v);
-                    oracle[Encoding.UTF8.GetString(K(i))] = v; // last round wins
-                }
+        await using (var store = await KvasarStore.Open(Options(encrypt: false, pageSize: 512))) {
+            for (var i = 0; i < 60; i++) {
+                var v = V(i, 90);
+                await store.Set(K(i), v);
+                oracle[Encoding.UTF8.GetString(K(i))] = v;
             }
             await store.Flush(true);
         }
 
-        SegmentFiles().Length.Should().BeGreaterThan(1);
+        var leftovers = new[] { BasePath + ".001.klog", BasePath + ".kidx", BasePath + ".kidx.tmp", BasePath + ".clean" };
+        foreach (var path in leftovers)
+            File.WriteAllBytes(path, [1, 2, 3, 4, 5, 6, 7]);
 
-        // Leftover temp from an interrupted checkpoint/compaction (partial garbage bytes).
-        var tmpPath = BasePath + ".kidx.tmp";
-        File.WriteAllBytes(tmpPath, [1, 2, 3, 4, 5, 6, 7]);
+        await using (var store = await KvasarStore.Open(Options(encrypt: false, pageSize: 512)))
+            await AssertMatches(store, oracle); // leftovers ignored, data intact
 
-        await using (var store = await KvasarStore.Open(Options(encrypt: false, pageSize: 512, segmentBytes: 8 * 1024))) {
-            await AssertMatches(store, oracle); // temp ignored, data intact
-        }
-
-        // A graceful open/close consumes the stale temp (checkpoint rewrite = temp -> rename).
-        File.Exists(tmpPath).Should().BeFalse();
+        // A Version bump wipes, and the wipe claims the leftovers too — they really are this store's.
+        await using (await KvasarStore.Open(Options(encrypt: false, pageSize: 512) with { Version = "next" })) { }
+        foreach (var path in leftovers)
+            File.Exists(path).Should().BeFalse();
     }
 
     // --- 6. Clear() then reopen --------------------------------------------

@@ -9,7 +9,8 @@ namespace ActualLab.Kvasar;
 /// </summary>
 public sealed record KvasarOptions
 {
-    // The store derives <base>.NNN.klog, <base>.kidx, <base>.lock from this.
+    // The store derives its whole (fixed) file set from this: <base>.kvs, <base>.{0,1}.kdat,
+    // <base>.{0,1}.kidx and <base>.lock.
     public required string BasePath { get; init; }
     // 32-byte AES-256 master key.
     public required byte[] EncryptionKey { get; init; }
@@ -33,6 +34,8 @@ public sealed record KvasarOptions
     // Auto encrypts unless Hasher is a keyed PRF.
     public IndexEncryption IndexEncryption { get; init; } = IndexEncryption.Auto;
 
+    // Unused. There is one active data file and compaction is total, so nothing rolls at a size
+    // threshold (§4). Kept so existing callers still compile.
     public long SegmentBytes { get; init; } = 16 * 1024 * 1024;
 
     // What a commit does about durability. Atomicity holds under either value — recovery authenticates

@@ -32,7 +32,8 @@ public class EncryptionTests : IDisposable
 
     private static byte[] K(string s) => Encoding.UTF8.GetBytes(s);
 
-    private string LogPath(string name = "store") => Path.Combine(_dir, name + ".001.klog");
+    // Slot 0 is the active data file of a freshly created store, and nothing here compacts.
+    private string LogPath(string name = "store") => Path.Combine(_dir, name + ".0.kdat");
 
     private static bool Contains(ReadOnlySpan<byte> haystack, ReadOnlySpan<byte> needle)
     {
@@ -82,10 +83,14 @@ public class EncryptionTests : IDisposable
         Contains(raw, K("marker-key")).Should().BeTrue("with encryption disabled the key is plaintext on disk");
     }
 
-    // 2. Wrong key ⇒ regenerate; Open never throws, returns a usable (empty) store.
+    // 2. Wrong key ⇒ throw, and leave the store untouched.
     [Fact]
-    public async Task WrongKeyRegeneratesAndNeverThrows()
+    public async Task WrongKeyThrowsAndLeavesTheStoreIntact()
     {
+        // I9. This used to wipe & recreate: "no readable state" and "wrong key" were the same answer, so
+        // a mistyped key destroyed an intact store — and it passed vacuously when the active segment was
+        // empty, which is worse still. The .kvs key check value separates the two (§3.1), and the wrong-key
+        // answer is the one case Open must NOT route into wipe-and-recreate.
         await using (var store = await KvasarStore.Open(Options())) {
             await store.Set(K("a"), K("secret"));
             await store.Set(K("b"), K("more-secret"));
@@ -96,17 +101,25 @@ public class EncryptionTests : IDisposable
         new Random(9999).NextBytes(wrong); // a different, deterministic key
         wrong.Should().NotEqual(_key);
 
-        KvasarStore? reopened = null;
-        Func<Task> open = async () => reopened = await KvasarStore.Open(Options(key: wrong));
-        await open.Should().NotThrowAsync("a wrong key must wipe & recreate, never surface an exception (§8)");
+        Func<Task> open = async () => await KvasarStore.Open(Options(key: wrong));
+        await open.Should().ThrowAsync<KvasarKeyException>();
 
-        await using var store2 = reopened!;
-        (await store2.Get(K("a"))).Should().BeNull("old data is unreadable with a different key ⇒ gone");
-        (await store2.Get(K("b"))).Should().BeNull();
+        // The store is still there, and still readable under the right key.
+        await using var store2 = await KvasarStore.Open(Options());
+        (await store2.Get(K("a")))!.Value.ToArray().Should().Equal(K("secret"));
+        (await store2.Get(K("b")))!.Value.ToArray().Should().Equal(K("more-secret"));
+    }
 
-        // Store is fully usable afterwards.
-        await store2.Set(K("fresh"), K("value"));
-        (await store2.Get(K("fresh")))!.Value.ToArray().Should().Equal(K("value"));
+    // 2b. An empty store must give the same answer: the check is on the file, not on its contents.
+    [Fact]
+    public async Task WrongKeyThrowsOnAnEmptyStoreToo()
+    {
+        await using (await KvasarStore.Open(Options())) { }
+
+        var wrong = new byte[32];
+        new Random(4242).NextBytes(wrong);
+        Func<Task> open = async () => await KvasarStore.Open(Options(key: wrong));
+        await open.Should().ThrowAsync<KvasarKeyException>();
     }
 
     // 3. Tamper detection: flipping a byte in the encrypted page region must not surface an
@@ -131,8 +144,7 @@ public class EncryptionTests : IDisposable
         await File.WriteAllBytesAsync(logPath, bytes);
 
         // Force a full log rescan (so the tampered page is decrypted & authenticated at open).
-        var kidx = Path.Combine(_dir, "store.kidx");
-        if (File.Exists(kidx))
+        foreach (var kidx in Directory.GetFiles(_dir, "store.*.kidx"))
             File.Delete(kidx);
 
         KvasarStore? reopened = null;
