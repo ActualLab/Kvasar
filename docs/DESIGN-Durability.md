@@ -288,12 +288,19 @@ The delta tail is kept: 21 bytes per write is much cheaper at open than replayin
 (values included) from the data file, and on mobile *unclean* open is the common case, not the rare
 one. Index files rotate rather than being appended after a gap:
 
-- **On unclean recovery, the index rotates.** Read the valid prefix, rebuild in RAM, write a fresh
-  full checkpoint into the *other* `.kidx` slot, commit, free the old one.
+- **Whenever recovery replayed anything, the index rotates.** Read the valid prefix, rebuild in RAM,
+  write a fresh full checkpoint into the *other* `.kidx` slot, commit, free the old one.
 
 Rotation means the index is only ever appended to contiguously, never after a hole — which is what
-makes **I3** impossible rather than merely fixed. The cost is one full index write per unclean
-start, which is the right place to pay it.
+makes **I3** impossible rather than merely fixed. The cost is one full index write, paid only on the
+opens that needed a replay.
+
+> **The trigger is "did recovery replay", not "was the open unclean".** An earlier draft said the
+> latter, and it is a live data-loss bug — see §14.1. If the valid prefix recovery reads is *shorter*
+> than the commit named, the store replays past it and then keeps appending deltas to that same file.
+> Its length grows back past `indexCommitLength` while its contents still have a hole, so the next
+> open sees a long-enough prefix, skips the replay, and adopts an index missing every truncated
+> entry. That is **I3 by another route**, reached without a single torn delta write.
 
 ### 3.4 The directory itself
 
@@ -382,7 +389,7 @@ and to anything else; their correctness comes from validation, not ordering.
        recovery must catch it and fall back, never propagate it to the wipe path.
 4. adopt G*: data is authoritative through L_{G*}
 5. index := longest valid prefix consistent with ≤ L_{G*}; replay data from there to L_{G*};
-   if the open was unclean, rotate the index (§3.3)
+   if anything was replayed, rotate the index (§3.3) — NOT "if the open was unclean" (§14.1)
 6. resume appending at ceil(physicalLength / pageSize) — never at L_{G*}
 ```
 
@@ -404,11 +411,11 @@ unrecoverable hole below the commit extent, exactly what §3.1 promises cannot e
 
 The rule that closes it:
 
-> **On unclean recovery the rotated index checkpoint is stamped at the resume offset**, not at the
+> **The rotated index checkpoint is stamped at the resume offset**, not at the
 > old committed length. So the replay range always starts *above* the burned pages.
 
-This costs nothing — §3.3 already rotates the index on an unclean open, so the only change is which
-extent that checkpoint records. It is sound because a commit extent always ends on a page boundary
+This costs nothing — §3.3 already rotates the index whenever recovery replayed, so the only change is
+which extent that checkpoint records. It is sound because a commit extent always ends on a page boundary
 and a committed page was fully written before the superblock named it, so **a torn page is always
 strictly above the last committed extent** — nothing committed is ever inside the burned range.
 
