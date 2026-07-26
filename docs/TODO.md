@@ -128,8 +128,65 @@ Tracked by the skipped `EdgeCaseTests.HashCollisionFanOut_KnownBug`. `HashIndex`
 64-bit hash alone (full keys aren't in RAM by design, §6.1), so `Set`/`Scan`/`Remove` treat any two
 same-hash keys as one entry and a later `Set` silently evicts the earlier one. On-disk full-key
 verification prevents returning a *wrong* value but doesn't provide the collision fan-out §14
-implies. Astronomically rare under SipHash-2-4; reachable with a caller-supplied hasher such as the
-built-in xxHash3. Unskip the test when the index can disambiguate.
+implies. **Investigated 2026-07-25; deliberately postponed — the test stays skipped.**
+
+#### What the code actually does
+
+*Reads are already fan-out ready.* `Get`/`GetSlow` walk every candidate `ProbeCursor` yields, skip the
+ones whose `CurrentHash` differs, and full-key-verify the rest on disk; `Scan` walks `Snapshot()` slot
+by slot. Nothing on the read path assumes one slot per hash — so no read change is needed at all.
+
+*The writer loses the fan-out, and not only in `HashIndex.Set`.* Five places collapse same-hash keys:
+
+- `HashIndex.Scan` (behind `Set`) and `RemoveCore` both stop at the **first** live slot whose hash
+  matches, so an update and a remove hit whichever colliding key got there first.
+- `KvasarStore.Publish` and `ApplyLoaded` pick that victim with `TryGetFirst(h)` — first slot for the
+  hash, no key check — for the index update **and** for the `OnSuperseded` dead-byte accounting.
+- `TryCompactOne` calls a record dead when `TryGetFirst(h) != loc`, so with two slots the loser's live
+  record is dropped by the next compaction (data loss, not just shadowing).
+- `IndexFile.Parse` resolves checkpoint + delta tail through a `Dictionary<ulong, IndexEntry>` keyed by
+  `KeyHash`, and `HashIndex.BulkLoad` is last-writer-wins per hash. Even a perfect in-RAM index
+  collapses back to one entry per hash on the next open.
+
+So **no** — fixing eviction in `Set` alone does not buy fan-out. `Set` can't even tell "same key" from
+"same hash": the only datum that distinguishes two slots is the locator, which only the store knows how
+to match against a key, and only by reading the record.
+
+#### Options
+
+**A. True fan-out.** `HashIndex` becomes locator-addressed: `Set(hash, oldLoc, newLoc, len)` (insert
+when `oldLoc` is `None`), `Remove`/`Scan` probe past hash matches whose locator differs, plus a cheap
+`Contains(hash, loc)` for compaction's liveness test. `Publish` must then decide *which* slot belongs
+to the key it is writing, and only the key bytes on disk can tell it — a record read (page decrypt when
+uncached) **per overwrite and per delete**, on a write path that today never reads. The `.kidx` must
+also say which entry a delta supersedes: either widen `IndexEntry` with the superseded locator (+8 B on
+a 21-byte entry, ~38%) or write two deltas per overwrite (a locator-matched remove + an add) and key
+`Parse`'s resolution by `(hash, locator)`. Either way the delta stream changes meaning ⇒ a
+`FormatVersion` bump ⇒ every existing store is wiped on upgrade. Touches `HashIndex`'s hot path, all
+eight mutating index call sites in `KvasarStore`, and `IndexFile`.
+
+**B. Make collisions unreachable rather than handled.** Widen the index hash to 128 bits: `IKeyHasher`
+(public) returns 128 bits, `IndexEntry` grows 8 B, the table grows 8 B/slot, every hasher is
+reimplemented. It doesn't satisfy §14's fan-out wording, but it removes the failure mode *including*
+for attacker-chosen keys, which is the only realistic way in.
+
+**C. Detect instead of silently losing.** Full-key-verify the single candidate at write time and
+throw/log on a genuine collision. Pays A's per-overwrite read without fixing anything, and converts a
+silent single-key loss into a hard failure for that key.
+
+**D. Constrain the contract and say so.** Keys must have distinct 64-bit hashes under the configured
+hasher. With the default keyed SipHash-2-4 the chance that *any* pair of n keys collides is ≈ n²/2⁶⁵ —
+about 3·10⁻⁸ at n = 10⁶ — and an attacker can't aim without the store key. With the built-in unkeyed
+`XxHash3`, collisions are constructible offline, so a store fed attacker-chosen keys can be made to
+drop entries at will. Zero code, and it's the part that's currently under-documented.
+
+#### Recommendation
+
+**D now**; **B** if Kvasar ever ingests untrusted keys under a non-keyed hasher; **A** only inside a
+change that already rewrites the `.kidx` format (it composes with D1's fsync-before-rename and I34's
+entry padding) — not on its own, and not while `HashIndex` is being rewritten for other reasons. The
+current behavior is a bounded single-key loss on a regenerable cache that self-heals on the next miss,
+which does not justify a read per overwrite plus a format break.
 
 ### C2. An unknown value-kind tag is not rejected (S)
 SPEC §4.3 says an unknown tag ⇒ corrupt ⇒ regenerate, but `RecordCodec.TryParse` casts
