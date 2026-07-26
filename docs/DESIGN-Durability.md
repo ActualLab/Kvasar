@@ -375,6 +375,9 @@ and to anything else; their correctness comes from validation, not ordering.
 2. G* := valid slot with the highest generation
 3. verify the data pages in (L_{G*-1}, L_{G*}] authenticate
    any failure  ⇒  discard G*, retry with the other slot
+   NB: a slot naming more data than the file holds makes PagedFile.Open throw
+       KvasarCorruptException. Under Buffered that is the *expected* path, not corruption —
+       recovery must catch it and fall back, never propagate it to the wipe path.
 4. adopt G*: data is authoritative through L_{G*}
 5. index := longest valid prefix consistent with ≤ L_{G*}; replay data from there to L_{G*};
    if the open was unclean, rotate the index (§3.3)
@@ -387,6 +390,32 @@ Step 6 is the nonce-safety rule and deserves its own statement. A crash mid-appe
 `P..P+k` physically present but uncommitted. Recovery rebuilds from the committed extent (which ends
 before `P`) but resumes *writing* at `P+k+1`, whose nonce has never been used. Pages `P..P+k` are
 unreferenced garbage, accounted dead, reclaimed by the next compaction.
+
+### 5.2.1 The burned range must not end up inside a replay
+
+A subtlety the crash harness caught, and the reason step 5 is ordered where it is. The burned pages
+`P..P+k` sit *above* the old committed extent, but nothing stops a **later** commit extent from
+spanning them: after recovery appends and commits, `dataCommitLength` covers `P..P+k` too, because a
+commit extent is simply the file's page-aligned end. Replaying `[index.DataCommitLength,
+dataCommitLength)` would then walk straight into a page that can never authenticate — a permanent,
+unrecoverable hole below the commit extent, exactly what §3.1 promises cannot exist.
+
+The rule that closes it:
+
+> **On unclean recovery the rotated index checkpoint is stamped at the resume offset**, not at the
+> old committed length. So the replay range always starts *above* the burned pages.
+
+This costs nothing — §3.3 already rotates the index on an unclean open, so the only change is which
+extent that checkpoint records. It is sound because a commit extent always ends on a page boundary
+and a committed page was fully written before the superblock named it, so **a torn page is always
+strictly above the last committed extent** — nothing committed is ever inside the burned range.
+
+Two consequences worth stating:
+
+- The store accounts `[committedEnd, resumeOffset)` as dead bytes, computable at open from
+  `PagedFile`'s `CommittedPageCount` and `ResumePageId`.
+- Nothing else ever reads the file sequentially: `Scan` and compaction reach records through index
+  locators, so neither can walk into the gap.
 
 This replaces both the `.clean` marker and the roll-to-a-fresh-segment-on-unclean-open. Both existed
 to prevent nonce reuse; both are subsumed by an always-true rule instead of a marker file whose
@@ -455,9 +484,17 @@ contains no bytes from any later commit.
 [0, L_{G\*}), and step 5 recomputes any part of it that is missing or inconsistent. No index state
 can therefore produce a result that differs from the one implied by the data.
 
-**(f) Nonce safety is preserved.** Step 6 resumes at or beyond the physical end of the file, so no
-`pageId` is ever issued twice under one `fileSalt`. Pages between L_{G\*} and the physical end are
-unreferenced, because the index derives only from [0, L_{G\*}).
+**(f) Nonce safety is preserved.** Step 6 resumes at or beyond the physical end of the file, so **no
+`pageId` whose ciphertext survived the crash is ever issued again** under one `fileSalt`. Pages
+between L_{G\*} and the physical end are unreferenced, because the index derives only from
+[0, L_{G\*}) and §5.2.1 keeps the replay range above them.
+
+The qualifier is load-bearing and the literal form would be false. When a crash drops a whole
+trailing write, that ciphertext is *gone* — the file shrinks and those ids are re-issued. That is
+safe precisely because nothing sealed under them survives to be XORed against, and it is what makes
+the invariant testable: the harness computes the surviving set as
+`ceil((physicalLength − headerSize) / onDiskPageSize)` and asserts against that, not against every id
+ever handed out.
 
 **(g) Compaction preserves the claim.** A compaction commit is an ordinary commit under §5.1, so
 (a)–(f) apply unchanged. The recycling rule in §3.2 guarantees no file referenced by a surviving
