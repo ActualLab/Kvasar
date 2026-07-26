@@ -185,7 +185,12 @@ that should be upgraded rather than rebuilt.
 decrypts every page of every segment. `Compact()` loops passes, so draining K segments is
 O(K × whole log) of AES-GCM. Use `ScanFrom(target, 0)` and break once the id exceeds the target.
 
-### P3. The flush loop is a fixed-period timer, not a deadline (S)
+### P3. The flush loop is a fixed-period timer, not a deadline (S) — **DONE**
+Fixed: the delay is armed on the clean⇒dirty edge, so an idle store costs zero wakeups. The
+`CommitBytes` trigger from [`DESIGN-Durability.md`](DESIGN-Durability.md) §2.2 lands with the store
+rewrite — without a superblock there is no commit window for it to bound. Original writeup:
+
+
 `RunFlushLoop` (`KvasarStore.cs:552`) does `await Task.Delay(_flushDelay)` in an unconditional loop,
 so it wakes every 500 ms for the life of the process whether or not anything was written. On a
 backgrounded mobile app that is two pointless wakeups a second — a battery cost, not just untidiness.

@@ -76,6 +76,31 @@ the cache-availability axes.
 
 ---
 
+## Fix status (updated 2026-07-25)
+
+Work is tracked against [`DESIGN-Durability.md`](DESIGN-Durability.md), which replaces the segment
+model with a fixed five-file set under an authenticated superblock. Three buckets, because the
+distinction matters: a component can be built, tested and green while `KvasarStore` still runs the
+old model, in which case **shipped behaviour is unchanged**.
+
+| State | Issues |
+|---|---|
+| **Fixed and live** | I16, I19, I23, I24, I27, I28, I31, I32, I33, I34, I35, I37 |
+| **Built + tested, not yet wired into `KvasarStore`** | I1 (P0), I3 (P0), I8, I9, I12, I20 |
+| **Dies with the segment model — awaiting the store rewrite** | I2 (P0), I4 (P0), I5, I6, I7, I10, I11, I13, I17, I18, I21, I22, I25, I26, I36, I38 |
+| **Closed by the test harness** | I30 — the `IStorageFile` seam plus a modelled device made every durability claim testable in-process; 4284 crash cases run in ~2 s |
+| **Open** | I29 (index disambiguation, L) |
+| **N/A** | I15 — the design no longer depends on `F_FULLFSYNC` on any platform (§7) |
+
+Two notes worth keeping:
+
+- **I16's fix is a semantic change.** An oversized `Set` now records a *delete* rather than leaving
+  the previous value in place. SPEC §12 said "skip + log"; under the priority model above, stale data
+  outranks a miss, and the caller cannot detect the skip. SPEC updated.
+- **I28's fix shipped without an isolating test**, deliberately. `PagedSegment.Prefetch` already
+  rethrows `OperationCanceledException` from outside `Scan`'s try/catch, so the obvious regression
+  test passes against the *unfixed* code — verified by reverting. Tracked as TODO T3.
+
 ## Cross-validation matrix
 
 | # | Issue | Pri | H+O | O5 | F5 | G5 |
