@@ -26,15 +26,24 @@ public sealed class PagedFile : IAsyncDisposable
     // Plaintext of staged pages. They aren't on disk yet, so a reader that misses the (evictable) page
     // cache must be served from here — compaction scans the file while appending to it.
     private readonly ConcurrentDictionary<long, byte[]> _pendingPlain = new();
-    private IPageCipher _cipher;
+    // The (cache id, cipher) pair a page must be decrypted and cached under, as one immutable value.
+    // Recycle swaps it atomically: readers are lock-free, so reading the two separately let a reader
+    // decrypt with the old cipher and then publish under the *new* id, poisoning the cache with a page
+    // from the slot's previous life. AES-GCM cannot catch that — both pages are genuine.
+    private sealed record Incarnation(uint FileId, IPageCipher Cipher);
+
+    private volatile Incarnation _incarnation;
     private long _pendingFirstPageId;
     private int _pendingCount;
     private long _pageCount;
+    // Whole pages whose bytes are known to be *in* the file. Deliberately not derived from
+    // IStorageFile.Length: that counts issued writes, so it runs ahead of the data during a Flush.
+    private long _flushedPageCount;
     private long _commitLength;
 
     // Identifies this file's current incarnation; also the PageCache key, so it must be unique among the
     // files sharing that cache and must change whenever the file is recycled.
-    public uint FileId { get; private set; }
+    public uint FileId => _incarnation.FileId;
     public int PageSize { get; }
     // Pages that physically exist (or are staged); equivalently, the next page id to be issued.
     public long PageCount => Volatile.Read(ref _pageCount);
@@ -117,15 +126,16 @@ public sealed class PagedFile : IAsyncDisposable
         _cipherFactory = cipherFactory;
         _cache = cache;
         _formatVer = header.FormatVer;
-        _cipher = cipherFactory.Create(header.FileSalt);
         _onDiskPageSize = header.PageSize + cipherFactory.Overhead;
         _pageCount = pageCount;
         _commitLength = commitLength;
         _pendingCapacity = Math.Max(1, MaxPendingBytes / _onDiskPageSize);
         _pending = new byte[_pendingCapacity * _onDiskPageSize];
-        FileId = cacheId ?? header.SegmentId;
+        _incarnation = new Incarnation(cacheId ?? header.SegmentId, cipherFactory.Create(header.FileSalt));
         PageSize = header.PageSize;
         ResumePageId = pageCount;
+        // Whole pages only: a torn trailing page is present but not readable as a page.
+        _flushedPageCount = (commitLength - KvasarConstants.SegmentHeaderSize) / _onDiskPageSize;
     }
 
     public async ValueTask DisposeAsync()
@@ -185,8 +195,12 @@ public sealed class PagedFile : IAsyncDisposable
         if (firstPageId < 0 || maxPages <= 0)
             return;
         try {
-            // Bound by the whole pages actually on disk, so we never decrypt staged or torn bytes.
-            var onDisk = (_file.Length - KvasarConstants.SegmentHeaderSize) / _onDiskPageSize;
+            // Bound by pages whose writes have *completed*. Using _file.Length here read bytes belonging
+            // to a write still in flight: with a real cipher that page failed authentication and was
+            // swallowed, but under NoopPageCipher it decrypted to garbage and was cached under a valid
+            // (fileId, pageId) — permanently, since Add keeps the first entry. Unlike GetPage, Prefetch
+            // reads a whole run straight from the file and never consults _pendingPlain.
+            var onDisk = Volatile.Read(ref _flushedPageCount);
             if (firstPageId >= onDisk)
                 return;
             var count = (int)Math.Min(maxPages, onDisk - firstPageId);
@@ -198,13 +212,16 @@ public sealed class PagedFile : IAsyncDisposable
             try {
                 await _file.ReadExact(PagePosition(firstPageId), buffer.AsMemory(0, byteLength), cancellationToken)
                     .ConfigureAwait(false);
+                // One incarnation for the whole run: a Recycle between the read and the decrypt would
+                // otherwise let these bytes be cached under the *new* id.
+                var inc = _incarnation;
                 for (var i = 0; i < count; i++) {
                     var pageId = firstPageId + i;
-                    if (_cache.TryGet(FileId, pageId, out _))
+                    if (_cache.TryGet(inc.FileId, pageId, out _))
                         continue;
                     var page = new byte[PageSize];
-                    _cipher.Decrypt(pageId, buffer.AsSpan(i * _onDiskPageSize, _onDiskPageSize), page);
-                    _cache.Add(FileId, pageId, page);
+                    inc.Cipher.Decrypt(pageId, buffer.AsSpan(i * _onDiskPageSize, _onDiskPageSize), page);
+                    _cache.Add(inc.FileId, pageId, page);
                 }
             }
             finally {
@@ -231,16 +248,17 @@ public sealed class PagedFile : IAsyncDisposable
         if (_pendingCount == _pendingCapacity)
             await Flush().ConfigureAwait(false);
 
+        var inc = _incarnation;
         var pageId = _pageCount;
         if (_pendingCount == 0)
             _pendingFirstPageId = pageId;
-        _cipher.Encrypt(pageId, payload.Span, _pending.AsSpan(_pendingCount * _onDiskPageSize, _onDiskPageSize));
+        inc.Cipher.Encrypt(pageId, payload.Span, _pending.AsSpan(_pendingCount * _onDiskPageSize, _onDiskPageSize));
         _pendingCount++;
 
         // Cache the immutable plaintext copy, then publish the new page (record-before-index ordering).
         var page = payload.ToArray();
         _pendingPlain[pageId] = page;
-        _cache.Add(FileId, pageId, page);
+        _cache.Add(inc.FileId, pageId, page);
         Volatile.Write(ref _pageCount, pageId + 1);
         return pageId;
     }
@@ -254,6 +272,8 @@ public sealed class PagedFile : IAsyncDisposable
         var firstPageId = _pendingFirstPageId;
         await _file.Write(PagePosition(firstPageId), _pending.AsMemory(0, count * _onDiskPageSize))
             .ConfigureAwait(false);
+        // Only now are these pages readable from the file — published after the write *returns*.
+        Volatile.Write(ref _flushedPageCount, firstPageId + count);
         _pendingCount = 0;
         // Drop the staged plaintext only after the bytes are in the file, so a concurrent reader always
         // finds the page in one place or the other, never neither.
@@ -293,9 +313,11 @@ public sealed class PagedFile : IAsyncDisposable
 
         var header = new SegmentHeader(_formatVer, PageSize, fileId);
         await WriteHeader(_file, header).ConfigureAwait(false);
-        _cipher = _cipherFactory.Create(header.FileSalt);
-        FileId = fileId;
+        // One atomic swap, so a concurrent lock-free reader sees either the whole old incarnation or the
+        // whole new one — never the old cipher paired with the new cache id.
+        _incarnation = new Incarnation(fileId, _cipherFactory.Create(header.FileSalt));
         ResumePageId = 0;
+        Volatile.Write(ref _flushedPageCount, 0);
         Volatile.Write(ref _commitLength, KvasarConstants.SegmentHeaderSize);
         Volatile.Write(ref _pageCount, 0);
     }
@@ -304,13 +326,17 @@ public sealed class PagedFile : IAsyncDisposable
 
     private async ValueTask<ReadOnlyMemory<byte>> ReadAndCache(long pageId, CancellationToken cancellationToken)
     {
-        var page = await ReadAndDecrypt(pageId, cancellationToken).ConfigureAwait(false);
+        // The decrypt and the cache insert must name the same incarnation, so it is captured once here
+        // and threaded through rather than re-read after the await.
+        var inc = _incarnation;
+        var page = await ReadAndDecrypt(inc, pageId, cancellationToken).ConfigureAwait(false);
         // Redundant concurrent decrypts of the same page are harmless (identical bytes); Add keeps the first.
-        _cache.Add(FileId, pageId, page);
+        _cache.Add(inc.FileId, pageId, page);
         return page;
     }
 
-    private async ValueTask<byte[]> ReadAndDecrypt(long pageId, CancellationToken cancellationToken)
+    private async ValueTask<byte[]> ReadAndDecrypt(
+        Incarnation inc, long pageId, CancellationToken cancellationToken)
     {
         var filePos = PagePosition(pageId);
         var onDisk = ArrayPool<byte>.Shared.Rent(_onDiskPageSize);
@@ -318,7 +344,7 @@ public sealed class PagedFile : IAsyncDisposable
             await _file.ReadExact(filePos, onDisk.AsMemory(0, _onDiskPageSize), cancellationToken)
                 .ConfigureAwait(false);
             var page = new byte[PageSize];
-            _cipher.Decrypt(pageId, onDisk.AsSpan(0, _onDiskPageSize), page);
+            inc.Cipher.Decrypt(pageId, onDisk.AsSpan(0, _onDiskPageSize), page);
             return page;
         }
         finally {

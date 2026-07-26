@@ -337,6 +337,46 @@ so the copier and the writer share one append stream and last-writer-wins by off
 (the CAS in `CompactCore` already handles the index side). Then the lock can be released between
 batches. Do not attempt the lock release without the redirect.
 
+### C4. Compaction can serve a torn value — **OPEN P0, not fixed** (serves garbage)
+`ConcurrencyTests.ReadersDuringCompaction` / `ScanDuringWrites` fail in roughly **2 of 12** runs with
+`Torn/garbage GetMany value` or `Scan yielded inconsistent value`. Every bad value has a
+self-consistent header and filler from a *different version of the same key* — a record assembled
+across two incarnations of a recycled slot. This is the top-severity failure kind under the review's
+own model: bytes the caller never stored, returned as valid.
+
+**Introduced by the v2 two-slot model.** Segments were unlinked, so a stale locator resolved to
+nothing; slots are recycled *in place*, so it can resolve into the slot's next life.
+
+Three real races were found and closed. **None changed the failure rate** (2/10 → 4/12 → 2/12), so
+the operative cause is still unidentified — do not assume these were it:
+1. `PagedFile` read `FileId` and `_cipher` as separate fields under lock-free readers, so a reader
+   could decrypt with the old cipher and publish under the new cache id. Now one immutable
+   `Incarnation` record swapped atomically.
+2. `DataLog.TryReadAt` assembled a multi-page record across several `GetPage` calls with no check that
+   the slot was still the same incarnation afterwards. Now re-checked; a mismatch reports a miss.
+3. `PagedFile.Prefetch` bounded its read by `IStorageFile.Length`, which counts *issued* writes, so it
+   could read a range whose write was still in flight. Under a real cipher the page failed
+   authentication and was swallowed; under `NoopPageCipher` it decrypted to garbage and was cached
+   under a valid `(fileId, pageId)` — permanently, since `Add` keeps the first entry. Now bounded by
+   a `_flushedPageCount` published after the write *returns*.
+
+**Strongest remaining lead**, from the agent that found it: commenting out the single `_data.Prefetch`
+call in `KvasarStore.GetMany` made it 3/3 green with nothing else changed. Fix 3 addressed the
+mechanism that made that plausible and did not close it, so either the reasoning is incomplete or
+there is a second path through the cache. Note the failures cluster on `encrypt: False`, where no
+page is authenticated — that asymmetry is the sharpest clue available and should drive the next
+attempt.
+
+**Do not ship this.** Until it is understood, compaction can serve bytes the caller never wrote.
+
+### C5. Test host crashes intermittently — **OPEN, undiagnosed**
+Roughly 1 full-suite run in 3 aborts with `Test host process crashed` after ~323 tests, with no stack
+trace and no failing test reported. An assertion failure cannot do this, so it is an unhandled
+exception on a thread nobody awaits — the flush loop, the compaction path, or a `Task.Run` in a test
+harness. Distinct from C4 (which fails assertions cleanly). Next step: run with
+`<TestProcessDumpOnCrash>` or attach a first-chance handler in a test fixture; a crash without a
+stack is worth the tooling to catch once.
+
 ## T — Testing & verification gaps
 
 ### T3. I28's fix has no test that isolates it — **done**

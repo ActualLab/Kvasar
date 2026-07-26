@@ -327,16 +327,14 @@ public sealed class ReviewRegressionTests : IDisposable
     // --- Known defects found while writing this suite ----------------------
 
     /// <summary>
-    /// KNOWN BUG (found by this suite, not by any review pass). A store that does not persist index
-    /// entries — <see cref="IndexEncryption.On"/>, or <see cref="IndexEncryption.Auto"/> with a
-    /// non-keyed hasher such as <c>KeyHashers.XxHash3</c> — reads back <b>completely empty</b> on the
-    /// next open. <c>DisposeAsync</c> forces a rotation, <c>RotateIndex</c> writes a checkpoint with no
-    /// entries stamped at the committed data extent, and <c>Recover</c> then replays from that stamp —
-    /// i.e. replays nothing. The stamp claims "the index is consistent up to here" for an index that
-    /// holds nothing. 100% permanent loss on every reopen, with no crash involved.
+    /// Regression for C3, found by this suite and not by any review pass. A store that does not persist
+    /// index entries — <see cref="IndexEncryption.On"/>, or <see cref="IndexEncryption.Auto"/> with a
+    /// non-keyed hasher — used to read back <b>completely empty</b> on the next open: the entry-less
+    /// checkpoint was stamped at the committed extent, so recovery replayed nothing and adopted it.
+    /// An entry-less checkpoint is consistent with offset 0, so that is what it is stamped at now.
     /// </summary>
-    [Fact(Skip = "Known bug: a store that doesn't persist index entries reads back empty after a reopen.")]
-    public async Task AnUnpersistedIndexStillRebuildsFromTheLog_KnownBug()
+    [Fact]
+    public async Task AnUnpersistedIndexStillRebuildsFromTheLog()
     {
         var options = Options() with { IndexEncryption = IndexEncryption.On };
         await using (var store = await KvasarStore.Open(options)) {

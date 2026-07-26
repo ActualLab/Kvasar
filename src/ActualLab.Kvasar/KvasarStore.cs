@@ -786,11 +786,15 @@ public sealed class KvasarStore : IAsyncDisposable
 
     private async ValueTask RotateIndex(long dataStamp)
     {
-        // With index persistence off the checkpoint carries no entries at all — only the data offset the
-        // in-RAM index is consistent with, which is what keeps a later replay above a burned range.
         var slot = 1 - _indexSlot;
         IndexEntry[] entries = _mustPersistIndex ? _index.Snapshot().ToArray() : [];
-        await _indexLogs[slot].WriteCheckpoint(entries, dataStamp).ConfigureAwait(false);
+        // An entry-less checkpoint is consistent with offset 0, not with the extent — it carries no
+        // record of anything. Stamping it at dataStamp made recovery compute replayFrom == committedOffset,
+        // replay nothing, and adopt an empty index: every key gone on the first reopen, no crash needed.
+        // The cost of stamping 0 is that replay now starts below any burned range, so the T5 gap
+        // (ScanFrom ends the walk at an unauthenticatable page) applies to this configuration.
+        var stamp = _mustPersistIndex ? dataStamp : 0L;
+        await _indexLogs[slot].WriteCheckpoint(entries, stamp).ConfigureAwait(false);
         _indexSlot = slot;
         _isSlotSwitchPending = true;
         _mustRotateIndex = false;

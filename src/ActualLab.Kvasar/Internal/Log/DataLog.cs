@@ -466,6 +466,13 @@ public sealed class DataLog : IAsyncDisposable
     private async ValueTask<RecordRead> TryReadAt(
         SlotState st, long offset, CancellationToken cancellationToken)
     {
+        // Pin the slot's incarnation for the whole read. A multi-page record is assembled from several
+        // GetPage calls, and BeginCompaction can recycle this slot between any two of them — which
+        // yields a record stitched from two different lives of the same file. With encryption on, the
+        // pages are individually genuine, so nothing downstream can detect it. A recycled slot means
+        // the record is gone or relocated, and the caller re-resolves through the index, so reporting
+        // a miss is both correct and what the compaction switch already promises readers.
+        var incarnation = st.File.FileId;
         var tail = st.Tail; // one read: everything below must agree on the same tail generation
         var len = LogicalLength(st, tail);
         if (offset < 0 || offset >= len)
@@ -500,6 +507,11 @@ public sealed class DataLog : IAsyncDisposable
             pid++;
             start = 0;
         }
+        // Re-check after assembling: if the slot was recycled while we walked its pages, the buffer may
+        // hold bytes from two incarnations, and with encryption on every one of them authenticates.
+        if (st.File.FileId != incarnation)
+            return default;
+
         return RecordCodec.TryDecode(buf.AsMemory(0, totalLen), out var spanned, out _)
             ? new RecordRead(true, spanned, totalLen)
             : default;
