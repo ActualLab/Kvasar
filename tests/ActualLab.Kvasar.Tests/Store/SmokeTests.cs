@@ -114,19 +114,20 @@ public class SmokeTests : IDisposable
     }
 
     [Fact]
-    public async Task WrongKeyRegenerates()
+    public async Task WrongKeyThrows()
     {
         await using (var store = await KvasarStore.Open(Options())) {
             await store.Set(K("a"), K("secret"));
             await store.Flush(true);
         }
-        // Open with a different key ⇒ corrupt ⇒ wipe & recreate (empty store), never throws.
+        // Open with a different key ⇒ throw, never wipe: an intact store must survive a bad key (§3.1).
         var wrong = (byte[])_key.Clone();
         wrong[0] ^= 0xFF;
         var opts = Options() with { EncryptionKey = wrong };
-        await using var store2 = await KvasarStore.Open(opts);
-        (await store2.Get(K("a"))).Should().BeNull();
-        await store2.Set(K("a"), K("new")); // usable
-        (await store2.Get(K("a")))!.Value.ToArray().Should().Equal(K("new"));
+        var open = async () => await KvasarStore.Open(opts);
+        await open.Should().ThrowAsync<KvasarKeyException>();
+
+        await using var store2 = await KvasarStore.Open(Options());
+        (await store2.Get(K("a")))!.Value.ToArray().Should().Equal(K("secret"));
     }
 }

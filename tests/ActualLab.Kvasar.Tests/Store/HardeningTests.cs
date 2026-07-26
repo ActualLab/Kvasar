@@ -1,7 +1,5 @@
-using System.Buffers.Binary;
 using System.Text;
 using ActualLab.Kvasar.Internal;
-using ActualLab.Kvasar.Tests.Paging;
 
 namespace ActualLab.Kvasar.Tests.Store;
 
@@ -64,20 +62,6 @@ public class HardeningTests : IDisposable
         read.Should().Be(10);
     }
 
-    [Fact]
-    public async Task IndexFileRejectsCheckpointCountThatOverflows()
-    {
-        // checkpointCount = long.MaxValue: `count * EntrySize` and `HeaderSize + that` both wrapped, so
-        // the negative result passed both guards and reached a throwing Slice.
-        var path = Path.Combine(_dir, "overflow.kidx");
-        await IndexFile.WriteCheckpoint(path, Array.Empty<IndexEntry>(), (1u, 0u), 1u);
-        var bytes = await File.ReadAllBytesAsync(path);
-        BinaryPrimitives.WriteInt64LittleEndian(bytes.AsSpan(16), long.MaxValue);
-        await File.WriteAllBytesAsync(path, bytes);
-
-        (await IndexFile.TryLoad(path, 1u)).Should().BeNull();
-    }
-
     // --- HashIndex: a sentinel locator must never reach a live slot --------------------------------
 
     [Fact]
@@ -114,32 +98,15 @@ public class HardeningTests : IDisposable
         index.Count.Should().Be(2);
     }
 
-    // --- Segment integrity ------------------------------------------------------------------------
+    // --- Data-file integrity ----------------------------------------------------------------------
 
     [Fact]
-    public async Task PagedSegmentRejectsSegmentIdThatDisagreesWithItsFileName()
+    public async Task TornTailBurnsItsPageIdsInsteadOfReusingThem()
     {
-        // The 64-byte header isn't authenticated. A flipped segmentId used to be adopted verbatim, so the
-        // set kept indexing by filename while new locators carried the bogus id: every later write read
-        // back as a miss, permanently and silently.
-        var path = Path.Combine(_dir, "seg.klog");
-        var factory = new FakePageCipherFactory(16);
-        using (await PagedSegment.Create(path, 11, 4096, factory, 1u, new PageCache(1 << 20))) { }
-
-        var act = async () => await PagedSegment.Open(path, factory, 1u, new PageCache(1 << 20), expectedSegmentId: 12);
-        await act.Should().ThrowAsync<KvasarCorruptException>();
-
-        // The matching id still opens fine.
-        using var ok = await PagedSegment.Open(path, factory, 1u, new PageCache(1 << 20), expectedSegmentId: 11);
-        ok.SegmentId.Should().Be(11u);
-    }
-
-    [Fact]
-    public async Task TornTailStartsANewSegmentInsteadOfReusingPageIds()
-    {
-        // The GCM nonce is a pure function of (fileSalt, pageId). Open floors PageCount past a torn
-        // trailing page, so appending into that segment would re-encrypt a *different* plaintext under an
-        // already-used nonce — catastrophic keystream reuse. Recovery must roll to a fresh segment.
+        // The GCM nonce is a pure function of (fileSalt, pageId). Open rounds PageCount *up* past a torn
+        // trailing page, so the next append starts above it: re-issuing that id would re-encrypt a
+        // different plaintext under an already-used nonce (§5.2 step 6). The file therefore only ever
+        // grows, and the torn page's bytes stay where they are.
         var basePath = Path.Combine(_dir, "torn");
         await using (var store = await KvasarStore.Open(Options(basePath))) {
             for (var i = 0; i < 64; i++)
@@ -147,19 +114,27 @@ public class HardeningTests : IDisposable
             await store.Flush(true);
         }
 
-        var segment1 = $"{basePath}.001.klog";
-        File.Exists(segment1).Should().BeTrue();
+        var dataPath = $"{basePath}.0.kdat";
+        File.Exists(dataPath).Should().BeTrue();
         // Chop a few bytes off the end so the file ends mid-page.
-        using (var fs = new FileStream(segment1, FileMode.Open, FileAccess.Write))
-            fs.SetLength(fs.Length - 7);
+        long tornLength;
+        using (var fs = new FileStream(dataPath, FileMode.Open, FileAccess.Write)) {
+            tornLength = fs.Length - 7;
+            fs.SetLength(tornLength);
+        }
 
         await using (var store = await KvasarStore.Open(Options(basePath))) {
             await store.Set(Key("after"), Val("recovered"));
             (await store.Get(Key("after")))!.Value.ToArray().Should().Equal(Val("recovered").ToArray());
+            await store.Flush(true);
         }
 
-        File.Exists($"{basePath}.002.klog").Should()
-            .BeTrue("a torn segment must never be appended to again, or its page nonces get reused");
+        new FileInfo(dataPath).Length.Should().BeGreaterThan(tornLength,
+            "recovery resumes above the torn page rather than overwriting its page ids");
+
+        // ... and the store reopens cleanly, with the post-recovery write intact.
+        await using (var reopened = await KvasarStore.Open(Options(basePath)))
+            (await reopened.Get(Key("after")))!.Value.ToArray().Should().Equal(Val("recovered").ToArray());
     }
 
     // Private methods

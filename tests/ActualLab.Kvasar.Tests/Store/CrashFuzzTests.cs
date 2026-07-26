@@ -104,20 +104,16 @@ public sealed class CrashFuzzTests : IDisposable
     }
 
     [Fact]
-    public async Task SetManyWritesSurviveAKidxCheckpointFiredMidBatch()
+    public async Task SetManyWritesSurviveAnIndexCheckpointFiredMidBatch()
     {
-        // Minimal deterministic reduction of the failure AbortedMidWriteRecovers(seed 5) finds.
+        // Minimal deterministic reduction of the failure AbortedMidWriteRecovers(seed 5) once found: an
+        // index checkpoint taken while a batch was only half-published stamped an extent covering the
+        // whole batch, so recovery replayed from *after* the records whose deltas were still buffered and
+        // lost them for good — even though SetMany had returned and the log held them.
         //
-        // KvasarStore.Publish -> AppendDelta checkpoints inline once _deltaCount > _index.Count / 2 + 64,
-        // and SetMany appends + Flush()es the WHOLE batch before its publish loop starts. So a checkpoint
-        // taken from inside that loop stamps hwm = end-of-batch onto an index that is only populated up to
-        // the current loop iteration. The remaining entries' deltas then land in a freshly reopened, never
-        // fsynced 4 KiB FileStream buffer; an abort drops them, and because LoadIndex replays only
-        // ScanFrom(cp.SegmentId, cp.Hwm) — i.e. from the end of the batch — their records are never
-        // re-read. Those writes are gone for good even though SetMany returned and the .klog holds them.
-        //
-        // The warmups below straddle both checkpoint epochs of a fresh store (trigger #1 at insert 130,
-        // #2 at insert 389), so this keeps biting even if the trigger constants are retuned a little.
+        // It cannot happen in the superblock model: a checkpoint is only ever written from inside a commit,
+        // which runs after the whole batch is published, and its stamp is the extent that same commit
+        // names. The warmups still straddle several checkpoint epochs so a future trigger change is caught.
         const int batchSize = 24;
         foreach (var warmup in new[] { 124, 126, 128, 386 }) {
             var liveDir = Path.Combine(_root, $"mid{warmup}");
@@ -130,9 +126,8 @@ public sealed class CrashFuzzTests : IDisposable
                 for (var j = 0; j < batchSize; j++)
                     batch.Add((Utf8($"batch{j:D2}"), Val(new byte[16])));
                 await store.SetMany(batch);
-                // Every record is already on disk here: Set/SetMany both Flush() the segments before
-                // publishing. Only the .kidx delta buffer is still in user space, which is exactly what a
-                // kill -9 loses.
+                // FlushDelay = 0 commits per write, so every record is committed here. Only the index's
+                // staged delta buffer can still be in user space, which is exactly what a kill -9 loses.
                 Snapshot(liveDir, snapshotDir);
             }
 
@@ -163,7 +158,8 @@ public sealed class CrashFuzzTests : IDisposable
             await AssertGetReturnsOnlyKnownValues(store, model, because);
             await AssertScanAgreesWithGet(store, contents, because);
             AssertLossIsASuffix(contents, model, because);
-            if (fault is not (FaultKind.TruncateActiveLog or FaultKind.CorruptLogHeader))
+            if (fault is not (FaultKind.TruncateActiveLog or FaultKind.CorruptLogHeader
+                or FaultKind.TruncateSuperblockSlot))
                 AssertFlushedDataSurvives(contents, model, because);
 
             var probeValue = NewValue(rnd);
@@ -276,19 +272,18 @@ public sealed class CrashFuzzTests : IDisposable
 
     private static void ApplyFault(string dir, FaultKind fault, Random rnd)
     {
-        var kidxPath = Path.Combine(dir, StoreName + ".kidx");
         switch (fault) {
         case FaultKind.None:
             break;
         case FaultKind.TruncateActiveLog: {
-            var path = ActiveSegmentPath(dir);
+            var path = ActiveDataPath(dir);
             using var fs = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.None);
             if (fs.Length > 0)
                 fs.SetLength(rnd.NextInt64(0, fs.Length));
             break;
         }
         case FaultKind.CorruptLogHeader: {
-            var path = ActiveSegmentPath(dir);
+            var path = ActiveDataPath(dir);
             using var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
             fs.Seek(rnd.Next(KvasarConstants.SegmentHeaderSize), SeekOrigin.Begin);
             var b = fs.ReadByte();
@@ -297,33 +292,38 @@ public sealed class CrashFuzzTests : IDisposable
             break;
         }
         case FaultKind.TruncateIndex: {
-            if (!File.Exists(kidxPath))
-                break;
-            using var fs = new FileStream(kidxPath, FileMode.Open, FileAccess.Write, FileShare.None);
-            if (fs.Length > 0)
-                fs.SetLength(rnd.NextInt64(0, fs.Length));
+            foreach (var path in IndexPaths(dir)) {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.None);
+                if (fs.Length > 0)
+                    fs.SetLength(rnd.NextInt64(0, fs.Length));
+            }
             break;
         }
         case FaultKind.PartialIndexDelta: {
-            if (!File.Exists(kidxPath))
-                break;
-            var partial = new byte[rnd.Next(1, IndexFile.EntrySize)];
-            rnd.NextBytes(partial);
-            AppendBytes(kidxPath, partial);
+            foreach (var path in IndexPaths(dir)) {
+                var partial = new byte[rnd.Next(1, IndexLog.EntrySize)];
+                rnd.NextBytes(partial);
+                AppendBytes(path, partial);
+            }
             break;
         }
         case FaultKind.GarbageIndexDelta: {
-            if (!File.Exists(kidxPath))
-                break;
-            var garbage = new byte[IndexFile.EntrySize * rnd.Next(1, 4)];
-            rnd.NextBytes(garbage);
-            AppendBytes(kidxPath, garbage);
+            foreach (var path in IndexPaths(dir)) {
+                var garbage = new byte[IndexLog.EntrySize * rnd.Next(1, 4)];
+                rnd.NextBytes(garbage);
+                AppendBytes(path, garbage);
+            }
             break;
         }
-        case FaultKind.LeftoverIndexTmp: {
-            var tmp = new byte[rnd.Next(1, 200)];
-            rnd.NextBytes(tmp);
-            File.WriteAllBytes(kidxPath + ".tmp", tmp);
+        case FaultKind.TruncateSuperblockSlot: {
+            // The newest slot is lost but the older one survives: recovery must fall back to it rather
+            // than wipe, which is the whole point of writing the two slots alternately (§3.1).
+            var path = Path.Combine(dir, StoreName + ".kvs");
+            if (!File.Exists(path))
+                break;
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.None);
+            if (fs.Length > Superblock.HeaderSize + Superblock.SlotSize)
+                fs.SetLength(Superblock.HeaderSize + Superblock.SlotSize);
             break;
         }
         default:
@@ -331,9 +331,14 @@ public sealed class CrashFuzzTests : IDisposable
         }
     }
 
-    private static string ActiveSegmentPath(string dir)
-        // Segment file names are zero-padded (`store.001.klog`), so ordinal order is segment-id order.
-        => Directory.EnumerateFiles(dir, StoreName + ".*.klog").OrderBy(x => x, StringComparer.Ordinal).Last();
+    // The store never renames or recreates its files, so the active one is whichever the superblock
+    // names — which the test can't read. Faulting the larger file hits the active slot in practice.
+    private static string ActiveDataPath(string dir)
+        => Directory.EnumerateFiles(dir, StoreName + ".*.kdat")
+            .OrderByDescending(x => new FileInfo(x).Length).First();
+
+    private static string[] IndexPaths(string dir)
+        => Directory.EnumerateFiles(dir, StoreName + ".*.kidx").Where(x => new FileInfo(x).Length > 0).ToArray();
 
     private static void AppendBytes(string path, byte[] bytes)
     {
@@ -451,7 +456,7 @@ public sealed class CrashFuzzTests : IDisposable
         TruncateIndex,
         PartialIndexDelta,
         GarbageIndexDelta,
-        LeftoverIndexTmp,
+        TruncateSuperblockSlot,
     }
 
     /// <summary>

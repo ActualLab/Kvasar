@@ -169,15 +169,16 @@ public sealed class ConcurrencyTests : IDisposable
         }
     }
 
-    // --- Test 3: concurrent readers during segment rolling (+ compaction) -------
+    // --- Test 3: concurrent readers during compaction ---------------------------
 
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    public async Task ReadersDuringSegmentRolling(bool encrypt)
+    public async Task ReadersDuringCompaction(bool encrypt)
     {
         var errors = new ConcurrentQueue<string>();
-        // Tiny segments ⇒ the writer rolls (and compacts away) segments constantly while readers run.
+        // A low dead-ratio threshold ⇒ the writer compacts (and switches data slots) constantly while
+        // readers run, so every read races a slot switch.
         await using var store = await KvasarStore.Open(Options(encrypt, segmentBytes: 24 * 1024));
 
         var deadline = Environment.TickCount64 + DurationMs;
@@ -193,7 +194,7 @@ public sealed class ConcurrencyTests : IDisposable
                     if ((++ops & 31) == 0)
                         await store.Flush(false);
                     if ((ops & 511) == 0)
-                        await store.Compact(); // segment GC ⇒ RemoveSegment concurrent with lock-free reads (§9)
+                        await store.Compact(); // slot switch concurrent with lock-free reads (§4)
                 }
             }
             catch (Exception ex) {
@@ -206,9 +207,11 @@ public sealed class ConcurrencyTests : IDisposable
 
         errors.Should().BeEmpty();
 
-        // Rolling actually happened: more than one .klog segment file exists on disk.
-        var segments = Directory.GetFiles(_dir, "store.*.klog");
-        segments.Length.Should().BeGreaterThan(1, "small SegmentBytes must force the writer to roll segments");
+        // Compaction recycles slots in place: the file set is the same two data files it started with.
+        Directory.GetFiles(_dir, "store.*.kdat").Should().HaveCount(2);
+        await store.Flush(true);
+        for (var k = 0; k < KeyCount; k++)
+            (await store.Get(Key(k))).Should().NotBeNull($"key {k} must survive every compaction");
     }
 
     // --- Test 4: Scan during writes --------------------------------------------
