@@ -331,6 +331,31 @@ public class EdgeCaseTests : IDisposable
         (await store2.Get(K("c")))!.Value.ToArray().Should().Equal(K("charlie"));
     }
 
+    [Fact]
+    public async Task WipeLeavesNeighbouringFilesAlone()
+    {
+        // I31: the wipe glob accepted any "<base>.*" ending in .klog, so wiping `store` also deleted
+        // a caller's `store.backup.klog` sitting in the same directory.
+        var v1 = Options() with { FormatVersion = "1" };
+        await using (var store = await KvasarStore.Open(v1)) {
+            await store.Set(K("a"), K("alpha"));
+            await store.Flush(true);
+        }
+
+        var neighbour = Path.Combine(_dir, "store.backup.klog");
+        var notes = Path.Combine(_dir, "store.notes");
+        await File.WriteAllTextAsync(neighbour, "not kvasar's");
+        await File.WriteAllTextAsync(notes, "also not kvasar's");
+
+        await using var store2 = await KvasarStore.Open(Options() with { FormatVersion = "2" });
+
+        File.Exists(neighbour).Should().BeTrue("a .klog whose suffix isn't a segment id isn't ours");
+        (await File.ReadAllTextAsync(neighbour)).Should().Be("not kvasar's");
+        File.Exists(notes).Should().BeTrue();
+        // ... while the store's own files really were wiped.
+        (await store2.Get(K("a"))).Should().BeNull();
+    }
+
     // --- Version (the caller's own data version) mismatch ⇒ wipe ------------
 
     [Fact]

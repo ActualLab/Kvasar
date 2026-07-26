@@ -789,13 +789,30 @@ public sealed class KvasarStore : IAsyncDisposable
         if (dir == null || !Directory.Exists(dir))
             return;
         foreach (var file in Directory.EnumerateFiles(dir, name + ".*")) {
-            var ext = Path.GetExtension(file);
-            if (ext is ".klog" or ".kidx" or ".clean" || file.EndsWith(".kidx.tmp", StringComparison.Ordinal)
-                    || Path.GetFileName(file).EndsWith(".klog", StringComparison.Ordinal)) {
-                try { File.Delete(file); }
-                catch { /* best-effort */ }
-            }
+            if (!IsOwnFile(name, Path.GetFileName(file)))
+                continue;
+            try { File.Delete(file); }
+            catch { /* best-effort */ }
         }
+    }
+
+    private static bool IsOwnFile(string baseName, string fileName)
+    {
+        // Exact suffixes only. The old test accepted any "<base>.*" ending in .klog, so wiping `cache`
+        // also deleted a user's `cache.backup.klog` (I31) — a segment suffix must be all digits.
+        if (fileName.Length <= baseName.Length || !fileName.StartsWith(baseName, StringComparison.Ordinal))
+            return false;
+
+        var suffix = fileName.AsSpan(baseName.Length);
+        if (suffix is ".kidx" or ".clean" or ".kidx.tmp")
+            return true;
+        if (suffix.Length < 7 || suffix[0] != '.' || !suffix.EndsWith(".klog", StringComparison.Ordinal))
+            return false;
+
+        foreach (var c in suffix[1..^5])
+            if (!char.IsAsciiDigit(c))
+                return false;
+        return true;
     }
 
     private static uint ParseFormatVersion(string formatVersion, string? version)
