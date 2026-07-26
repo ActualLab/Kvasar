@@ -298,6 +298,19 @@ public sealed class DataLog : IAsyncDisposable
         st.DeadBytes = Math.Max(0, LogicalLength(st) - liveBytes);
     }
 
+    // Zeroes a slot's counters. Used on the slot a compaction just drained: its bytes are awaiting
+    // recycling, not garbage inside the active file, and counting them would immediately re-arm the
+    // dead-ratio trigger that the compaction just satisfied.
+    public void ResetAccounting(int slot)
+    {
+        if ((uint)slot >= SlotCount)
+            throw new ArgumentOutOfRangeException(nameof(slot));
+
+        var st = _slots[slot];
+        st.LiveBytes = 0;
+        st.DeadBytes = 0;
+    }
+
     public async ValueTask SealTail()
     {
         await SealTail(_active).ConfigureAwait(false);
