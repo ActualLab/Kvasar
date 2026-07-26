@@ -478,7 +478,11 @@ caches repopulate. `.kidx` is always rebuildable and may be discarded across ver
 
 ## 12. Error model
 - Misses ⇒ `null`, never exceptions.
-- Oversized value (> `MaxValueBytes`) ⇒ **[DECISION]** skip + log (recommended) vs. throw.
+- Oversized value (> `MaxValueBytes`) ⇒ recorded as a **delete**, or throw when
+  `OversizedValueThrows`. It is deliberately not "skip": skipping left the previous value in place, so
+  the key kept serving data the caller had already replaced, permanently and undetectably (I16). Under
+  §Priority a miss costs one upstream lookup while stale data has no downstream defence, so the write
+  degrades to a delete rather than to a no-op.
 - Unrecoverable state ⇒ a single `KvasarCorruptException` the adapter catches to wipe & recreate.
 
 ## 13. ActualChat integration

@@ -162,21 +162,27 @@ public class EdgeCaseTests : IDisposable
     // --- Oversized value ----------------------------------------------------
 
     [Fact]
-    public async Task OversizedValueSkippedByDefault()
+    public async Task OversizedValueDeletesRatherThanKeepingTheOldOne()
     {
         var opts = Options() with { MaxValueBytes = 16, OversizedValueThrows = false };
         await using var store = await KvasarStore.Open(opts);
 
-        // Absent key + oversized set ⇒ silently skipped, no throw, still absent.
+        // Absent key + oversized set ⇒ no throw, still absent.
         await store.Set(K("a"), new byte[17]);
         (await store.Get(K("a"))).Should().BeNull();
 
-        // Prior value preserved when a later oversized set is skipped.
+        // I16: this used to leave `ten` in place, so the key served a value the caller had already
+        // replaced — permanently, and with no way to notice. A miss costs one upstream lookup;
+        // stale data has no downstream defence, so the oversized set is recorded as a delete.
         var ten = new byte[10];
         new Random(1).NextBytes(ten);
         await store.Set(K("b"), ten);
-        await store.Set(K("b"), new byte[20]); // skipped
-        (await store.Get(K("b")))!.Value.ToArray().Should().Equal(ten);
+        await store.Set(K("b"), new byte[20]);
+        (await store.Get(K("b"))).Should().BeNull();
+
+        // ... and the delete is durable, not just an in-memory index edit.
+        await store.Flush(true);
+        (await store.Get(K("b"))).Should().BeNull();
 
         // Exactly at the limit ⇒ accepted.
         var atLimit = new byte[16];

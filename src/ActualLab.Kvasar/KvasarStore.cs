@@ -467,8 +467,13 @@ public sealed class KvasarStore : IAsyncDisposable
         if (!isTombstone && record.Length > _options.MaxValueBytes) {
             if (_options.OversizedValueThrows)
                 throw new ArgumentException($"Value exceeds MaxValueBytes ({_options.MaxValueBytes}).", nameof(value));
-            // §12: skip oversized value (default). Callers wanting failures set OversizedValueThrows.
-            return new AppendResult(Locator.None, 0, isTombstone);
+            // §12: an oversized value isn't stored. It is recorded as a *delete* rather than skipped,
+            // because skipping left the previous value in place — so the key kept serving data the caller
+            // had already replaced, permanently and silently (I16). A miss costs one upstream lookup;
+            // stale data has no downstream defence. Throwing doesn't help on its own: callers ignore a
+            // throw from Set and carry on believing the write landed.
+            isTombstone = true;
+            record = default;
         }
         var (locator, recordLength) = await _segments
             .Append(RecordFlags.None, record.Kind, key.Memory, record.Memory, isTombstone)
