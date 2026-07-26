@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.IO;
 using System.Text;
 using ActualLab.Kvasar.Crypto;
@@ -252,6 +253,41 @@ public class EdgeCaseTests : IDisposable
         results[3].Should().BeNull();
         results[4].Should().NotBeNull();
         results[4]!.Value.Length.Should().Be(0);
+    }
+
+    [Fact]
+    public async Task GetManyMatchesGetOnAColdStore()
+    {
+        // I27: GetMany now resolves locators up front, sorts by locator and prefetches runs instead of
+        // looping Get. Results must stay positional and identical to per-key Get, including for
+        // tombstones, duplicates and misses — and after a reopen, where nothing is cached.
+        var opts = Options();
+        var keys = new List<KvasarKey>();
+        await using (var store = await KvasarStore.Open(opts)) {
+            for (var i = 0; i < 120; i++) {
+                var k = K("key" + i.ToString(CultureInfo.InvariantCulture));
+                await store.Set(k, K("value" + i.ToString(CultureInfo.InvariantCulture)));
+                keys.Add(k);
+            }
+            await store.Set(K("key7"), null); // delete
+            await store.Flush(true);
+        }
+
+        keys.Add(K("absent"));
+        keys.Add(K("key3"));       // duplicate of an earlier entry
+        keys.Reverse();            // request order deliberately unrelated to locator order
+
+        await using var reopened = await KvasarStore.Open(opts);
+        var batch = await reopened.GetMany(keys);
+
+        batch.Should().HaveCount(keys.Count);
+        for (var i = 0; i < keys.Count; i++) {
+            var single = await reopened.Get(keys[i]);
+            if (single is null)
+                batch[i].Should().BeNull();
+            else
+                batch[i]!.Value.ToArray().Should().Equal(single.Value.ToArray());
+        }
     }
 
     // --- Stats sanity + compaction reclaim ----------------------------------

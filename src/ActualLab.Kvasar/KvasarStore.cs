@@ -200,8 +200,47 @@ public sealed class KvasarStore : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(keys);
         var results = new KvasarValue?[keys.Count];
-        for (var i = 0; i < keys.Count; i++)
-            results[i] = await Get(keys[i], cancellationToken).ConfigureAwait(false);
+        if (keys.Count <= 1) {
+            if (keys.Count == 1)
+                results[0] = await Get(keys[0], cancellationToken).ConfigureAwait(false);
+            return results;
+        }
+
+        // §6.4: resolve locators from the in-RAM index first, then read in locator order with run
+        // readahead, so a cold batch walks the log forward instead of paying one random I/O per key.
+        // Get() still does the candidate walk and the on-disk full-key verify, so hash-collision
+        // handling is unchanged — this decides only the order and the prefetching.
+        var order = new (ulong Packed, int Index)[keys.Count];
+        for (var i = 0; i < keys.Count; i++) {
+            var h = _hasher.Hash(keys[i].Span, _hashKey);
+            var cursor = _index.Probe(h);
+            var packed = ulong.MaxValue; // unresolved ⇒ sorts last; Get returns null without touching disk
+            while (cursor.MoveNext(out var loc, out _)) {
+                if (cursor.CurrentHash != h)
+                    continue;
+                packed = loc.Packed;
+                break;
+            }
+            order[i] = (packed, i);
+        }
+        Array.Sort(order, static (a, b) => a.Packed.CompareTo(b.Packed));
+
+        var prefetchPages = _segments.PrefetchPages;
+        var prefetchedFile = uint.MaxValue;
+        var nextPrefetchPage = 0L;
+        foreach (var (packed, index) in order) {
+            if (packed != ulong.MaxValue) {
+                var loc = Locator.FromPacked(packed);
+                var pageId = loc.Offset / _pageSize;
+                if (loc.FileId != prefetchedFile || pageId >= nextPrefetchPage) {
+                    await _segments.Prefetch(loc.FileId, pageId, prefetchPages, cancellationToken)
+                        .ConfigureAwait(false);
+                    prefetchedFile = loc.FileId;
+                    nextPrefetchPage = pageId + prefetchPages;
+                }
+            }
+            results[index] = await Get(keys[index], cancellationToken).ConfigureAwait(false);
+        }
         return results;
     }
 
