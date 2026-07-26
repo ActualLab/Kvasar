@@ -96,6 +96,13 @@ Most of these were not fixed individually. The segment lifecycle that produced I
 I13, I17, I18, I21, I22, I25, I26, I36 and I38 no longer exists, and the `.clean` marker whose
 write/consume asymmetry *was* I1 is gone with it.
 
+> **The rewrite introduced two new defects of its own, and the table above should not be read as
+> "done".** `TODO.md` § **C4** is an open **P0** — compaction can serve a torn value assembled from
+> two incarnations of a recycled slot, which is the same *serves garbage* class as I3. Segments made
+> it impossible by unlinking; slots are recycled in place. § **C5** is an undiagnosed intermittent
+> test-host crash. Both were found by the regression suite written for this table, which is the
+> argument for writing it: closing 33 issues is worth little if the closing introduces two more.
+
 Two notes worth keeping:
 
 - **I16's fix is a semantic change.** An oversized `Set` now records a *delete* rather than leaving
