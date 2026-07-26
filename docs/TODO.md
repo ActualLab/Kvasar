@@ -292,6 +292,23 @@ that it landed whole (and survives a reopen) — or, for the queued writer, that
 The one seam still missing is per-page injection: `IPageCipherFactory` isn't reachable from
 `KvasarOptions`, so "cancel between page 3 and 4" can't be expressed through the public API.
 
+### T4. `ScanAgreesWithPointReadsAfterAKill` is intermittently red (unreproduced — re-check after the rewrite)
+`Store/ProcessCrashRecoveryTests.cs:78`. Seen failing **three times total** by two independent
+sessions, always during a *full-suite* run, never in isolation — an acknowledged key present to point
+reads but missing from `Scan`. Attempts to reproduce: 6 isolated runs of the class and 4 full-suite
+runs after the `DataLog` merge, all green.
+
+Worth treating as real rather than as harness noise, because the invariant it asserts —
+`Scan` agrees with point reads — is a *consistency* property, not a durability one, and losing a
+write would fail it in a different way (both would miss the key). A divergence means the index and
+the scan path disagree about the same store.
+
+Two candidate explanations, untested: a race in the worker's stdout acknowledgement (so the test
+believes a write was acknowledged that never was), or a genuine gap where `Scan`'s index snapshot and
+`Get`'s probe resolve a key differently after recovery. **Re-check after the store rewrite** — the
+v2 recovery path replaces the machinery involved, so this either disappears or becomes reproducible
+against code worth debugging. Do not close it silently if it simply stops appearing.
+
 ### T2. No durability item (D1–D5) is testable in this suite (L)
 `CrashFuzzTests`/`ProcessCrashRecoveryTests` kill a process, which does **not** drop the OS page
 cache, so they cannot distinguish a durable write from a merely-written one. Verifying any fsync
