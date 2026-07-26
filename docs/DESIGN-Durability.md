@@ -197,17 +197,50 @@ liveBytes, deadBytes     accounting, drives the compaction trigger
 MAC                      AES-GCM tag over all of the above, under the derived key
 ```
 
-Slot for generation *G* is `G mod 2`, so a write never touches the slot currently being relied on.
+Slot for generation *G* is `G mod 2`, and this is **checked on read**, not merely followed on write:
+an authenticated blob is position-independent, so a slot byte-copied into the other position would
+otherwise authenticate happily. Recovery must not have to assume its own writer was correct.
 
-Three properties come out of this for free:
+A slot is also **range-checked** after it authenticates. A MAC proves integrity, not plausibility —
+a slot written by a buggy writer can authenticate and still name `dataSlot = 7` or a negative
+`dataCommitLength`. Such a slot is treated as invalid, exactly like one that fails its tag.
+
+Ahead of the two slots sits a 64-byte **file header**, written once at store creation:
+
+```
+magic "KSUP", formatVer
+kcvNonce   12 B   random, written once, never rewritten
+kcvTag     16 B   AES-GCM tag over a fixed constant, under the superblock subkey, AAD = formatVer
+```
+
+That **key check value** exists to separate three cases a MAC alone cannot distinguish, because
+authentication fails identically for all of them:
+
+| Condition | Meaning | Action |
+|---|---|---|
+| file absent or zero-length | new store | create |
+| bad magic, or `formatVer` mismatch | deliberate format/`Version` bump | wipe & recreate |
+| header intact, **KCV fails** | **wrong master key** | **throw — never wipe** |
+| KCV passes, neither slot authenticates | genuine corruption | wipe & rebuild |
+
+The ordering matters: `formatVer` is checked *before* the KCV, so a deliberate `KvasarOptions.Version`
+bump still wipes rather than being reported as a wrong key.
+
+Without the KCV, "no valid slot" would collapse wrong-key into corruption, and §5.2's "wipe &
+rebuild" would mean **a wrong key silently destroys an intact store** — worse than the I9 bug this
+replaces. (That is also what the current code does: `SegmentSet.Discover` decrypts page 0 and lets
+the throw reach the wipe path. So this is a fix, not a regression, but the redesign is where it gets
+fixed.)
+
+Three further properties come out of the slot design for free:
 
 - **A torn superblock write is self-detecting.** A partially written slot fails its MAC and is
   discarded. This is why the superblock needs no flush of its own: if the newest slot is lost or
   torn, recovery falls back to the previous one, which names an earlier *complete* commit — exactly
   what §1 permits.
-- **The superblock is authenticated under the master key**, so opening with the wrong key fails at
-  the first read, before anything is trusted. Strictly better than the current "decrypt page 0 of
-  the active segment" check, which passes vacuously when that segment is empty (issue **I9**).
+- **The wrong master key is caught at the first read**, before anything is trusted — and now
+  distinguishably, per the table above. Strictly better than the current "decrypt page 0 of the
+  active segment" check, which passes vacuously when that segment is empty (issue **I9**).
 - **Committed extents are explicit byte offsets.** Nothing is ever inferred from file length. There
   is no torn-tail heuristic, no "parse until it stops making sense". Bytes past `dataCommitLength`
   are not data: not read, not parsed, not scanned.
@@ -227,6 +260,13 @@ Two rules govern them:
   rule for nonce safety.
 - **A data file may be recycled only when no valid superblock slot references it.** With two slots
   that means one extra commit must pass after a compaction switches away from a file.
+- **`PageCache` ids are assigned by the store, never read from the file header.** `PageCache` keys
+  *decrypted* pages by `(fileId, pageId)`, and the header carrying `fileId` is unauthenticated
+  plaintext. If two files' headers ever reported the same id, their cache entries would collide and
+  one file's read would be served the other's plaintext — after decryption, so AES-GCM cannot catch
+  it. `PagedSegment` guarded this by validating header id against file name; with fixed slot names
+  that check is gone, so the store must mint ids itself. The cache is in-memory only, so a monotonic
+  per-process counter suffices.
 
 ### 3.3 The index files — `<base>.N.kidx`
 
@@ -480,6 +520,11 @@ Two implementations: the real one, and a fake that models a device — writes la
 state, `FlushToDisk` promotes volatile→stable, and `Crash()` discards volatile state, optionally
 reordering and tearing within it. The fake is exactly the §6 model, which is what lets the proof be
 tested rather than merely asserted.
+
+`Length` is deliberately **the store's own view, not the kernel's**: it counts writes that have been
+*issued*, not only those that have completed, because the commit protocol needs to name an extent
+before the write to it is awaited. A consequence worth stating: an external writer to the same file
+would be invisible. `StoreLock` is what makes that acceptable.
 
 ## 9. Testing the invariants
 
