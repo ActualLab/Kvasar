@@ -304,6 +304,12 @@ public sealed class KvasarStore : IAsyncDisposable
             }
             if (!read.IsFound || read.View.IsTombstone)
                 continue;
+            // Verify the record is the one the entry named. A compaction recycles the drained file in
+            // place, so a locator from this snapshot can end up resolving inside the *new* contents of
+            // that slot and decoding as a different — entirely valid — record. Get is covered by its
+            // full-key compare against the caller's bytes; a scan has no key to compare, so it re-hashes.
+            if (_hasher.Hash(read.View.Key.Span, _hashKey) != e.KeyHash)
+                continue;
             yield return (new KvasarKey(read.View.Key), new KvasarValue(read.View.Value, read.View.ValueKind));
         }
     }
@@ -893,18 +899,19 @@ public sealed class KvasarStore : IAsyncDisposable
                 }
                 // Tombstones are simply dropped: compaction is total, so no earlier file survives holding
                 // the record this one deletes, and there is nothing left to resurrect (I4). A record that
-                // cannot be read is dropped with them — carrying its entry forward would put a dangling
-                // locator into the checkpoint, aimed at the file this switch is about to recycle.
-                if (!read.IsFound || read.View.IsTombstone) {
+                // cannot be read — or that isn't the one the entry named, which a locator left over from
+                // an earlier switch can be — is dropped with them, rather than carrying a dangling
+                // locator into the checkpoint or copying a foreign record forward under this key's hash.
+                var view = read.View;
+                if (!read.IsFound || view.IsTombstone
+                    || _hasher.Hash(view.Key.Span, _hashKey) != e.KeyHash) {
                     _index.Remove(e.KeyHash, loc);
                     continue;
                 }
-                var view = read.View;
-                var h = _hasher.Hash(view.Key.Span, _hashKey);
                 var (newLoc, newLength) = await _data
                     .AppendToTarget(view.Flags, view.ValueKind, view.Key, view.Value, false)
                     .ConfigureAwait(false);
-                pending.Add((h, loc, newLoc, newLength));
+                pending.Add((e.KeyHash, loc, newLoc, newLength));
             }
             // Seal before repointing, so a published locator always names an immutable page.
             await _data.SealTail().ConfigureAwait(false);

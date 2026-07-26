@@ -505,6 +505,13 @@ public class DataLogTests
                 published.TryDequeue(out _);
         }
 
+        // Wait for the readers to have seen something before calling the race over: on a loaded machine
+        // the writer can finish all 3000 appends before a reader task is scheduled even once, and the
+        // test then fails on its own liveness check rather than on anything the log did.
+        var deadline = Environment.TickCount64 + 30_000;
+        while (Interlocked.Read(ref readCount) == 0 && Environment.TickCount64 < deadline)
+            await Task.Delay(1);
+
         await stopCts.CancelAsync();
         await Task.WhenAll(readerTasks);
         Interlocked.Read(ref readCount).Should().BeGreaterThan(0, "the readers must have raced the writer");
