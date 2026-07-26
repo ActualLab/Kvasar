@@ -1,5 +1,12 @@
 # Kvasar — outstanding items
 
+> **Largely superseded by [`DESIGN-Durability.md`](DESIGN-Durability.md) (2026-07-25).** That
+> proposal replaces segments with a fixed five-file set governed by an authenticated superblock, and
+> in doing so eliminates D1–D5, G1–G5 and C-cluster items *structurally* rather than fixing them
+> individually — 23 of the 38 issues in [`REVIEW-Overlap.md`](REVIEW-Overlap.md) cease to exist,
+> including all four P0s. The items below that survive it are A1–A4, C1, C2, P2, T1 and the doc
+> list. Read the design doc first; treat the rest of this file as the pre-redesign record.
+
 Everything known-open as of **2026-07-25**, with enough context to act without re-deriving it.
 Nothing here is a build or test failure: the suite is green (298 pass, 1 skipped) at 94.2% line /
 89.6% branch coverage. These are correctness, durability, growth and hygiene gaps found by reading
@@ -174,6 +181,17 @@ that should be upgraded rather than rebuilt.
 `TryCompactOne` walks `_segments.ScanAll()` and filters to `loc.SegmentId != target`, so each pass
 decrypts every page of every segment. `Compact()` loops passes, so draining K segments is
 O(K × whole log) of AES-GCM. Use `ScanFrom(target, 0)` and break once the id exceeds the target.
+
+### P3. The flush loop is a fixed-period timer, not a deadline (S)
+`RunFlushLoop` (`KvasarStore.cs:552`) does `await Task.Delay(_flushDelay)` in an unconditional loop,
+so it wakes every 500 ms for the life of the process whether or not anything was written. On a
+backgrounded mobile app that is two pointless wakeups a second — a battery cost, not just untidiness.
+It should arm the delay on the **clean → dirty transition** instead: `await WhenDirty()`, then
+`Task.Delay(FlushDelay)`, then commit. Worst-case staleness is unchanged (`FlushDelay` either way,
+since the first write in a batch waits the full delay and later ones wait less), so the periodic form
+buys nothing for its wakeups. Found in this session, not by any of the four review passes; see
+[`DESIGN-Durability.md`](DESIGN-Durability.md) §2.2, which also adds the byte-based commit trigger
+that the recovery-validation bound actually requires.
 
 ### P2. Benchmarks not re-run after this session's hot-path changes (S)
 CLAUDE.md requires re-running and updating [`BENCHMARKS.md`](BENCHMARKS.md) when a hot path changes.
