@@ -383,8 +383,16 @@ public class DataLogTests
             await pf.Flush();
 
         await using var log = await ctx.Open(0, HeaderSize + OnDiskPageSize);
-        log.SlotCacheId(0).Should().Be(7u, "the active slot keeps the id its pages were cached under");
+
+        // Both ids are minted, so the colliding header value cannot reach the cache at all — stronger
+        // than detecting the collision afterwards, which left the active slot on its header's id.
+        log.SlotCacheId(0).Should().NotBe(log.SlotCacheId(1));
+        log.SlotCacheId(0).Should().NotBe(7u, "the header's id is unauthenticated and must not key the cache");
         log.SlotCacheId(1).Should().NotBe(7u);
+
+        // ... and the active slot's pages still read back correctly under the minted id.
+        var read = await log.TryReadRecord(new Locator(log.ActiveFileId, 0));
+        read.Should().NotBeNull();
     }
 
     [Fact]

@@ -103,25 +103,17 @@ public sealed class DataLog : IAsyncDisposable
             for (var i = 0; i < SlotCount; i++) {
                 // Only the active slot has a committed extent; the other is free or an abandoned compaction
                 // target, so nothing in it is referenced and its whole-page end is extent enough.
+                // Mint the PageCache id rather than inheriting the header's: the header is unauthenticated
+                // plaintext, and the cache holds *decrypted* pages keyed by (fileId, pageId), so two files
+                // claiming one id would serve each other's plaintext past the point AES-GCM could catch it.
                 var file = await PagedFile
                     .Open(slotFiles[i], cipherFactory, formatVer, cache,
-                        i == activeSlot ? activeCommitLength : -1, cancellationToken)
+                        i == activeSlot ? activeCommitLength : -1, mintCacheId(), cancellationToken)
                     .ConfigureAwait(false);
                 slots[i] = new SlotState { Slot = i, File = file };
                 openCount = i + 1;
                 if (file.PageSize != pageSize)
                     throw new KvasarCorruptException("Data file page size does not match the store's.");
-            }
-            if (slots[0].File.FileId == slots[1].File.FileId) {
-                // Both headers claim the same PageCache id, so one file's read would be served the other's
-                // plaintext — after decryption, where AES-GCM cannot catch it (§3.2). The free slot holds
-                // nothing any superblock slot references, so re-stamping it is the non-destructive fix.
-                var inUse = slots[activeSlot].File.FileId;
-                uint fileId;
-                do {
-                    fileId = mintCacheId();
-                } while (fileId == inUse);
-                await slots[1 - activeSlot].File.Recycle(fileId).ConfigureAwait(false);
             }
         }
         catch {

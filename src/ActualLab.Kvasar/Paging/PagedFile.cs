@@ -69,8 +69,12 @@ public sealed class PagedFile : IAsyncDisposable
 
     public static async ValueTask<PagedFile> Open(
         IStorageFile file, IPageCipherFactory cipherFactory, uint formatVer, PageCache cache,
-        long commitLength = -1, CancellationToken cancellationToken = default)
+        long commitLength = -1, uint? cacheId = null, CancellationToken cancellationToken = default)
     {
+        // cacheId overrides the header's id for PageCache keying. The header is unauthenticated
+        // plaintext, and the cache holds *decrypted* pages keyed by (fileId, pageId) — so two files
+        // whose headers claimed the same id would serve each other's plaintext, past the point where
+        // AES-GCM could catch it. Callers mint ids instead; the cache is per-process, so a counter does.
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(cipherFactory);
         ArgumentNullException.ThrowIfNull(cache);
@@ -97,7 +101,7 @@ public sealed class PagedFile : IAsyncDisposable
             else if ((commitLength - KvasarConstants.SegmentHeaderSize) % onDiskPageSize != 0)
                 throw new KvasarCorruptException("Committed extent is not page-aligned.");
 
-            return new PagedFile(file, cipherFactory, cache, header, pageCount, commitLength);
+            return new PagedFile(file, cipherFactory, cache, header, pageCount, commitLength, cacheId);
         }
         catch {
             await file.DisposeAsync().ConfigureAwait(false);
@@ -107,7 +111,7 @@ public sealed class PagedFile : IAsyncDisposable
 
     private PagedFile(
         IStorageFile file, IPageCipherFactory cipherFactory, PageCache cache,
-        SegmentHeader header, long pageCount, long commitLength)
+        SegmentHeader header, long pageCount, long commitLength, uint? cacheId = null)
     {
         _file = file;
         _cipherFactory = cipherFactory;
@@ -119,7 +123,7 @@ public sealed class PagedFile : IAsyncDisposable
         _commitLength = commitLength;
         _pendingCapacity = Math.Max(1, MaxPendingBytes / _onDiskPageSize);
         _pending = new byte[_pendingCapacity * _onDiskPageSize];
-        FileId = header.SegmentId;
+        FileId = cacheId ?? header.SegmentId;
         PageSize = header.PageSize;
         ResumePageId = pageCount;
     }

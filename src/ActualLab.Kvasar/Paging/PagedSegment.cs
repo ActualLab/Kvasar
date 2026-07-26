@@ -69,7 +69,7 @@ public sealed class PagedSegment : IDisposable
 
         var header = new SegmentHeader(formatVer, pageSize, segmentId);
         var handle = File.OpenHandle(
-            path, FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite, FileOptions.Asynchronous);
+            path, FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete, FileOptions.Asynchronous);
         try {
             var headerBytes = new byte[KvasarConstants.SegmentHeaderSize];
             header.Write(headerBytes);
@@ -91,7 +91,7 @@ public sealed class PagedSegment : IDisposable
         ArgumentNullException.ThrowIfNull(cache);
 
         var handle = File.OpenHandle(
-            path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite, FileOptions.Asynchronous);
+            path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete, FileOptions.Asynchronous);
         try {
             var headerBytes = new byte[KvasarConstants.SegmentHeaderSize];
             await ReadExact(handle, 0, headerBytes, cancellationToken).ConfigureAwait(false);
