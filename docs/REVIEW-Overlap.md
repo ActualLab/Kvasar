@@ -83,14 +83,18 @@ model with a fixed five-file set under an authenticated superblock. Three bucket
 distinction matters: a component can be built, tested and green while `KvasarStore` still runs the
 old model, in which case **shipped behaviour is unchanged**.
 
+The store rewrite has landed, so the "built but unwired" bucket is empty — every fix below is live.
+
 | State | Issues |
 |---|---|
-| **Fixed and live** | I16, I19, I23, I24, I27, I28, I31, I32, I33, I34, I35, I37 |
-| **Built + tested, not yet wired into `KvasarStore`** | I1 (P0), I3 (P0), I8, I9, I12, I20 |
-| **Dies with the segment model — awaiting the store rewrite** | I2 (P0), I4 (P0), I5, I6, I7, I10, I11, I13, I17, I18, I21, I22, I25, I26, I36, I38 |
-| **Closed by the test harness** | I30 — the `IStorageFile` seam plus a modelled device made every durability claim testable in-process; 4284 crash cases run in ~2 s |
-| **Open** | I29 (index disambiguation, L) |
+| **Fixed and live** | **all four P0s** (I1, I2, I3, I4), plus I5, I6, I7, I8, I9, I10, I11, I12, I13, I14, I16, I17, I18, I19, I20, I21, I22, I23, I24, I25, I26, I27, I28, I31, I32, I33, I34, I35, I36, I37, I38 |
+| **Closed by the test harness** | I30 — the `IStorageFile` seam plus a modelled device made every durability claim testable in-process; 4284 crash cases in ~2 s |
 | **N/A** | I15 — the design no longer depends on `F_FULLFSYNC` on any platform (§7) |
+| **Open, deliberately** | I29 — index disambiguation. Investigated and postponed with a write-up in TODO § C1: the collapse is spread across five writer-side sites, and a real fix needs a locator-addressed index, a record read per overwrite, and a `.kidx` format change |
+
+Most of these were not fixed individually. The segment lifecycle that produced I2, I4, I5–I7, I11,
+I13, I17, I18, I21, I22, I25, I26, I36 and I38 no longer exists, and the `.clean` marker whose
+write/consume asymmetry *was* I1 is gone with it.
 
 Two notes worth keeping:
 

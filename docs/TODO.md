@@ -271,6 +271,25 @@ to be noise against AES-GCM plus I/O, but that's a prediction, not a measurement
 
 ---
 
+### P4. Compaction blocks writers for a whole pass (M — the one unmet design requirement)
+[`DESIGN-Durability.md`](DESIGN-Durability.md) §4 says compaction "runs asynchronously; the switch is
+a single superblock write, so it is instantaneous". The implementation runs the whole copy pass under
+the write lock. `Compact()` always did, so it is not a regression — but it is now **auto-triggered**
+at the dead-ratio threshold, so an ordinary commit can stall every writer for a full copy of the live
+set (tens to hundreds of ms for a 25 MB live set).
+
+**Releasing the lock naively is wrong, and this is the part worth remembering.** `DataLog.Append`
+targets the *active* slot, which during a pass is still the **source**. The lock is what stops a
+concurrent write from landing in a slot that is about to be abandoned: such a record is not in the
+`_index.Snapshot()` the pass copies, so after the switch its locator points into the source slot, and
+the next `BeginCompaction` truncates it — silent loss of every key written during the pass.
+
+So the lock is load-bearing for correctness, not just simplicity. Fixing this properly means adopting
+what §4 actually specifies: **route new writes to the compaction target while a pass is in flight**,
+so the copier and the writer share one append stream and last-writer-wins by offset resolves them
+(the CAS in `CompactCore` already handles the index side). Then the lock can be released between
+batches. Do not attempt the lock release without the redirect.
+
 ## T — Testing & verification gaps
 
 ### T3. I28's fix has no test that isolates it (S, blocked on the store rewrite)
