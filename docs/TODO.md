@@ -324,9 +324,17 @@ the scan path disagree about the same store.
 
 Two candidate explanations, untested: a race in the worker's stdout acknowledgement (so the test
 believes a write was acknowledged that never was), or a genuine gap where `Scan`'s index snapshot and
-`Get`'s probe resolve a key differently after recovery. **Re-check after the store rewrite** — the
-v2 recovery path replaces the machinery involved, so this either disappears or becomes reproducible
-against code worth debugging. Do not close it silently if it simply stops appearing.
+`Get`'s probe resolve a key differently after recovery.
+
+**Re-checked after the store rewrite: 18 further runs (12 of the class, 6 full-suite), all green —
+28 attempts total, no recurrence.** Left open deliberately rather than closed. The rewrite replaced
+the entire recovery path, so *if* the cause was recovery it is gone; if it was a harness race in the
+worker's acknowledgement, it is untouched and still latent. Those two are indistinguishable from
+"it stopped failing", which is exactly why absence of the symptom is not evidence here.
+
+What would actually close it: run `ProcessCrashRecoveryTests` under sustained parallel load (the only
+condition it ever failed in) a few hundred times, or make the worker's acknowledgement synchronous so
+the harness race is ruled out by construction, leaving only the store as a suspect.
 
 ### T2. No durability item (D1–D5) is testable in this suite (L)
 `CrashFuzzTests`/`ProcessCrashRecoveryTests` kill a process, which does **not** drop the OS page
@@ -336,10 +344,17 @@ Until then, the honest status in DESIGN.md is "reasoned, not verified".
 
 ---
 
-## Docs
+## Docs — **all done**
 
-- Record the cancellation contract's caller-visible consequence: a cancelled write **may still land**,
-  and the caller has no way to learn whether it did (SPEC §4.4 covers the rule, not this corollary).
-- Add the directory-entry limitation (D3) and the Apple `F_FULLFSYNC` answer (D5) to DESIGN.md's
-  known limitations, next to the segment-rollback entry.
-- State the compaction trigger policy chosen in G1 in both SPEC §9 and the README.
+- ~~Record the cancellation contract's caller-visible consequence~~ — SPEC §4.4 now states it: a
+  cancelled write may still have landed, the exception is identical either way, and reading the key
+  back is the only way to know.
+- ~~Add the directory-entry limitation (D3) and the Apple `F_FULLFSYNC` answer (D5) to DESIGN.md~~ —
+  added as limitation 0, recording that both are resolved but neither the way D3/D5 anticipated:
+  `F_FULLFSYNC` *is* used, but only under `TARGET_OSX` (desktop macOS), and it no longer matters
+  because the design buys atomicity rather than durability. The directory gap is closed by
+  construction — files are created once and never renamed or unlinked while open.
+- ~~State the compaction trigger policy in SPEC §9 and the README~~ — both updated: automatic at
+  commit on `dead/(live+dead) ≥ 2/3` and `dead ≥ CompactionMinBytes`, with the disk-amplification
+  consequence spelled out and the P4 write-lock caveat noted.
+- `docs/DESIGN.md` now carries a staleness banner pointing at `DESIGN-Durability.md`.

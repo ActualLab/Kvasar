@@ -208,6 +208,13 @@ Fully cancellable: `Get`/`GetMany`/`Scan`, `Open`, and compaction's copy pass (i
 records — the index still points at the originals, so an abandoned pass leaves reclaimable dead
 bytes, never a dangling locator).
 
+**The corollary callers must plan around:** a cancelled write **may still have landed**, and there is
+no way to find out. `OperationCanceledException` from `Set`/`SetMany` means "your wait was abandoned",
+not "your write was". If the token fired after the lock was acquired, the write completes and is
+readable; if it fired before, nothing happened — and the exception is identical either way. A caller
+that must know has exactly one option: read the key back. This follows from the rule above rather
+than qualifying it, but it is the part that surprises people, so it is stated rather than implied.
+
 ---
 
 ## 5. Storage architecture (layered)
@@ -439,6 +446,22 @@ ms, scaling with index size not data size** (vs. ~15–30 ms to decrypt-scan a 2
   unrecoverable error to the app.** *Isolated* single-record issue ⇒ drop that key, keep the store.
 
 ## 9. Compaction (segment GC — *not* LSM leveling)
+
+> **Superseded by [`DESIGN-Durability.md`](DESIGN-Durability.md) §4.** Segments are gone. Compaction
+> is now **total**: two `.kdat` slots, one active, and a pass copies the whole live set into the free
+> slot, so the switch is a single superblock write. The rest of this section describes the v1 model
+> and is kept as the record.
+>
+> **The trigger, which G1 left open, is now decided and implemented:** compaction fires
+> automatically at commit when `dead / (live + dead) ≥ CompactionDeadRatio` **and**
+> `dead ≥ CompactionMinBytes`. Defaults are **2/3** and 1 MiB. `CompactionDeadRatio` is what sets the
+> store's steady-state disk amplification — at 2/3 a store holding L live bytes occupies up to 3L,
+> peaking at 4L during a pass. Nothing needs to call `Compact()`; that closes I5, where the only
+> callers in the repo were three tests and an overwrite-heavy cache grew forever.
+>
+> One caveat, tracked as TODO P4: the copy pass currently runs **under the write lock** rather than
+> asynchronously as §4 describes, so a commit that triggers compaction stalls writers for the pass.
+
 Overwrites and deletes leave dead records; we reclaim them with **Bitcask-style segment GC**.
 
 - **Segmented log.** `.klog` is a series of immutable **sealed segments** plus one **active**

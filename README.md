@@ -58,8 +58,10 @@ Three layers, each independently testable:
 - **Paging** (`Paging/`) — the `.klog` segment files: a plaintext 64-byte header followed by
   AES-256-GCM encrypted pages, with a sharded byte-budgeted LRU cache of decrypted pages. Reads are
   zero-copy slices into those cached, immutable pages.
-- **Log** (`Internal/Log/`) — records appended to the active segment; old segments are compacted by
-  segment GC. Values that fit a page never span one, which is what keeps reads zero-copy.
+- **Log** (`Internal/Log/`) — records appended to the active `.kdat` slot. Values that fit a page
+  never span one, which is what keeps reads zero-copy. **Compaction is automatic**: at commit, when
+  two-thirds of the store is dead bytes, the whole live set is copied into the free slot and the
+  switch is a single superblock write. Nothing needs to call `Compact()`.
 - **Index** (`Index/`) — an in-RAM open-addressing map from a keyed 64-bit key hash to a record
   locator. Keys live on disk, not in the index, so index memory is **independent of key length**
   (~16–24 B/entry). Persisted to `.kidx` as a checkpoint plus a delta tail, so opening is O(index)
@@ -131,10 +133,18 @@ is +56% writes, −31% file size, and −51% startup.
 Working and tested — not yet released. The library multi-targets **net10.0** (default) and
 **net9.0**, is AOT- and trimming-safe, and depends on exactly one package (`System.IO.Hashing`).
 
-Known limitations are tracked honestly in [`docs/DESIGN.md`](docs/DESIGN.md), including two worth
-knowing up front: two distinct keys sharing a full 64-bit hash collapse to one entry (~2⁻⁶⁴ under the
-default keyed hasher; it never returns wrong data, and a regenerable cache self-heals), and an
-in-flight read racing compaction can return a spurious miss.
+**Durability:** Kvasar buys **atomicity, not durability** — after any crash it reopens at the state
+of some commit that completed, never at a partial or mixed one. It does *not* promise that the most
+recent commit survives; for a regenerable cache a lost write costs one upstream lookup, while a torn
+state costs correctness. That trade is what lets the whole design work with no native code and at
+most one `fsync` per commit. See [`docs/DESIGN-Durability.md`](docs/DESIGN-Durability.md) for the
+commit protocol and its proof.
+
+Known limitations are tracked honestly in [`docs/DESIGN.md`](docs/DESIGN.md) and
+[`docs/TODO.md`](docs/TODO.md), including two worth knowing up front: two distinct keys sharing a
+full 64-bit hash collapse to one entry (~2⁻⁶⁴ under the default keyed hasher; it never returns wrong
+data, and a regenerable cache self-heals), and a compaction pass currently holds the write lock, so
+it stalls writers for the length of the copy.
 
 ## Building
 

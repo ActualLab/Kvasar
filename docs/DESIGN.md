@@ -382,6 +382,22 @@ An adversarial review of every module found these; each now has a regression tes
 
 ### Known limitations that remain
 
+> **Stale below this line.** The storage layer described in this document — segments, `SegmentSet`,
+> `PagedSegment`, the v1 `IndexFile`, the `.clean` marker — has been replaced by the model in
+> [`DESIGN-Durability.md`](DESIGN-Durability.md): a superblock over two `.kdat` and two `.kidx` slots.
+> Several limitations below are therefore gone with the code that caused them (notably 3 and 5, both
+> segment-lifecycle artefacts). Read the durability design first; treat this file as the v1 record.
+
+0. **Apple `F_FULLFSYNC` and the directory-entry gap — both resolved, and neither the way this file
+   expected.** `SystemNative_FSync` *does* use `fcntl(F_FULLFSYNC)`, but only under `TARGET_OSX`,
+   which is desktop macOS alone — iOS, tvOS and Mac Catalyst get plain `fsync`
+   ([`DESIGN-Durability.md`](DESIGN-Durability.md) §7). It no longer matters: the v2 design buys
+   *atomicity*, not durability, so nothing depends on reaching the medium (§1, §6c). The directory
+   gap is likewise gone by construction rather than by `fsync` — all files are created once at store
+   creation and never renamed or unlinked while open, so no dirent is ever in the durability path,
+   and the worst case of losing one is "the store looks uninitialized", which is the accepted
+   wipe-and-rebuild path, never a torn state (§3.4).
+
 3. **Segment-file substitution / rollback.** Nothing binds a `.klog` to the store or to its own filename:
    the per-file salt travels *inside* the file, so replacing a whole segment with an older copy of itself
    authenticates perfectly. The filename cross-check above stops a flipped id, not a wholesale swap. A
