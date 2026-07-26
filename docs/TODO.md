@@ -195,6 +195,50 @@ entry padding) — not on its own, and not while `HashIndex` is being rewritten 
 current behavior is a bounded single-key loss on a regenerable cache that self-heals on the next miss,
 which does not justify a read per overwrite plus a format break.
 
+### C4. `GetMany` can serve a torn value while a compaction runs (M, **P0** — serves garbage)
+`ConcurrencyTests.ReadersDuringCompaction` and `ReadersAndWriter_NoTornReads_NoLostWrites` fail with
+`Torn/garbage GetMany value` on roughly half of full-suite runs once two more test classes are running
+alongside them (`Store/ReviewRegressionTests`, `Store/ReadCancellationTests`). Both encrypted and
+unencrypted; observed value lengths 505, 528, 869, 1292, 1467. The payloads are self-describing, and in
+every case the 12-byte header is internally consistent while the filler belongs to a **different
+version of the same key** — i.e. the record was assembled from two pages that came from different
+incarnations of one slot.
+
+Not introduced by those classes: they only add parallel load. Without them the suite is 5/5 green;
+with them it fails ~1 run in 2; and commenting out the one `_data.Prefetch` call in
+`KvasarStore.GetMany` (`:257`) makes it 3/3 green with everything else unchanged. `GetMany` is the only
+*reader-side* caller of `Prefetch`, which is what makes it the only API that shows the defect.
+
+Where it most likely lives: `PagedFile.Recycle` reassigns `FileId` and swaps `_cipher` while lock-free
+readers are between "read + decrypt" and `_cache.Add(FileId, pageId, page)`. A page decrypted from the
+*old* incarnation can therefore be added under the *new* `FileId`, and `PageCache.Add` keeps the first
+entry for a key — so the copier's genuine page for that id is silently dropped and every later reader
+gets the stale plaintext. That is exactly the (fileId, pageId) collision DESIGN-Durability.md §3.2 says
+must not happen; minting ids in the store closed the *header* route to it, not this one. Every observed
+bad record is longer than a page, which fits: one page of the pair is stale, the other fresh, so the
+assembled record mixes two versions of the same key. `Prefetch` also bounds its read by `_file.Length`,
+which by design counts writes that have been *issued* rather than completed (`IStorageFile`), so it can
+decrypt bytes the device has not received yet — a second way to cache a page that is not what its key
+says it is. Both want `Recycle` to be exclusive with readers, or the cache key to carry an incarnation
+that a reader captures once and re-checks before `Add`.
+
+### C3. A store that doesn't persist index entries reads back empty on every reopen (S, **P0**)
+Found by `Store/ReviewRegressionTests`; the failing case is kept as the skipped
+`AnUnpersistedIndexStillRebuildsFromTheLog_KnownBug`. With `IndexEncryption.On` — or `Auto` plus a
+non-keyed hasher, e.g. the built-in `KeyHashers.XxHash3` — `_mustPersistIndex` is false, and the store
+comes back with **zero entries** after a clean close. Measured: 50 keys written and flushed, 0 present
+after the reopen; `Get` misses every one of them. 100% permanent loss, no crash involved.
+
+The chain: `DisposeAsync` sets `_mustRotateIndex` when `!_mustPersistIndex`
+(`KvasarStore.cs:175`), `RotateIndex` writes a checkpoint carrying **no entries** (`:792`) stamped at
+`_data.ActiveCommittedOffset`, and `Recover` then takes `replayFrom = snapshot.DataCommitLength`
+(`:555`) — which now equals the committed offset, so the replay range is empty. The stamp asserts "the
+index is consistent up to here" on behalf of an index that holds nothing. The `DisposeAsync` comment
+says this exists so "the next open replays the whole session"; it guarantees the opposite. Dropping
+that re-stamp (leaving the stamp at 0 for a non-persisting index) looks like the minimal fix, but §5.2.1
+wants the stamp above any burned range, so the two rules need reconciling — an empty checkpoint should
+probably stamp `ActiveResumeOffset` only when `BurnedBytes > 0` and 0 otherwise.
+
 ### C2. An unknown value-kind tag is not rejected (S)
 SPEC §4.3 says an unknown tag ⇒ corrupt ⇒ regenerate, but `RecordCodec.TryParse` casts
 `body[1]` straight to `KvasarValueKind` with no range check. Harmless today — the public API can't
@@ -295,14 +339,26 @@ batches. Do not attempt the lock release without the redirect.
 
 ## T — Testing & verification gaps
 
-### T3. I28's fix has no test that isolates it (S, blocked on the store rewrite)
-The fix is in (`KvasarStore.cs:235`, `:443` — the filters now let `OperationCanceledException`
-through). The regression test is not, and the reason is worth recording: `PagedSegment.Prefetch`
-already rethrows `OperationCanceledException`, and `Scan` calls it **outside** the try/catch, so a
-cancelled scan throws via prefetch whether or not the filter is fixed. A test written the obvious way
-passes against the unfixed code — verified by reverting the fix and watching it still pass. Isolating
-the filter needs cancellation injected at the `TryReadRecord` call specifically, which becomes
-straightforward once the store runs on `IStorageBackend` and the fake can inject it. Write it then.
+### T3. I28's fix has no test that isolates it — **done**
+`Store/ReadCancellationTests` isolates it, through a wrapping `IStorageBackend` that fails reads on one
+armed `.kdat`: a whole-page read — the shape only `TryReadRecord` makes — as an
+`OperationCanceledException`, anything larger (the readahead's whole run) as a plain `IOException`.
+That split is the point. The original blocker was that `Prefetch` rethrows cancellation on its own and
+`Scan` calls it *outside* the try/catch, so a cancelled scan threw via the readahead whether or not the
+filter was fixed, and a test written the obvious way passed against the unfixed code. Failing the
+readahead with something it is documented to swallow removes it from the picture, leaving the record
+read as the only source of cancellation; `Get` takes no readahead at all, so it needs nothing extra.
+Both tests were verified to fail with the filters reverted to `is not KvasarCorruptException`.
+
+### T5. An index-less replay still stops at the first unreadable page (M)
+[`DESIGN-Durability.md`](DESIGN-Durability.md) §14.4 records this as unfixed; the cost is now measured.
+`Store/ReviewRegressionTests` keeps it as the skipped `AnIndexLessRebuildRecoversPastACorruptPage_KnownGap`.
+With the `.kidx` intact, corrupting one mid-file page costs exactly the records on it — 1 key of 400.
+With no usable `.kidx`, the same damage costs **392 of 400**: `DataLog.ScanFrom` ends the walk at the
+page that fails its tag, and everything above it is dropped and then checkpointed. That is I2's shape at
+a smaller volume, and the index being derivable is what keeps it off the normal path. Closing it needs
+what §14.4 names: an authenticate-only pass over the commit window that reports failure instead of
+stopping, plus a way to resume the walk at the next page boundary above a bad page.
 
 ### T1. Cancellation tests are timing-based, not deterministic — **done**
 `Store/CancellationTests` now has three gate-driven tests alongside the timer-based smoke ones. A
