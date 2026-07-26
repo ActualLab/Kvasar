@@ -1,12 +1,16 @@
+using System.Buffers;
 using System.Globalization;
 using System.IO;
 using System.Text;
+using ActualLab.Kvasar.Crypto;
 
 namespace ActualLab.Kvasar.Tests.Store;
 
 /// <summary>
 /// Cancellation contract (§4.4): a token abandons the caller's <i>wait</i>, never the write in flight.
 /// An acknowledged write is always readable afterwards, and a cancelled one never corrupts the log.
+/// The gate-driven tests pin that contract down at an exact point of the write; the timer-driven ones
+/// stay as smoke tests, since on a fast machine their token may never land mid-append at all.
 /// </summary>
 public class CancellationTests : IDisposable
 {
@@ -109,6 +113,97 @@ public class CancellationTests : IDisposable
         }
     }
 
+    // --- Deterministic injection (no timers) --------------------------------
+
+    [Fact]
+    public async Task CancelInsideAMultiPageAppendStillWritesItWhole()
+    {
+        // The value's bytes are served by a gate, so the writer parks inside SegmentSet.Append (which
+        // reads value.Span to encode the record) with the multi-page write half-done. Cancelling there
+        // is the case the timer-based tests can only hope to hit.
+        var value = Value(4000, 0x11);
+        using var gate = new Gate();
+        using var gatedValue = new GatedMemory(gate, value);
+        var gatedMemory = new KvasarValue(gatedValue.Memory); // taking the Memory reads the span itself
+        gatedValue.Arm();
+        using var cts = new CancellationTokenSource();
+        await using (var store = await KvasarStore.Open(Options())) {
+            var setTask = Task.Run(async () => await store.Set(K("gated"), gatedMemory, cts.Token));
+            gate.WaitUntilEntered();
+            (await store.Get(K("gated"))).Should()
+                .BeNull("the write is parked mid-append, so nothing is published yet");
+            await cts.CancelAsync();
+            gate.Resume();
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => setTask);
+            // Flush queues on the write lock, so it returns only once the cancelled body has released it.
+            await store.Flush(true);
+            (await store.Get(K("gated")))!.Value.ToArray().Should().Equal(value);
+        }
+
+        await using (var store = await KvasarStore.Open(Options())) {
+            (await store.Get(K("gated")))!.Value.ToArray().Should().Equal(value);
+            (await ScanCount(store)).Should().Be(1);
+        }
+    }
+
+    [Fact]
+    public async Task CancelAfterTheAppendStillPublishesTheIndexEntry()
+    {
+        // The store hashes the key inside the write body — after the record's bytes are appended and
+        // before the index is updated. Abandoning the body there would leave a value on disk that no
+        // index entry points at, i.e. an acknowledged-looking write that Get can't see.
+        var value = Value(4000, 0x22);
+        using var gate = new Gate();
+        using var cts = new CancellationTokenSource();
+        var options = Options() with { Hasher = new GatedHasher(gate, K("gated")) };
+        await using (var store = await KvasarStore.Open(options)) {
+            var setTask = Task.Run(async () => await store.Set(K("gated"), value, cts.Token));
+            gate.WaitUntilEntered();
+            (await store.Get(K("gated"))).Should()
+                .BeNull("the bytes are appended but the index entry isn't published yet");
+            await cts.CancelAsync();
+            gate.Resume();
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => setTask);
+            await store.Flush(true);
+            (await store.Get(K("gated")))!.Value.ToArray().Should().Equal(value);
+        }
+
+        await using (var store = await KvasarStore.Open(Options())) {
+            (await store.Get(K("gated")))!.Value.ToArray().Should().Equal(value);
+            (await ScanCount(store)).Should().Be(1);
+        }
+    }
+
+    [Fact]
+    public async Task CancelWhileWaitingForTheWriteLockChangesNothing()
+    {
+        // The other half of the contract: a token that fires before the write owns the lock must leave
+        // the store untouched. The gate holds the lock for the whole window, so the loser can't sneak in.
+        var value = Value(4000, 0x33);
+        using var gate = new Gate();
+        using var cts = new CancellationTokenSource();
+        var options = Options() with { Hasher = new GatedHasher(gate, K("winner")) };
+        await using (var store = await KvasarStore.Open(options)) {
+            var winnerTask = Task.Run(async () => await store.Set(K("winner"), value));
+            gate.WaitUntilEntered();
+            var loserTask = Task.Run(async () => await store.Set(K("loser"), K("nope"), cts.Token));
+            await cts.CancelAsync();
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => loserTask);
+            gate.Resume();
+            await winnerTask;
+            await store.Flush(true);
+        }
+
+        await using (var store = await KvasarStore.Open(Options())) {
+            (await store.Get(K("loser"))).Should().BeNull();
+            (await store.Get(K("winner")))!.Value.ToArray().Should().Equal(value);
+            (await ScanCount(store)).Should().Be(1);
+        }
+    }
+
     // Private methods
 
     private KvasarOptions Options() => new() {
@@ -130,5 +225,95 @@ public class CancellationTests : IDisposable
         rnd.NextBytes(value);
         value[0] = (byte)i;
         return value;
+    }
+
+    // Several pages at PageSize = 512, so every gated write takes the multi-page append path.
+    private static byte[] Value(int length, byte seed)
+    {
+        var value = new byte[length];
+        for (var i = 0; i < length; i++)
+            value[i] = (byte)(seed + i);
+        return value;
+    }
+
+    private static async Task<int> ScanCount(KvasarStore store)
+    {
+        var count = 0;
+        await foreach (var _ in store.Scan())
+            count++;
+        return count;
+    }
+
+    // Nested types
+
+    /// <summary>
+    /// Parks a writer at an exact point of the write path until the test thread releases it — the seam
+    /// that makes cancellation deterministic instead of a race against a timer.
+    /// </summary>
+    private sealed class Gate : IDisposable
+    {
+        private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(30);
+
+        private readonly ManualResetEventSlim _entered = new(false);
+        private readonly ManualResetEventSlim _resumed = new(false);
+
+        public void Dispose()
+        {
+            _entered.Dispose();
+            _resumed.Dispose();
+        }
+
+        public void Enter()
+        {
+            _entered.Set();
+            _resumed.Wait(Timeout);
+        }
+
+        public void WaitUntilEntered()
+            => _entered.Wait(Timeout).Should().BeTrue("the write must reach the injection point");
+
+        public void Resume()
+            => _resumed.Set();
+    }
+
+    /// <summary>
+    /// Backs a <see cref="KvasarValue"/> whose bytes can only be read through <see cref="Gate"/>: once
+    /// armed, the append parks the next time it reads the span, i.e. mid-record.
+    /// </summary>
+    private sealed class GatedMemory(Gate gate, byte[] bytes) : MemoryManager<byte>
+    {
+        private int _isArmed;
+
+        public void Arm()
+            => _isArmed = 1;
+
+        public override Span<byte> GetSpan()
+        {
+            if (Interlocked.Exchange(ref _isArmed, 0) == 1)
+                gate.Enter();
+            return bytes;
+        }
+
+        public override MemoryHandle Pin(int elementIndex = 0)
+            => throw new NotSupportedException(); // the write path only ever copies out of the span
+        public override void Unpin() { }
+        protected override void Dispose(bool disposing) { }
+    }
+
+    // Delegates to the default hasher, but parks in `gate` the first time it hashes `triggerKey` — which
+    // the store does inside the write body, between the append and the index update.
+    private sealed class GatedHasher(Gate gate, byte[] triggerKey) : IKeyHasher
+    {
+        private int _isTriggered;
+
+        public bool IsKeyed => true;
+        public int SecretSize => 16;
+
+        public ulong Hash(ReadOnlySpan<byte> key, ReadOnlySpan<byte> secret)
+        {
+            if (key.SequenceEqual(triggerKey) && Interlocked.Exchange(ref _isTriggered, 1) == 0)
+                gate.Enter();
+            return KeyHashers.SipHash24.Hash(key, secret);
+        }
     }
 }

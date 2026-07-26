@@ -185,11 +185,15 @@ to be noise against AES-GCM plus I/O, but that's a prediction, not a measurement
 
 ## T — Testing & verification gaps
 
-### T1. Cancellation tests are timing-based, not deterministic (M)
-`Store/CancellationTests` cancels on sub-millisecond timers, so on a fast machine the token may never
-land mid-append — they're smoke tests, not proof that the uninterruptible-write contract holds. The
-repo already has the fault-injection machinery (`FakePageCipher`, the crash-fuzz harness); the real
-test injects cancellation deterministically at page N of a multi-page append.
+### T1. Cancellation tests are timing-based, not deterministic — **done**
+`Store/CancellationTests` now has three gate-driven tests alongside the timer-based smoke ones. A
+`Gate` parks the writer at an exact point and the test thread cancels while it's parked, so the token
+provably lands mid-write: `GatedMemory` (a `MemoryManager<byte>` behind the value) parks inside the
+multi-page append itself, `GatedHasher` parks between the append and the index publish, and the third
+test cancels a writer queued on the write lock. Each asserts the write is invisible while parked, then
+that it landed whole (and survives a reopen) — or, for the queued writer, that nothing landed at all.
+The one seam still missing is per-page injection: `IPageCipherFactory` isn't reachable from
+`KvasarOptions`, so "cancel between page 3 and 4" can't be expressed through the public API.
 
 ### T2. No durability item (D1–D5) is testable in this suite (L)
 `CrashFuzzTests`/`ProcessCrashRecoveryTests` kill a process, which does **not** drop the OS page
