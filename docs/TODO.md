@@ -149,10 +149,15 @@ present, empty value. That trap predates the change (the `ReadOnlyMemory<byte>?`
 author meant a delete. Options: drop the nullable-source conversions and require an explicit
 `new KvasarValue(...)`, or keep them and make the XML doc say it in one line.
 
-### A2. `KvasarValue` equality/`GetHashCode` is speculative API (S)
-Added for symmetry with `KvasarKey`; nothing uses it, and `GetHashCode` over a multi-megabyte value
-is a footgun with no current caller. `KvasarKey`'s equality is justified (dictionary keys).
-Consider removing the value-side implementation.
+### A2. `KvasarValue` equality/`GetHashCode` was speculative API — **removed**
+`IEquatable<KvasarValue>`, `Equals`, `GetHashCode` and `==`/`!=` are gone; `KvasarKey` keeps its own
+(it really is used as a dictionary key). Rationale: nothing in the library, tests or benchmarks
+compared values; values are the large side of the store (up to `MaxValueBytes`, 8 MiB by default), so
+a content `GetHashCode` is an O(n) trap that a `HashSet<KvasarValue>` or `Distinct()` would spring
+invisibly; and adding an implementation back later is source-compatible, while removing one isn't.
+The known cost: `a.Equals(b)` still compiles and now means `ValueType.Equals`, i.e. "same slice of the
+same array" rather than "same bytes" — `a == b` no longer compiles at all, which is the louder half.
+Callers wanting content equality write `a.Span.SequenceEqual(b.Span)`.
 
 ### A3. `Kind` / `Require` are inert in v1 (no action, note only)
 Only `Raw` exists and user code can't construct another kind, so `Require(Raw)` can never throw

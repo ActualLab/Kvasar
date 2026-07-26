@@ -2,12 +2,16 @@ using ActualLab.Kvasar.Internal;
 
 namespace ActualLab.Kvasar;
 
+// Deliberately not IEquatable, unlike KvasarKey: values are the large side of the store (up to
+// MaxValueBytes), nothing here ever compares them, and a content GetHashCode over megabytes is an
+// O(n) trap no caller asked for. Compare Span.SequenceEqual explicitly if you need it.
+
 /// <summary>
 /// A store value — raw bytes (<see cref="Memory"/>) tagged with a <see cref="KvasarValueKind"/> (§4.3).
 /// Same conversions as <see cref="KvasarKey"/>, except every conversion out of a value requires a
 /// matching <see cref="Kind"/>. A read returns a zero-copy slice into a cached page (§6.3).
 /// </summary>
-public readonly struct KvasarValue : IEquatable<KvasarValue>
+public readonly struct KvasarValue
 {
     public ReadOnlyMemory<byte> Memory { get; }
     public KvasarValueKind Kind { get; }
@@ -50,21 +54,4 @@ public readonly struct KvasarValue : IEquatable<KvasarValue>
         => value.Require(KvasarValueKind.Raw).Memory;
     public static implicit operator ReadOnlySpan<byte>(KvasarValue value)
         => value.Require(KvasarValueKind.Raw).Memory.Span;
-
-    // Equality
-
-    public bool Equals(KvasarValue other)
-        => Kind == other.Kind && Memory.Span.SequenceEqual(other.Memory.Span);
-    public override bool Equals(object? obj)
-        => obj is KvasarValue other && Equals(other);
-    public override int GetHashCode()
-    {
-        var hashCode = new HashCode();
-        hashCode.Add(Kind);
-        hashCode.AddBytes(Memory.Span);
-        return hashCode.ToHashCode();
-    }
-
-    public static bool operator ==(KvasarValue left, KvasarValue right) => left.Equals(right);
-    public static bool operator !=(KvasarValue left, KvasarValue right) => !left.Equals(right);
 }

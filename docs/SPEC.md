@@ -132,11 +132,12 @@ public readonly struct KvasarKey : IEquatable<KvasarKey>
     // KvasarKeyExt.AsString: UTF-8 decode
 }
 
-public readonly struct KvasarValue : IEquatable<KvasarValue>   // same shape as KvasarKey, plus:
+public readonly struct KvasarValue        // same shape as KvasarKey, minus equality, plus:
 {
     public KvasarValueKind Kind { get; }                                 // Raw in v1 (§4.3)
     public KvasarValue Require(KvasarValueKind kind);                    // throws on a kind mismatch
     // every conversion *out* of a value (operators, KvasarValueExt.AsString) goes through Require
+    // no IEquatable: values are the large side, and a content GetHashCode over megabytes is a trap
 }
 
 public sealed record KvasarOptions
