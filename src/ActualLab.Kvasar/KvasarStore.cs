@@ -271,13 +271,19 @@ public sealed class KvasarStore : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(updates);
         if (updates.Count == 0)
             return;
-        // Last write wins for duplicate keys: keep only the last occurrence per key hash.
+        // Last write wins for duplicate keys: keep only the last occurrence per key hash. Hashing is
+        // keyed SipHash over the whole key, so the results are carried forward rather than recomputed
+        // in the append loop and again in Publish (I32).
+        var hashes = new ulong[updates.Count];
         var lastByHash = new Dictionary<ulong, int>(updates.Count);
-        for (var i = 0; i < updates.Count; i++)
-            lastByHash[_hasher.Hash(updates[i].Key.Span, _hashKey)] = i;
+        for (var i = 0; i < updates.Count; i++) {
+            var h = _hasher.Hash(updates[i].Key.Span, _hashKey);
+            hashes[i] = h;
+            lastByHash[h] = i;
+        }
 
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-        await SetManyLocked(updates, lastByHash).WaitAsync(cancellationToken).ConfigureAwait(false);
+        await SetManyLocked(updates, hashes, lastByHash).WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask Clear(CancellationToken cancellationToken = default)
@@ -314,7 +320,7 @@ public sealed class KvasarStore : IAsyncDisposable
             ObjectDisposedException.ThrowIf(_isDisposed, this);
             var appended = await AppendOne(key, value).ConfigureAwait(false);
             await SealOrDefer().ConfigureAwait(false);
-            await Publish(key, appended).ConfigureAwait(false);
+            await Publish(_hasher.Hash(key.Span, _hashKey), appended).ConfigureAwait(false);
             await MaybeCheckpoint().ConfigureAwait(false);
         }
         finally {
@@ -323,21 +329,23 @@ public sealed class KvasarStore : IAsyncDisposable
     }
 
     private async Task SetManyLocked(
-        IReadOnlyList<(KvasarKey Key, KvasarValue? Value)> updates, Dictionary<ulong, int> lastByHash)
+        IReadOnlyList<(KvasarKey Key, KvasarValue? Value)> updates,
+        ulong[] hashes,
+        Dictionary<ulong, int> lastByHash)
     {
         try {
             ObjectDisposedException.ThrowIf(_isDisposed, this);
-            var pending = new List<(KvasarKey Key, AppendResult Appended)>(lastByHash.Count);
+            var pending = new List<(KvasarKey Key, ulong Hash, AppendResult Appended)>(lastByHash.Count);
             for (var i = 0; i < updates.Count; i++) {
                 var (key, value) = updates[i];
-                if (lastByHash[_hasher.Hash(key.Span, _hashKey)] != i)
+                if (lastByHash[hashes[i]] != i)
                     continue; // superseded within this batch
                 var appended = await AppendOne(key, value).ConfigureAwait(false);
-                pending.Add((key, appended));
+                pending.Add((key, hashes[i], appended));
             }
             await SealOrDefer().ConfigureAwait(false); // seal once for the whole batch
             foreach (var p in pending)
-                await Publish(p.Key, p.Appended).ConfigureAwait(false);
+                await Publish(p.Hash, p.Appended).ConfigureAwait(false);
             await MaybeCheckpoint().ConfigureAwait(false);
         }
         finally {
@@ -468,12 +476,11 @@ public sealed class KvasarStore : IAsyncDisposable
         return new AppendResult(locator, recordLength, isTombstone);
     }
 
-    private async ValueTask Publish(KvasarKey key, AppendResult appended)
+    private async ValueTask Publish(ulong h, AppendResult appended)
     {
         var (loc, recordLength, isTombstone) = appended;
         if (loc.IsNone)
             return; // skipped oversized value
-        var h = _hasher.Hash(key.Span, _hashKey);
         var hasOld = _index.TryGetFirst(h, out var oldLoc, out var oldLen);
         if (isTombstone) {
             if (hasOld) {
