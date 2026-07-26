@@ -34,6 +34,11 @@ public sealed class KvasarStore : IAsyncDisposable
     private readonly CancellationTokenSource _disposeCts = new();
     private Task? _flushLoopTask;
     private int _isDirty;
+    // Completed on the clean⇒dirty edge and replaced once consumed, so the flush loop waits on a
+    // signal instead of polling. Constructed directly: CODING_STYLE routes these through
+    // TaskCompletionSourceExt, which lives in ActualLab.Core and is covered by the zero-dependency
+    // carve-out.
+    private volatile TaskCompletionSource _whenDirty = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _isDisposeStarted;
     private bool _isDisposed;
 
@@ -601,17 +606,35 @@ public sealed class KvasarStore : IAsyncDisposable
         // what makes an unbatched Set cheap — sealing per call pads a whole page per record.
         if (_flushDelay <= TimeSpan.Zero)
             return _segments.Flush(false);
-        Volatile.Write(ref _isDirty, 1);
+        MarkDirty();
         return default;
+    }
+
+    private void MarkDirty()
+    {
+        // Only the clean⇒dirty edge opens a batch, so the flush loop sleeps on a signal rather than
+        // waking on a timer while the store is idle.
+        if (Interlocked.Exchange(ref _isDirty, 1) == 0)
+            _whenDirty.TrySetResult();
     }
 
     private async Task RunFlushLoop()
     {
         // Bounds how long a write can sit unflushed. Losing writes newer than the last flush is the
         // accepted cost of FlushDelay; losing anything older would not be, so failures only retry.
+        //
+        // The delay is armed on the clean⇒dirty edge rather than run as a period: an idle store now
+        // costs zero wakeups, where the fixed-period loop woke every FlushDelay for the life of the
+        // process and usually did nothing — two wakeups a second on a backgrounded mobile app. The
+        // staleness bound is identical either way, since the *first* write of a batch waits the full
+        // delay and later ones wait less, so the periodic form bought nothing for those wakeups.
         try {
             while (!_disposeCts.IsCancellationRequested) {
+                await _whenDirty.Task.WaitAsync(_disposeCts.Token).ConfigureAwait(false);
                 await Task.Delay(_flushDelay, _disposeCts.Token).ConfigureAwait(false);
+                // Re-arm before flushing, so a write landing during the flush opens the next batch
+                // rather than being swallowed by this one.
+                _whenDirty = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 if (Interlocked.Exchange(ref _isDirty, 0) == 0)
                     continue;
                 try {
@@ -620,7 +643,7 @@ public sealed class KvasarStore : IAsyncDisposable
                 catch (Exception e) when (e is not OperationCanceledException) {
                     // Best-effort: a failed background flush costs durability, never consistency, so the
                     // next tick simply tries again.
-                    Volatile.Write(ref _isDirty, 1);
+                    MarkDirty();
                 }
             }
         }
