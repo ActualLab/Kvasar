@@ -148,13 +148,16 @@ corrupted or forward-version record decodes as `Raw` and is served as data rathe
 
 ## A — API & format leftovers (from this session's `KvasarKey`/`KvasarValue` work)
 
-### A1. A null `string`/array converts to a *present empty value*, not a delete (S — decide)
+### A1. A null `string`/array converts to a *present empty value*, not a delete (done — documented)
 `KvasarValue?` = `null` deletes; `KvasarValue` built from a null `string`/`byte[]`/`char[]` is a
 present, empty value. That trap predates the change (the `ReadOnlyMemory<byte>?` comments in
 `PropertyTests`/`CrashFuzzTests` are about exactly this), but the new implicit conversions widen it:
 `string? v = MaybeNull(); store.Set(k, v)` now compiles and silently stores an empty value where the
 author meant a delete. Options: drop the nullable-source conversions and require an explicit
 `new KvasarValue(...)`, or keep them and make the XML doc say it in one line.
+**Resolved:** the conversions stay (dropping them is a breaking API change); `KvasarValue`'s summary
+and the comment above its conversion operators now state the behaviour, covered by
+`KvasarValueTests.NullStringOrArrayIsAPresentEmptyValue`.
 
 ### A2. `KvasarValue` equality/`GetHashCode` is speculative API (S)
 Added for symmetry with `KvasarKey`; nothing uses it, and `GetHashCode` over a multi-megabyte value

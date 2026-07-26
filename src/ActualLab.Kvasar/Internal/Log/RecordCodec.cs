@@ -10,10 +10,14 @@ namespace ActualLab.Kvasar.Internal;
 public static class RecordCodec
 {
     public static int MaxHeaderSize(int keyLen)
-        => Varint.MaxSize + 2 + Varint.SizeOf((ulong)keyLen) + keyLen;
+    {
+        RequireLengths(keyLen, 0);
+        return Varint.MaxSize + 2 + Varint.SizeOf((ulong)keyLen) + keyLen;
+    }
 
     public static int GetRecordLength(int keyLen, int valueLen, bool isTombstone)
     {
+        RequireLengths(keyLen, isTombstone ? 0 : valueLen);
         var body = 2 + Varint.SizeOf((ulong)keyLen) + keyLen + (isTombstone ? 0 : valueLen);
         return Varint.SizeOf((ulong)body) + body;
     }
@@ -25,6 +29,7 @@ public static class RecordCodec
         if (isTombstone)
             flags |= RecordFlags.Tombstone;
         var valueLen = isTombstone ? 0 : value.Length;
+        RequireLengths(key.Length, valueLen);
         var body = 2 + Varint.SizeOf((ulong)key.Length) + key.Length + valueLen;
         var pos = Varint.Write(dst, (ulong)body);
         dst[pos++] = (byte)flags;
@@ -67,6 +72,16 @@ public static class RecordCodec
         return true;
     }
 
+    // Private methods
+
+    private static void RequireLengths(int keyLen, int valueLen)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(keyLen);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(keyLen, KvasarConstants.MaxKeyBytes);
+        ArgumentOutOfRangeException.ThrowIfNegative(valueLen);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(valueLen, KvasarConstants.MaxRecordValueBytes);
+    }
+
     private static bool TryParse(
         ReadOnlySpan<byte> src, out RecordFlags flags, out KvasarValueKind valueKind,
         out int keyOffset, out int keyLen, out int valueOffset, out int valueLen,
@@ -89,7 +104,12 @@ public static class RecordCodec
 
         var body = src.Slice(recLenBytes, bodyLen);
         flags = (RecordFlags)body[0];
-        valueKind = (KvasarValueKind)body[1];
+        // An unknown value kind is corruption or a forward format (§4.3) — never serve it as Raw.
+        var kind = (KvasarValueKind)body[1];
+        if (!Enum.IsDefined(kind))
+            return false;
+
+        valueKind = kind;
         isTombstone = (flags & RecordFlags.Tombstone) != 0;
         if (!Varint.TryRead(body[2..], out var keyLenU, out var keyLenBytes))
             return false;

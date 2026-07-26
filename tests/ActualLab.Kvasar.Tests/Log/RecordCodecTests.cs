@@ -69,6 +69,57 @@ public class RecordCodecTests
             RecordCodec.TryDecode(buf.AsMemory(0, cut), out _, out _).Should().BeFalse($"cut at {cut}");
     }
 
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(255)]
+    public void UnknownValueKindFails(byte kind)
+    {
+        var key = RandomBytes(4, 8);
+        var value = RandomBytes(16, 9);
+        var buf = new byte[RecordCodec.MaxHeaderSize(key.Length) + value.Length];
+        var written = RecordCodec.Encode(buf, RecordFlags.None, KvasarValueKind.Raw, key, value, false);
+
+        // The body is < 128 bytes, so recordLen is a single varint byte and valueKind lands at buf[2].
+        buf[2].Should().Be((byte)KvasarValueKind.Raw);
+        buf[2] = kind;
+
+        RecordCodec.TryDecode(buf.AsMemory(0, written), out _, out _).Should().BeFalse();
+        RecordCodec.TryDecode(buf.AsSpan(0, written), out _, out _).Should().BeFalse();
+    }
+
+    [Fact]
+    public void OversizedKeyIsRejected()
+    {
+        var atCap = () => RecordCodec.GetRecordLength(KvasarConstants.MaxKeyBytes, 16, false);
+        atCap.Should().NotThrow();
+
+        var overCap = () => RecordCodec.GetRecordLength(KvasarConstants.MaxKeyBytes + 1, 16, false);
+        overCap.Should().Throw<ArgumentOutOfRangeException>();
+
+        var header = () => RecordCodec.MaxHeaderSize(KvasarConstants.MaxKeyBytes + 1);
+        header.Should().Throw<ArgumentOutOfRangeException>();
+
+        var encode = () => RecordCodec.Encode(
+            new byte[64], RecordFlags.None, KvasarValueKind.Raw,
+            new byte[KvasarConstants.MaxKeyBytes + 1], ReadOnlySpan<byte>.Empty, false);
+        encode.Should().Throw<ArgumentOutOfRangeException>();
+    }
+
+    [Fact]
+    public void HugeLengthsDoNotWrapToANegativeRecordLength()
+    {
+        // Without a cap these sum to a negative int, and the caller then allocates/slices with it.
+        var hugeKey = () => RecordCodec.GetRecordLength(int.MaxValue - 8, 16, false);
+        hugeKey.Should().Throw<ArgumentOutOfRangeException>();
+
+        var hugeValue = () => RecordCodec.GetRecordLength(16, int.MaxValue - 8, false);
+        hugeValue.Should().Throw<ArgumentOutOfRangeException>();
+
+        var negative = () => RecordCodec.GetRecordLength(-1, 16, false);
+        negative.Should().Throw<ArgumentOutOfRangeException>();
+    }
+
     [Fact]
     public void EmptyOrZeroBufferFails()
     {

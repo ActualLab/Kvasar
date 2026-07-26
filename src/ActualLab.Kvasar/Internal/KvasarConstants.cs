@@ -16,6 +16,11 @@ public static class KvasarConstants
     // Segment file header is a fixed-size plaintext prefix; encrypted pages follow it.
     public const int SegmentHeaderSize = 64;
 
+    // Record sizing. RecordCodec sums key + value + a <= 16-byte header in int, so both parts are
+    // capped to keep that sum from wrapping into a negative length.
+    public const int MaxKeyBytes = 64 * 1024;
+    public const int MaxRecordValueBytes = int.MaxValue - MaxKeyBytes - 16;
+
     // Crypto sizing.
     public const int MasterKeySize = 32;      // AES-256 master key
     public const int PageKeySize = 32;        // AES-256 page key

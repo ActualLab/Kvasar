@@ -43,6 +43,22 @@ public class KvasarValueTests
     }
 
     [Fact]
+    public void NullStringOrArrayIsAPresentEmptyValue()
+    {
+        // The documented trap (KvasarValue's summary): the conversions accept null, so only KvasarValue? deletes.
+        string? nullText = null;
+        byte[]? nullBytes = null;
+        char[]? nullChars = null;
+
+        ((KvasarValue)nullText).IsEmpty.Should().BeTrue();
+        ((KvasarValue)nullBytes).IsEmpty.Should().BeTrue();
+        ((KvasarValue)nullChars).IsEmpty.Should().BeTrue();
+
+        KvasarValue? lifted = nullText;
+        lifted.HasValue.Should().BeTrue();
+    }
+
+    [Fact]
     public void EqualityIsByContent()
     {
         KvasarValue a = "abc";

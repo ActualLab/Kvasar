@@ -1,5 +1,6 @@
 using System.IO;
 using System.Text;
+using ActualLab.Kvasar.Internal;
 
 namespace ActualLab.Kvasar.Tests.Store;
 
@@ -40,6 +41,26 @@ public class LockTests : IDisposable
 
         // The first store is untouched.
         (await first.Get(K("keep")))!.Value.ToArray().Should().Equal(K("me"));
+    }
+
+    [Fact]
+    public void ContendedStoreLockThrowsLockException()
+    {
+        var path = Path.Combine(_dir, "contended.lock");
+        using var first = new StoreLock(path);
+
+        var second = () => new StoreLock(path);
+        second.Should().Throw<KvasarLockException>();
+    }
+
+    [Fact]
+    public void NonContentionIOFailureIsNotALockException()
+    {
+        // An over-long path component fails the open with an I/O error that has nothing to do with locking.
+        var path = Path.Combine(_dir, new string('n', 300) + ".lock");
+
+        var open = () => new StoreLock(path);
+        open.Should().Throw<IOException>().Which.Should().NotBeOfType<KvasarLockException>();
     }
 
     [Fact]
