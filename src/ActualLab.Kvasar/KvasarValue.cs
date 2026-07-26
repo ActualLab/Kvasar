@@ -6,6 +6,7 @@ namespace ActualLab.Kvasar;
 /// A store value — raw bytes (<see cref="Memory"/>) tagged with a <see cref="KvasarValueKind"/> (§4.3).
 /// Same conversions as <see cref="KvasarKey"/>, except every conversion out of a value requires a
 /// matching <see cref="Kind"/>. A read returns a zero-copy slice into a cached page (§6.3).
+/// A null <c>string</c>/array converts to a present, empty value — only a null <c>KvasarValue?</c> deletes.
 /// </summary>
 public readonly struct KvasarValue : IEquatable<KvasarValue>
 {
@@ -40,6 +41,8 @@ public readonly struct KvasarValue : IEquatable<KvasarValue>
         => $"{nameof(KvasarValue)}({Kind}, {Length} bytes)";
 
     // Conversion operators
+    // The nullable sources below accept null and produce an empty value, so `store.Set(key, maybeNullString)`
+    // stores an empty value rather than deleting the key — pass a null KvasarValue? to delete.
 
     public static implicit operator KvasarValue(ReadOnlyMemory<byte> memory) => new(memory);
     public static implicit operator KvasarValue(ReadOnlyMemory<char> chars) => new(chars);
