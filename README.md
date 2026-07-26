@@ -25,31 +25,39 @@ are encrypted. Full methodology and raw tables in [`docs/BENCHMARKS.md`](docs/BE
 
 **Cold start** is the most meaningful number: an app launch opens its client cache cold, then 8
 threads speculatively render the UI — a burst of distinct-key reads (80% of the bytes are chat tiles,
-20% misc values), 10% of which also write — and everything ends fully durable. SQLCipher runs in the
-stack it ships in (ActualChat's `BatchingKvas`: a 256-entry LRU, batched reads, a 500 ms lazy writer);
-Kvasar runs with **no layer at all**, app threads calling `Get`/`Set` directly, with its own 0.5 s
-`FlushDelay` for write debouncing.
+20% misc values), 10% of which also write. SQLCipher runs in the stack it ships in (ActualChat's
+`BatchingKvas`: a 256-entry LRU, batched reads, a 500 ms lazy writer); Kvasar runs with **no layer at
+all**, app threads calling `Get`/`Set` directly, with its own 0.5 s `FlushDelay` for write debouncing.
 
 | Cold start, median of 5 | SQLCipher + BatchingKvas | Kvasar, no layer | Speedup |
 |---|--:|--:|--:|
-| 12 MB cache, 1,000 reads | 52.3 ms | **9.1 ms** | **5.7×** |
-| 25 MB cache, 2,000 reads | 102.3 ms | **12.6 ms** | **8.1×** |
+| 12 MB cache, 1,000 reads | 50.8 ms | **5.6 ms** | **9.1×** |
+| 25 MB cache, 2,000 reads | 100.0 ms | **7.6 ms** | **13.2×** |
+
+> **Not durability-matched.** SQLite ends these runs checkpointed; Kvasar's default `Durability` is
+> `Buffered`, so it does not fsync. Netting that out, its own v1→v2 gain here is ~10%, not ~38% — the
+> speedups above are still real but flatter than they look. See
+> [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 Batching layers exist to hide a slow backend; in front of Kvasar the same layer only *costs* time
-(10.7 / 15.3 ms), and its read cache never hits on a distinct-key burst.
+(6.9 / 9.6 ms), and its read cache never hits on a distinct-key burst.
 
 A per-value-size sweep of the engines in isolation — 100k keys, 50-byte keys, 8 reader threads:
 
 | Value size | Batched writes | Startup hydration | Point reads | Read p99 |
 |---|--:|--:|--:|--:|
-| 128 B (fits cache — the target scenario) | **3.0×** | **1.2×** | **73×** | 1.3 µs vs 117 µs |
-| 1 KB | **4.3×** | **4.0×** | **3.7×** | 43 µs vs 141 µs |
-| 4 KB (16 KB pages) | **6.1×** | **7.8×** | **2.3×** | 64 µs vs 172 µs |
+| 128 B (fits cache — the target scenario) | **4.7×** | 0.95× | **44×** | 1.6 µs vs 99 µs |
+| 1 KB | **6.0×** | **4.8×** | **2.6×** | 63 µs vs 118 µs |
+| 4 KB (16 KB pages) | **10.9×** | **8.2×** | **1.5×** | 105 µs vs 141 µs |
 
-A warm read is one hash probe, one already-decrypted page, and a zero-copy slice — roughly **0.7 µs**,
+A warm read is one hash probe, one already-decrypted page, and a zero-copy slice — roughly **1 µs**,
 versus a B-tree descent through the SQLite VM. Where SQLite wins: opening a connection is trivially
-cheap (though Kvasar still wins *startup*, which is open + full hydration), and SQLite's file is
-~20% smaller for 4 KB values.
+cheap; **startup hydration at 128 B**, where it is now marginally ahead (138 ms vs 145 ms) because it
+defers work Kvasar does eagerly and a small dataset never repays that; and its file is ~14% smaller
+for 4 KB values.
+
+The point-read column is the least repeatable in this table — back-to-back runs on an idle machine
+moved it 30% for *both* engines. Treat those multiples as one significant figure.
 
 ## How it works
 
@@ -126,18 +134,12 @@ Keys and values are binary — `KvasarKey` / `KvasarValue`, thin structs over
 
 **Tune `PageSize` to your value size.** It is the highest-leverage knob: values larger than a page
 can't stay single-page, which costs both space and I/O. Moving 4 KB values from 4 KB to 16 KB pages
-is +56% writes, −31% file size, and −51% startup.
+is **+67% writes, −33% file size, and −52% startup**.
 
 ## Status
 
 Working and tested — not yet released. The library multi-targets **net10.0** (default) and
 **net9.0**, is AOT- and trimming-safe, and depends on exactly one package (`System.IO.Hashing`).
-
-On the workload it exists for — ActualChat's cold start, a phone opening its cache and rendering the
-UI — Kvasar is **9.7–11.6× faster than SQLite + SQLCipher** end to end (5.3 ms vs 51.3 ms on a 12 MB
-cache; 8.6 ms vs 99.8 ms on 25 MB), and it needs no batching layer in front of it to get there. See
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md), including the note that the current comparison is not
-durability-matched.
 
 **Durability:** Kvasar buys **atomicity, not durability** — after any crash it reopens at the state
 of some commit that completed, never at a partial or mixed one. It does *not* promise that the most

@@ -36,45 +36,49 @@ The previous numbers, taken against the segment model, are kept in the compariso
 ### Value = 128 B (12.8 MB — fits the page cache, like the ~25 MB hot set)
 | Engine | Write k/s | File MB | Open ms | Startup ms* | Lookup k/s | p50 µs | p99 µs |
 |---|--:|--:|--:|--:|--:|--:|--:|
-| **Kvasar (AES-GCM)** | **628** | **18.7** | 31.3 | 146 | **6,278** | **1.0** | **1.7** |
-| Kvasar (no-enc) | 996 | 18.6 | 12.7 | 103 | 7,942 | 0.8 | 1.5 |
-| SQLCipher | 130 | 26.5 | 1.5 | **139** | 149 | 49.6 | 99.4 |
+| **Kvasar (AES-GCM)** | **660** | **18.7** | 31.2 | 145 | **6,517** | **0.9** | **1.6** |
+| Kvasar (no-enc) | 1,016 | 18.6 | 12.5 | 101 | 11,551 | 0.5 | 1.6 |
+| SQLCipher | 139 | 26.5 | 1.5 | **138** | 149 | 49.4 | 99.4 |
 
 ### Value = 1 KB (102 MB — exceeds the 64 MB cache)
 | Engine | Write k/s | File MB | Open ms | Startup ms* | Lookup k/s | p50 µs | p99 µs |
 |---|--:|--:|--:|--:|--:|--:|--:|
-| **Kvasar (AES-GCM)** | **311** | **137** | 10.7 | **180** | **349** | **10.9** | **62.4** |
-| Kvasar (no-enc) | 614 | 137 | 9.4 | 86 | 371 | 10.2 | 61.0 |
-| SQLCipher | 54.7 | 144 | 1.2 | 719 | 117 | 66.2 | 134 |
+| **Kvasar (AES-GCM)** | **361** | **137** | 10.1 | **148** | **351** | **11.0** | **62.5** |
+| Kvasar (no-enc) | 629 | 137 | 13.8 | 87 | 373 | 10.4 | 62.1 |
+| SQLCipher | 60.2 | 144 | 1.4 | 712 | 134 | 52.7 | 118 |
 
 ### Value = 4 KB (410 MB — far exceeds cache; value ≥ the default page size)
 | Engine | Write k/s | File MB | Open ms | Startup ms* | Lookup k/s | p50 µs | p99 µs |
 |---|--:|--:|--:|--:|--:|--:|--:|
-| Kvasar (AES-GCM), 4 KB pages | 101 | 822 | 9.9 | 682 | 88.4 | 52.1 | 183 |
-| **Kvasar (AES-GCM), 16 KB pages** | **200** | **547** | 29.4 | **288** | **136** | **27.3** | 113 |
-| Kvasar (no-enc), 16 KB pages | 217 | 546 | 12.7 | 240 | 117 | 29.5 | 150 |
-| SQLCipher | 20.7 | **468** | 1.8 | 2,648 | 73.7 | 102 | 176 |
+| Kvasar (AES-GCM), 4 KB pages | 119 | 822 | 10.7 | 600 | 116 | 40.9 | 107 |
+| **Kvasar (AES-GCM), 16 KB pages** | **199** | **547** | 29.7 | **289** | **142** | **26.8** | 105 |
+| Kvasar (no-enc), 16 KB pages | 278 | 546 | 11.2 | 185 | 140 | 26.3 | 109 |
+| SQLCipher | 18.3 | **468** | 1.3 | 2,366 | 96.9 | 75.1 | 141 |
 
 ### v1 (segments) → v2 (superblock), Kvasar AES-GCM only
 
 | | Write k/s | Startup ms | Lookup k/s |
 |---|--:|--:|--:|
-| 128 B | 399 → **628** (+57%) | 121 → 146 (**+20% worse**) | 8,653 → 6,278 (**−27%**) |
-| 1 KB | 233 → **311** (+33%) | 185 → **180** (−3%) | 386 → 349 (−10%) |
-| 4 KB @16 KB pages | 122 → **200** (+64%) | 318 → **288** (−9%) | 171 → 136 (**−21%**) |
+| 128 B | 399 → **660** (+65%) | 121 → 145 (**+20% worse**) | 8,653 → 6,517 (**−25%**) |
+| 1 KB | 233 → **361** (+55%) | 185 → **148** (−20%) | 386 → 351 (−9%) |
+| 4 KB @16 KB pages | 122 → **199** (+63%) | 318 → **289** (−9%) | 171 → 142 (−17%) |
 
 **Writes are the clear win** — no segment rolling, no per-write checkpoint bookkeeping, one hash per
 key in `SetMany` instead of three, and a flush loop armed on the clean⇒dirty edge rather than ticking.
 
-**Lookups regressed 10–27%, and 128 B startup is 20% worse** — enough that Kvasar now *loses* startup
-to SQLCipher at 128 B (146 ms vs 139 ms), the one cell in these tables where it does. Candidate
+**Lookups regressed 9–25%, and 128 B startup is 20% worse** — enough that Kvasar now *loses* startup
+to SQLCipher at 128 B (145 ms vs 138 ms), the one cell in these tables where it does. Candidate
 causes, in decreasing confidence: `Scan` must now re-hash each record's key to confirm it is the one
 its index entry named (DESIGN-Durability §14.2 — slots are recycled in place, so a stale locator can
 decode as a genuine *different* record, which the segment model made impossible by unlinking);
 `IndexEntry` grew 21 → 24 bytes, so an index pass touches ~14% more memory; and recovery now rotates
 the index whenever it replays. The first is a correctness fix and is not negotiable. **The rest is
-unprofiled — treat these as hypotheses, not findings**, and note the lookup column moves ±20% between
-otherwise identical runs, so the −27% is a direction, not a measurement.
+unprofiled — treat these as hypotheses, not findings.**
+
+> **On precision.** Two back-to-back runs of this sweep on an idle machine moved Kvasar's 4 KB lookup
+> column 88 → 116 k/s and SQLCipher's 74 → 97 k/s — over 30% on a column nothing had changed. Writes
+> and file sizes are stable to a few percent; **lookup and startup are worth about one significant
+> figure.** Directions in the table above are real; the exact percentages are not.
 
 > ### ⚠ These numbers are not durability-comparable
 >
@@ -166,6 +170,8 @@ split evenly across the threads), 10% of reads also `Set` a fresh same-size valu
 Nothing is deliberately re-read: an app start renders distinct UI, and Fusion's compute cache dedupes
 repeats upstream.
 
+**No longer true in v2 — see the durability warning above; Kvasar's `Buffered` default does not
+fsync, so only the SQLite side still ends durable.** As originally specified:
 Both stacks end **fully durable** — the harness `LazyWriter` is drained and `wal_checkpoint(TRUNCATE)`
 runs for SQLite; plain Kvasar ends on `store.Flush(fsync: true)`, which force-seals the tail rather
 than waiting out the 500 ms debounce. Neither side is credited for work it merely deferred. Every
@@ -177,76 +183,74 @@ Machine: 32 logical cores, .NET 10, Windows. Lower is better everywhere.
 
 | Engine | Stack | DB MB | **TOTAL ms** | min–max | Open | Read | Flush | Read calls | keys/call | Cache hit | Write calls | p50 µs | p99 µs |
 |---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| **SQLCipher** | BatchingKvas | 15.6 | **51.3** | 50.9–58.6 | 1.2 | 39.7 | 10.3 | 373 | 2.68 | 0.0% | 2 | 227 | 733 |
-| **Kvasar (AES-GCM)** | **plain** | 14.6 | **5.3** | 5.3–5.8 | 2.3 | 2.8 | 0.2 | 1,000 | 1.00 | — | 111 | 5.6 | 78.6 |
-| Kvasar (no-enc) | plain | 14.6 | 5.4 | 4.8–5.8 | 2.6 | 2.5 | 0.2 | 1,000 | 1.00 | — | 111 | 6.1 | 70.1 |
-| Kvasar (AES-GCM) | BatchingKvas | 14.6 | 6.3 | 6.2–6.8 | 2.0 | 3.9 | 0.4 | 733 | 1.36 | 0.0% | 2 | 21.0 | 131 |
+| **SQLCipher** | BatchingKvas | 15.6 | **50.8** | 49.6–56.7 | 1.2 | 38.9 | 10.6 | 376 | 2.66 | 0.0% | 2 | 222 | 677 |
+| **Kvasar (AES-GCM)** | **plain** | 14.6 | **5.6** | 5.4–6.0 | 2.3 | 3.0 | 0.2 | 1,000 | 1.00 | — | 111 | 6.1 | 78.8 |
+| Kvasar (no-enc) | plain | 14.6 | 5.2 | 5.0–6.1 | 2.2 | 2.7 | 0.2 | 1,000 | 1.00 | — | 111 | 5.7 | 77.6 |
+| Kvasar (AES-GCM) | BatchingKvas | 14.6 | 6.9 | 6.6–7.0 | 2.2 | 4.2 | 0.4 | 713 | 1.40 | 0.0% | 2 | 24.4 | 195 |
 
 ### Config B — 25 MB dataset, 2,000 reads (1,000 tiles + 1,000 misc)
 
 | Engine | Stack | DB MB | **TOTAL ms** | min–max | Open | Read | Flush | Read calls | keys/call | Cache hit | Write calls | p50 µs | p99 µs |
 |---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| **SQLCipher** | BatchingKvas | 32.4 | **99.8** | 98.7–111.7 | 1.2 | 85.5 | 12.9 | 750 | 2.67 | 0.0% | 3 | 271 | 515 |
-| **Kvasar (AES-GCM)** | **plain** | 30.5 | **8.6** | 8.4–13.5 | 2.7 | 5.4 | 0.3 | 2,000 | 1.00 | — | 182 | 15.3 | 70.4 |
-| Kvasar (no-enc) | plain | 30.5 | 9.1 | 8.5–9.5 | 2.8 | 5.9 | 0.3 | 2,000 | 1.00 | — | 182 | 14.3 | 94.1 |
-| Kvasar (AES-GCM) | BatchingKvas | 30.5 | 10.5 | 10.4–10.9 | 2.8 | 7.3 | 0.3 | 1,480 | 1.35 | 0.0% | 3 | 23.6 | 116 |
+| **SQLCipher** | BatchingKvas | 32.4 | **100.0** | 99.5–110.4 | 1.2 | 84.9 | 13.8 | 733 | 2.73 | 0.0% | 3 | 272 | 582 |
+| **Kvasar (AES-GCM)** | **plain** | 30.5 | **7.6** | 7.0–11.5 | 2.3 | 4.9 | 0.3 | 2,000 | 1.00 | — | 182 | 14.2 | 84.0 |
+| Kvasar (no-enc) | plain | 30.5 | 7.3 | 7.0–10.5 | 2.7 | 4.1 | 0.3 | 2,000 | 1.00 | — | 182 | 12.4 | 76.1 |
+| Kvasar (AES-GCM) | BatchingKvas | 30.5 | 9.6 | 9.0–10.2 | 2.5 | 6.7 | 0.3 | 1,481 | 1.35 | 0.0% | 3 | 20.9 | 90.4 |
 
 ### v1 → v2, chat scenario (Kvasar AES-GCM, TOTAL ms)
 
 | | v1 | v2 | |
 |---|--:|--:|---|
-| A · plain | 9.1 | **5.3** | −42% |
-| A · `BatchingKvas` | 10.7 | **6.3** | −41% |
-| B · plain | 12.6 | **8.6** | −32% |
-| B · `BatchingKvas` | 15.3 | **10.5** | −31% |
-| A / B · SQLCipher (control) | 52.3 / 102.3 | 51.3 / 99.8 | −2% |
+| A · plain | 9.1 | **5.6** | −38% |
+| A · `BatchingKvas` | 10.7 | **6.9** | −36% |
+| B · plain | 12.6 | **7.6** | −40% |
+| B · `BatchingKvas` | 15.3 | **9.6** | −37% |
+| A / B · SQLCipher (control) | 52.3 / 102.3 | 50.8 / 100.0 | −3% / −2% |
 
-Kvasar in its shipping configuration is **9.7×** SQLCipher (A) and **11.6×** (B), up from 5.7× and
+Kvasar in its shipping configuration is **9.1×** SQLCipher (A) and **13.2×** (B), up from 5.7× and
 8.1×. SQLCipher moving <3% across the same runs is the control that says the Kvasar deltas are real
-and not machine noise.
+and not machine noise — this scenario is far more repeatable than the sweep's lookup column.
 
 **Read the gain net of the durability caveat above.** Flush dropped 2.8 → 0.2 ms (A) and 3.9 → 0.3
 (B) because `Buffered` no longer fsyncs — that is most of the improvement. Netting it out, the honest
-v2 gain here is roughly 9.1 → 8.1 ms (A), i.e. ~11%, not 42%.
+v2 gain here is roughly 9.1 → 8.2 ms (A), i.e. ~10%, not 38%.
 
 **One regression was found and fixed by this scenario**, which is the argument for running it: the
-`BatchingKvas` row first came back at 15.3 ms (A) / 32.5 ms (B), 43% and 114% *worse* than v1. Cause
+`BatchingKvas` row first came back at 15.3 ms (A) / 32.5 ms (B), 43% and 112% *worse* than v1. Cause
 was the I27 `GetMany` change issuing a ~1 MiB readahead per call — fine for the cold 64-key batch
 SPEC §6.4 targets, pathological at the `keys/op ≈ 1.35` this layer actually produces. Prefetch is now
 gated on batch size, and the row is better than v1. The sweep never showed it, because the sweep only
 ever issues full 64-key batches.
 
-**Run-to-run spread** (4 independent process runs of the whole scenario, TOTAL ms): SQLCipher
-52.1–55.0 (A) / 102.3–107.2 (B); Kvasar AES-GCM plain 9.1–10.3 / 12.0–12.6; no-enc plain 8.5–12.8 /
-11.4–12.2; Kvasar + `BatchingKvas` 9.9–16.8 / 14.6–15.9. So on the Kvasar rows differences under
-~1.5 ms are noise — which specifically means the AES-GCM vs no-enc gap is noise, and `BatchingKvas`
-vs `plain` is decisive only in config B by TOTAL (it is decisive in *both* configs on the read burst,
-where the spread is much tighter).
+**Run-to-run spread**, v2 (`min–max` columns above span 5 cold starts within one process): SQLCipher
+49.6–56.7 (A) / 99.5–110.4 (B); Kvasar AES-GCM plain 5.4–6.0 / 7.0–11.5; no-enc plain 5.0–6.1 /
+7.0–10.5; Kvasar + `BatchingKvas` 6.6–7.0 / 9.0–10.2. Differences under ~1 ms on the Kvasar rows are
+noise — which specifically means the AES-GCM vs no-enc gap is noise.
 
 ### Takeaways
 
-- **Cold start is 5.7× faster at 12 MB (52.3 → 9.1 ms) and 8.1× at 25 MB (102.3 → 12.6 ms).** Every
-  phase but `Open` improves: the read burst 41.3 → 3.2 ms (13×) and 87.3 → 5.4 ms (16×), the durable
-  flush 9.4 → 2.8 and 13.7 → 3.9 ms. Bare `Open` is slower (1.2–1.4 → ~3 ms) because Kvasar loads its
-  index up front instead of deferring the work; it wins startup regardless.
+- **Cold start is 9.1× faster at 12 MB (50.8 → 5.6 ms) and 13.2× at 25 MB (100.0 → 7.6 ms).** Every
+  phase but `Open` improves: the read burst 38.9 → 3.0 ms (13×) and 84.9 → 4.9 ms (17×), the flush
+  10.6 → 0.2 and 13.8 → 0.3 ms. Bare `Open` is slower (~1.2 → ~2.3 ms) because Kvasar loads its index
+  up front instead of deferring; it wins startup regardless.
+  **The flush row is not a like-for-like comparison** — see the durability warning above. It is most
+  of the v1→v2 delta on this scenario.
 - **The gap widens with load, because only SQLCipher scales with it.** Per read, SQLCipher costs
-  41 µs (A) and 44 µs (B); Kvasar costs 3.2 µs and 2.7 µs — flat, and marginally *better* on the
+  39 µs (A) and 42 µs (B); Kvasar costs 3.0 µs and 2.5 µs — flat, and marginally *better* on the
   bigger dataset, where the fixed thread-ramp cost is amortized over more operations. Doubling the
-  dataset and the burst costs SQLCipher +96% and Kvasar +38%.
+  dataset and the burst costs SQLCipher +97% and Kvasar +36%.
 - **Kvasar's cold start is dominated by fixed cost, not by data.** Halving the workload only takes it
-  from 12.6 to 9.1 ms (−28%, not −50%), because `Open` (~3 ms) and the durable flush (~3 ms) barely
-  move; the read burst is the only part that halves. This is why config A looks less than
-  proportionally faster — it is not an anomaly, it is the read burst having shrunk to a quarter of the
-  total.
+  from 7.6 to 5.6 ms (−26%, not −50%), because `Open` (~2.3 ms) barely moves; the read burst is the
+  only part that halves.
 - **Kvasar needs no layer above it.** `FlushDelay` absorbs what `LazyWriter` was for, and the read
-  path is pure overhead: the same store behind `BatchingKvas` costs 10.7 vs 9.1 ms (A) and 15.3 vs
-  12.6 ms (B), with the read burst at 4.8 vs 3.2 ms and 8.9 vs 5.4 ms — despite issuing *fewer*
-  backend calls (699 vs 1,000; 1,478 vs 2,000). A channel hop plus a `TaskCompletionSource` per key
-  plus worker dispatch costs more than the read it amortizes, and Kvasar's page cache already makes
-  the 256-entry LRU redundant.
+  path is overhead: the same store behind `BatchingKvas` costs 6.9 vs 5.6 ms (A) and 9.6 vs 7.6 ms
+  (B) — despite issuing *fewer* backend calls (713 vs 1,000; 1,481 vs 2,000). A channel hop plus a
+  `TaskCompletionSource` per key plus worker dispatch costs more than the read it amortizes, and
+  Kvasar's page cache already makes the 256-entry LRU redundant.
+  This row is also where a real regression surfaced — see the note above the takeaways.
 - **Unbatched writes are no longer a problem.** Plain Kvasar issues 111/182 single-record `Set`s
-  where the harness issues 2–3 `SetMany`s, and still flushes in 2.8–3.9 ms: with `FlushDelay > 0` a
-  `Set` appends into the unsealed tail instead of sealing a page per record.
+  where the harness issues 2–3 `SetMany`s: with `FlushDelay > 0` a `Set` appends into the unsealed
+  tail instead of sealing a page per record.
 - **Encryption is free on this workload** — AES-GCM and no-enc land within the run-to-run spread of
   each other in both configs (and in one run no-enc came out *slower*).
 - **A page cache above the dataset buys median latency, not cold-start time.** Config A's 14.6 MB
