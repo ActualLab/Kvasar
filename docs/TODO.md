@@ -263,7 +263,10 @@ buys nothing for its wakeups. Found in this session, not by any of the four revi
 [`DESIGN-Durability.md`](DESIGN-Durability.md) §2.2, which also adds the byte-based commit trigger
 that the recovery-validation bound actually requires.
 
-### P2. Benchmarks not re-run after this session's hot-path changes (S)
+### P2. Benchmarks not re-run after this session's hot-path changes (S) — **DONE**
+Re-measured after the v2 rewrite; see [`BENCHMARKS.md`](BENCHMARKS.md). Writes +41–68%, lookups
+−3–11%, and 128 B startup +17% worse — enough that Kvasar now loses startup to SQLCipher at 128 B.
+The regressions are recorded with candidate causes flagged as unprofiled hypotheses. Original note:
 CLAUDE.md requires re-running and updating [`BENCHMARKS.md`](BENCHMARKS.md) when a hot path changes.
 `Set` now allocates the `*Locked` `Task` and passes a wider `KvasarValue?` (the `Kind` byte pushes
 `Nullable<KvasarValue>` past `ReadOnlyMemory<byte>?`), and `SegmentSet.Flush` changed shape. Expected

@@ -30,43 +30,69 @@ configurations, one table each) and ignores the sweep's sizing args.
 Machine: 32 logical cores, .NET 10, Windows, N = 100,000 keys, 8 lookup threads, 500k random lookups.
 Kvasar uses AES-256-GCM (encrypted, like SQLCipher). Higher is better except ms columns.
 
+Re-measured after the v2 storage rewrite (superblock + two-slot data/index files, total compaction).
+The previous numbers, taken against the segment model, are kept in the comparison below.
+
 ### Value = 128 B (12.8 MB — fits the page cache, like the ~25 MB hot set)
 | Engine | Write k/s | File MB | Open ms | Startup ms* | Lookup k/s | p50 µs | p99 µs |
 |---|--:|--:|--:|--:|--:|--:|--:|
-| **Kvasar (AES-GCM)** | **399** | **19.3** | 28.4 | **121** | **8,653** | **0.7** | **1.3** |
-| Kvasar (no-enc) | 493 | 19.2 | 13.9 | 85 | 8,529 | 0.7 | 3.2 |
-| SQLCipher | 134 | 26.5 | 3.9 | 140 | 119 | 66.5 | 117 |
+| **Kvasar (AES-GCM)** | **670** | **18.7** | 29.7 | 142 | **8,274** | **0.7** | **1.4** |
+| Kvasar (no-enc) | 1,026 | 18.6 | 12.5 | 100 | 11,532 | 0.4 | 3.0 |
+| SQLCipher | 142 | 26.5 | 1.5 | **136** | 127 | 65.0 | 108 |
 
 ### Value = 1 KB (102 MB — exceeds the 64 MB cache)
 | Engine | Write k/s | File MB | Open ms | Startup ms* | Lookup k/s | p50 µs | p99 µs |
 |---|--:|--:|--:|--:|--:|--:|--:|
-| **Kvasar (AES-GCM)** | **233** | 141 | 16.0 | **185** | **386** | **10.9** | **43.0** |
-| Kvasar (no-enc) | 334 | 141 | 13.7 | 115 | 471 | 8.6 | 36.8 |
-| SQLCipher | 54 | 144 | 1.3 | 743 | 105 | 69.0 | 141 |
+| **Kvasar (AES-GCM)** | **330** | **137** | 11.8 | **178** | **374** | **11.1** | **54.1** |
+| Kvasar (no-enc) | 662 | 137 | 11.4 | 90 | 417 | 8.8 | 50.7 |
+| SQLCipher | 51.4 | 144 | 1.3 | 729 | 109 | 67.8 | 132 |
 
 ### Value = 4 KB (410 MB — far exceeds cache; value ≥ the default page size)
 | Engine | Write k/s | File MB | Open ms | Startup ms* | Lookup k/s | p50 µs | p99 µs |
 |---|--:|--:|--:|--:|--:|--:|--:|
-| Kvasar (AES-GCM), 4 KB pages | 77.9 | 822 | 40.5 | 649 | 137 | 29.8 | 81.7 |
-| **Kvasar (AES-GCM), 16 KB pages** | **122** | **564** | 35.4 | **318** | **171** | **20.0** | **63.7** |
-| Kvasar (no-enc), 16 KB pages | 168 | 563 | 21.4 | 209 | 182 | 16.8 | 59.2 |
-| SQLCipher | 19.8 | **468** | 1.4 | 2,498 | 75.0 | 101 | 172 |
+| Kvasar (AES-GCM), 4 KB pages | 111 | 822 | 10.6 | 608 | 126 | 34.2 | 106 |
+| **Kvasar (AES-GCM), 16 KB pages** | **190** | **547** | 30.3 | **286** | **153** | **23.8** | 99.0 |
+| Kvasar (no-enc), 16 KB pages | 310 | 546 | 9.8 | 177 | 147 | 22.8 | 106 |
+| SQLCipher | 22.0 | **468** | 1.3 | 2,491 | 76.0 | 99.6 | 166 |
+
+### v1 (segments) → v2 (superblock), Kvasar AES-GCM only
+
+| | Write k/s | Startup ms | Lookup k/s |
+|---|--:|--:|--:|
+| 128 B | 399 → **670** (+68%) | 121 → 142 (**+17% worse**) | 8,653 → 8,274 (−4%) |
+| 1 KB | 233 → **330** (+41%) | 185 → **178** (−4%) | 386 → 374 (−3%) |
+| 4 KB @16 KB pages | 122 → **190** (+56%) | 318 → **286** (−10%) | 171 → 153 (−11%) |
+
+**Writes are the clear win** — no segment rolling, no per-write checkpoint bookkeeping, one hash per
+key in `SetMany` instead of three, and a flush loop armed on the clean⇒dirty edge rather than ticking.
+
+**Two regressions, reported rather than buried.** Lookups are 3–11% slower and 128 B startup is 17%
+worse — enough that Kvasar now *loses* startup to SQLCipher at 128 B (142 ms vs 136 ms), the one cell
+in these tables where it does. Contributing causes, in decreasing confidence: `Scan` must now re-hash
+each record's key to confirm it is the one its index entry named (DESIGN-Durability §14.2 — slots are
+recycled in place, so a stale locator can decode as a genuine *different* record, which the segment
+model made impossible by unlinking); `IndexEntry` grew 21 → 24 bytes, so an index pass touches ~14%
+more memory; and recovery now rotates the index whenever it replays. The first is a correctness fix
+and is not negotiable. The rest is unprofiled — **treat these attributions as hypotheses, not
+findings.**
 
 \* Startup ms = open + full `ListAllEntries`/`Scan` (the client cache's launch-time hydration).
 Open ms = just reopening the store (Kvasar: load `.kidx` + seed accounting; SQLite: open connection).
 
 ## Takeaways
 
-Kvasar wins every metric at every value size except bare `Open` (opening a SQLite connection is
-trivially cheap — but it defers the work Kvasar has already done, which is why Kvasar still wins
-*startup*) and on-disk size at 4 KB.
+Kvasar wins every metric at every value size except bare `Open`, on-disk size at 4 KB, and — new in
+v2 — startup at 128 B, where it is now marginally behind.
 
-- **Point reads — Kvasar wins decisively.** ~**73×** faster when the hot data fits the page cache
-  (the target ~25 MB scenario), narrowing to ~2–4× when the dataset is many times the cache. Tail
-  latency is dramatically better (p99 1.3–64 µs vs SQLCipher's 117–172 µs) — one hash probe + one
+- **Point reads — Kvasar wins decisively.** ~**65×** faster when the hot data fits the page cache
+  (the target ~25 MB scenario), narrowing to ~2–3.4× when the dataset is many times the cache. Tail
+  latency is dramatically better (p99 1.4–99 µs vs SQLCipher's 108–166 µs) — one hash probe + one
   cached page decrypt + zero-copy slice vs. a B-tree descent through the SQLite VM.
-- **Batched writes — Kvasar wins 3.0–6.1×** (at a page size suited to the value size).
-- **Startup hydration — Kvasar wins 1.2× (128 B), 4.0× (1 KB), 7.8× (4 KB at 16 KB pages).**
+- **Batched writes — Kvasar wins 4.7–8.6×** (at a page size suited to the value size), up from
+  3.0–6.1× in v1.
+- **Startup hydration — 0.96× (128 B, i.e. a slight loss), 4.1× (1 KB), 8.7× (4 KB at 16 KB pages).**
+  The 128 B case is the honest weak spot: SQLite defers work that Kvasar does eagerly, and at a small
+  dataset there is not enough deferred work for Kvasar's eager index load to pay for itself.
 - **On-disk size.** Smaller than SQLCipher for small values. At 4 KB with 4 KB pages it is ~1.75×
   larger, because a value ≥ the page can't stay single-page and rounds up to a multi-page run;
   **16 KB pages cut that to 564 MB (−31%)**, close to SQLite's 468 MB.
