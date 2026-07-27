@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using ActualLab.Kvasar.Crypto;
@@ -174,6 +175,7 @@ public sealed class KvasarStore : IAsyncDisposable
         var kdf = options.Kdf ?? KeyDerivations.HkdfSha256;
         _hasher = options.Hasher ?? KeyHashers.SipHash24;
         _formatVer = ParseFormatVersion(options.FormatVersion, options.Version);
+        var previousFormatVer = ParsePreviousFormatVersion(options.Version);
 
         // Derive per-store subkeys from the master key. The page nonce's uniqueness comes from each
         // file's own random salt, so a store-level KDF salt isn't needed (the master key is already
@@ -191,7 +193,7 @@ public sealed class KvasarStore : IAsyncDisposable
             cipherFactory = options.DisableEncryption
                 ? NoopPageCipherFactory.Instance
                 : new AesGcmPageCipherFactory(pageKey, _formatVer);
-            superblock = new Superblock(options.EncryptionKey, _formatVer, kdf);
+            superblock = new Superblock(options.EncryptionKey, _formatVer, kdf, previousFormatVer);
             _hashKey = hashKey;
             _indexMacKey = indexMacKey;
             _cipherFactory = cipherFactory;
@@ -533,6 +535,13 @@ public sealed class KvasarStore : IAsyncDisposable
         await CompactLocked(cancellationToken).WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
+    // Protected/internal methods
+
+    internal static uint ParsePreviousFormatVersion(string? version)
+        => ParseFormatVersion(
+            KvasarConstants.PreviousDataFormatVersion.ToString(CultureInfo.InvariantCulture),
+            version);
+
     // Private methods
 
     // --- Private: write-lock bodies ----------------------------------------
@@ -635,7 +644,10 @@ public sealed class KvasarStore : IAsyncDisposable
     private async ValueTask Initialize(CancellationToken cancellationToken)
     {
         _superblockFile = await _storage.Open(_kvsPath, cancellationToken).ConfigureAwait(false);
-        var read = await _superblock.Read(_superblockFile, cancellationToken).ConfigureAwait(false);
+        var read = await _superblock
+            .ReadWithPreviousFormatCorroboration(
+                _superblockFile, HasCorroboratingDataHeader, cancellationToken)
+            .ConfigureAwait(false);
         if (read.Status == SuperblockStatus.WrongKey)
             throw new KvasarKeyException(
                 $"The store '{_options.BasePath}' was created under a different encryption key.");
@@ -687,9 +699,9 @@ public sealed class KvasarStore : IAsyncDisposable
             && previous.DataSlot == state.DataSlot
             && previous.DataCommitLength >= KvasarConstants.SegmentHeaderSize
             && previous.DataCommitLength <= state.DataCommitLength)
-            floor = previous.DataCommitLength;
+            floor = Math.Max(floor, previous.DataCommitLength);
         else if (previousState is { } other && other.DataSlot != state.DataSlot)
-            floor = KvasarConstants.SegmentHeaderSize;
+            floor = Math.Max(floor, KvasarConstants.SegmentHeaderSize);
 
         var fromPageId = GetPageCount(floor);
         var toPageId = GetPageCount(state.DataCommitLength);
@@ -855,6 +867,34 @@ public sealed class KvasarStore : IAsyncDisposable
         var header = new byte[KvasarConstants.SegmentHeaderSize];
         await file.ReadExact(0, header, cancellationToken).ConfigureAwait(false);
         return SegmentHeader.Read(header).PageSize;
+    }
+
+    private async ValueTask<bool> HasCorroboratingDataHeader(
+        uint formatVer, CancellationToken cancellationToken)
+    {
+        var header = new byte[KvasarConstants.SegmentHeaderSize];
+        foreach (var path in _kdatPaths) {
+            if (!_storage.Exists(path))
+                continue;
+
+            var file = await _storage.Open(path, cancellationToken).ConfigureAwait(false);
+            try {
+                if (file.Length < header.Length
+                    || !await file.TryReadExact(0, header, cancellationToken).ConfigureAwait(false))
+                    continue;
+
+                try {
+                    if (SegmentHeader.Read(header).FormatVer == formatVer)
+                        return true;
+                }
+                catch (KvasarCorruptException) {
+                }
+            }
+            finally {
+                await file.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+        return false;
     }
 
     private static async ValueTask DisposeFiles(IStorageFile?[] files)

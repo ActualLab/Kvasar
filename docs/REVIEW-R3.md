@@ -34,7 +34,7 @@ independently hit the same P0 from opposite directions, which is what made it wo
 | **X3** | `Recycle` strands the previous page cipher unzeroized | P3 | | X | open — see below |
 | **X6** | `SetByKeyId` sits below its callees | P3 | | X | **fixed** `3fb9405` |
 
-**Status as of 2026-07-27: 12 of 13 fixed.** X3 remains open and is described below. Suite: 462 passed, 0 skipped,
+**Status as of 2026-07-27: 12 of 13 fixed.** X3 remains open and is described below. Suite: 463 passed, 0 skipped,
 0 failed, on net10.0 and net9.0.
 
 ### Exploitability

@@ -790,5 +790,4 @@ public sealed class DataLog : IAsyncDisposable
             if (slot is not null)
                 await slot.File.DisposeAsync().ConfigureAwait(false);
     }
-
 }

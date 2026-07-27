@@ -874,12 +874,25 @@ public sealed class ReviewRegressionTests : IDisposable
         var physical = new FileInfo(DataPath(after.DataSlot)).Length;
         after.DataCommitLength.Should().BeLessThanOrEqualTo(physical + PageSize + KvasarConstants.GcmTagSize);
 
-        await using var reopened = await KvasarStore.Open(options);
-        var survivors = 0;
-        for (var i = 0; i < total; i++)
-            if (await reopened.Get(K(i)) is not null)
-                survivors++;
-        survivors.Should().Be(total, "a torn tail must never cost the whole store");
+        var previousStates = await ReadSuperblockStates();
+        for (var round = 0; round < 2; round++) {
+            await using (var reopened = await KvasarStore.Open(options)) {
+                var survivors = 0;
+                for (var i = 0; i < total; i++)
+                    if (await reopened.Get(K(i)) is not null)
+                        survivors++;
+                survivors.Should().Be(total, "a torn tail must never cost the whole store");
+            }
+
+            var currentStates = await ReadSuperblockStates();
+            currentStates.Should().HaveCount(2);
+            currentStates[0].Generation.Should().Be(previousStates[0].Generation + 1,
+                "a read-only reopen must adopt and confirm the newest generation");
+            currentStates[1].Generation.Should().Be(previousStates[0].Generation);
+            currentStates[1].DataCommitLength.Should().Be(previousStates[0].DataCommitLength,
+                "confirming the newest generation must not rewind its committed extent");
+            previousStates = currentStates;
+        }
     }
 
     [Fact]
@@ -988,11 +1001,14 @@ public sealed class ReviewRegressionTests : IDisposable
         => [.. Directory.GetFiles(_dir).Select(Path.GetFileName)!];
 
     private async Task<SuperblockState> ReadSuperblock()
+        => (await ReadSuperblockStates())[0];
+
+    private async Task<SuperblockState[]> ReadSuperblockStates()
     {
         await using var file = await FileStorageBackend.Instance.Open(KvsPath);
         var read = await new Superblock(_key, FormatVer).Read(file);
         read.Status.Should().Be(SuperblockStatus.Ok);
-        return read.Newest!.Value;
+        return read.States;
     }
 
     private async Task<SuperblockState> ReadSuperblock(FakeStorageBackend backend)

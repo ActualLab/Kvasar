@@ -152,15 +152,16 @@ public sealed class FormatRevisionTests : IDisposable
     }
 
     [Fact]
-    public async Task WrongKeyOnAPreRevisionStoreThrowsWithoutWiping()
+    public async Task WrongKeyOnAVersionedPreRevisionStoreThrowsWithoutWiping()
     {
-        await CreateLegacyStore();
+        const string version = "app-v3";
+        await CreateLegacyStore(version);
         string[] paths = [SuperblockPath, .. DataPaths, .. IndexPaths];
         var snapshots = paths.ToDictionary(x => x, x => File.ReadAllBytes(x));
         var wrongKey = Enumerable.Range(101, 32).Select(x => (byte)x).ToArray();
         var options = Options() with {
             EncryptionKey = wrongKey,
-            Version = "app-v3",
+            Version = version,
         };
 
         var act = async () => {
@@ -170,6 +171,22 @@ public sealed class FormatRevisionTests : IDisposable
 
         foreach (var path in paths)
             File.ReadAllBytes(path).Should().Equal(snapshots[path]);
+    }
+
+    [Fact]
+    public async Task CorruptCurrentFormatTagThatLooksPreRevisionRebuilds()
+    {
+        var options = Options();
+        await using (var store = await KvasarStore.Open(options)) {
+            await store.Set("before", "value");
+            await store.Flush();
+        }
+        CorruptCurrentFormatVersionToPrevious();
+
+        await using var reopened = await KvasarStore.Open(options);
+        (await reopened.Get("before")).Should().BeNull();
+        reopened.Stats.Entries.Should().Be(0);
+        (await ReadFormatVersion()).Should().Be(KvasarConstants.DataFormatVersion);
     }
 
     // Private methods
@@ -186,14 +203,14 @@ public sealed class FormatRevisionTests : IDisposable
         FlushDelay = TimeSpan.Zero,
     };
 
-    private async Task CreateLegacyStore()
+    private async Task CreateLegacyStore(string version = "")
     {
+        var formatVer = KvasarStore.ParsePreviousFormatVersion(version);
         var pageKey = new byte[KvasarConstants.PageKeySize];
         var indexKey = new byte[KvasarConstants.IndexMacKeySize];
         KeyDerivations.HkdfSha256.Derive(_key, [], KvasarConstants.PageKeyInfo, pageKey);
         KeyDerivations.HkdfSha256.Derive(_key, [], KvasarConstants.IndexMacKeyInfo, indexKey);
-        using var cipherFactory =
-            new AesGcmPageCipherFactory(pageKey, KvasarConstants.PreviousDataFormatVersion);
+        using var cipherFactory = new AesGcmPageCipherFactory(pageKey, formatVer);
 
         long dataCommitLength;
         IndexEntry[] entries;
@@ -202,7 +219,7 @@ public sealed class FormatRevisionTests : IDisposable
             1,
             PageSize,
             cipherFactory,
-            KvasarConstants.PreviousDataFormatVersion,
+            formatVer,
             new PageCache(PageSize))) {
             var page = new byte[PageSize];
             var records = new[] {
@@ -238,28 +255,29 @@ public sealed class FormatRevisionTests : IDisposable
             2,
             PageSize,
             cipherFactory,
-            KvasarConstants.PreviousDataFormatVersion,
+            formatVer,
             new PageCache(PageSize)))
             await free.Flush();
 
         long indexCommitLength;
         await using (var index = await IndexLog.Open(
             await FileStorageBackend.Instance.Open(IndexPaths[0]),
-            KvasarConstants.PreviousDataFormatVersion,
+            formatVer,
             indexKey)) {
             indexCommitLength = await index.WriteCheckpoint(entries, PageSize);
             await index.WriteCommitMac(1);
         }
         await using (var index = await IndexLog.Open(
             await FileStorageBackend.Instance.Open(IndexPaths[1]),
-            KvasarConstants.PreviousDataFormatVersion,
+            formatVer,
             indexKey))
             await index.WriteCheckpoint(Array.Empty<IndexEntry>(), 0);
 
         await using var superblockFile = await FileStorageBackend.Instance.Open(SuperblockPath);
         using var superblock = new Superblock(
             _key,
-            KvasarConstants.PreviousDataFormatVersion);
+            formatVer,
+            previousFormatVer: formatVer);
         await superblock.Initialize(superblockFile);
         await superblock.Write(superblockFile, new SuperblockState(
             1,
@@ -298,6 +316,15 @@ public sealed class FormatRevisionTests : IDisposable
         var header = new byte[8];
         await file.ReadExact(0, header);
         return BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(4));
+    }
+
+    private void CorruptCurrentFormatVersionToPrevious()
+    {
+        using var stream = new FileStream(SuperblockPath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read);
+        stream.Position = 4;
+        stream.ReadByte().Should().Be((int)KvasarConstants.DataFormatVersion);
+        stream.Position--;
+        stream.WriteByte((byte)KvasarConstants.PreviousDataFormatVersion);
     }
 
     private void CorruptPage(int slot, long pageId)

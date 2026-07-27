@@ -122,8 +122,13 @@ public sealed class Superblock : IDisposable
 
     private readonly byte[] _key;
     private readonly uint _formatVer;
+    private readonly uint _previousFormatVer;
 
-    public Superblock(ReadOnlySpan<byte> masterKey, uint formatVer, IKeyDerivation? keyDerivation = null)
+    public Superblock(
+        ReadOnlySpan<byte> masterKey,
+        uint formatVer,
+        IKeyDerivation? keyDerivation = null,
+        uint previousFormatVer = KvasarConstants.PreviousDataFormatVersion)
     {
         _key = new byte[KvasarConstants.SuperblockKeySize];
         try {
@@ -135,6 +140,7 @@ public sealed class Superblock : IDisposable
             throw;
         }
         _formatVer = formatVer;
+        _previousFormatVer = previousFormatVer;
     }
 
     public void Dispose()
@@ -154,27 +160,9 @@ public sealed class Superblock : IDisposable
         return file.Write(0, buffer);
     }
 
-    public async ValueTask<SuperblockReadResult> Read(
+    public ValueTask<SuperblockReadResult> Read(
         IStorageFile file, CancellationToken cancellationToken = default)
-    {
-        var status = await ReadHeader(file, cancellationToken).ConfigureAwait(false);
-        if (status != SuperblockStatus.Ok)
-            return new SuperblockReadResult(status, []);
-
-        var buffer = new byte[SlotSize];
-        var state0 = await ReadSlot(file, 0, buffer, cancellationToken).ConfigureAwait(false);
-        var state1 = await ReadSlot(file, 1, buffer, cancellationToken).ConfigureAwait(false);
-        if (state0 is not { } s0)
-            return state1 is { } only1
-                ? new SuperblockReadResult(SuperblockStatus.Ok, [only1])
-                : new SuperblockReadResult(SuperblockStatus.NoValidSlot, []);
-        if (state1 is not { } s1)
-            return new SuperblockReadResult(SuperblockStatus.Ok, [s0]);
-
-        return new SuperblockReadResult(
-            SuperblockStatus.Ok,
-            s0.Generation > s1.Generation ? [s0, s1] : [s1, s0]);
-    }
+        => ReadCore(file, null, cancellationToken);
 
     public ValueTask Write(IStorageFile file, SuperblockState state)
     {
@@ -196,12 +184,47 @@ public sealed class Superblock : IDisposable
         return file.Write(SlotOffset(slot), buffer);
     }
 
+    // Protected/internal methods
+
+    internal ValueTask<SuperblockReadResult> ReadWithPreviousFormatCorroboration(
+        IStorageFile file,
+        Func<uint, CancellationToken, ValueTask<bool>> corroboratePreviousFormat,
+        CancellationToken cancellationToken = default)
+        => ReadCore(file, corroboratePreviousFormat, cancellationToken);
+
     // Private methods
 
     private static long SlotOffset(int slot)
         => HeaderSize + ((long)slot * SlotSize);
 
-    private async ValueTask<SuperblockStatus> ReadHeader(IStorageFile file, CancellationToken cancellationToken)
+    private async ValueTask<SuperblockReadResult> ReadCore(
+        IStorageFile file,
+        Func<uint, CancellationToken, ValueTask<bool>>? corroboratePreviousFormat,
+        CancellationToken cancellationToken)
+    {
+        var status = await ReadHeader(file, corroboratePreviousFormat, cancellationToken).ConfigureAwait(false);
+        if (status != SuperblockStatus.Ok)
+            return new SuperblockReadResult(status, []);
+
+        var buffer = new byte[SlotSize];
+        var state0 = await ReadSlot(file, 0, buffer, cancellationToken).ConfigureAwait(false);
+        var state1 = await ReadSlot(file, 1, buffer, cancellationToken).ConfigureAwait(false);
+        if (state0 is not { } s0)
+            return state1 is { } only1
+                ? new SuperblockReadResult(SuperblockStatus.Ok, [only1])
+                : new SuperblockReadResult(SuperblockStatus.NoValidSlot, []);
+        if (state1 is not { } s1)
+            return new SuperblockReadResult(SuperblockStatus.Ok, [s0]);
+
+        return new SuperblockReadResult(
+            SuperblockStatus.Ok,
+            s0.Generation > s1.Generation ? [s0, s1] : [s1, s0]);
+    }
+
+    private async ValueTask<SuperblockStatus> ReadHeader(
+        IStorageFile file,
+        Func<uint, CancellationToken, ValueTask<bool>>? corroboratePreviousFormat,
+        CancellationToken cancellationToken)
     {
         if (file.Length == 0)
             return SuperblockStatus.Missing;
@@ -218,8 +241,10 @@ public sealed class Superblock : IDisposable
         var storedFormatVer = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(FormatVerOffset, 4));
         if (storedFormatVer != _formatVer) {
             // Format 1 is rebuild-only, but a wrong key must not let that rebuild wipe the original store.
-            if (storedFormatVer == KvasarConstants.PreviousDataFormatVersion
-                && !IsKcvValid(header, storedFormatVer))
+            if (storedFormatVer == _previousFormatVer
+                && !IsKcvValid(header, storedFormatVer)
+                && corroboratePreviousFormat is not null
+                && await corroboratePreviousFormat(storedFormatVer, cancellationToken).ConfigureAwait(false))
                 return SuperblockStatus.WrongKey;
 
             return SuperblockStatus.FormatMismatch;
@@ -301,7 +326,8 @@ public sealed class Superblock : IDisposable
         var dataAuthenticationFloor =
             BinaryPrimitives.ReadInt64LittleEndian(plain.Slice(DataAuthenticationFloorOffset, 8));
         var nextKeyId = BinaryPrimitives.ReadUInt64LittleEndian(plain.Slice(NextKeyIdOffset, 8));
-        if (_formatVer == KvasarConstants.PreviousDataFormatVersion) {
+        // This branch is executable documentation of the format-1 slot layout used by test fixtures.
+        if (_formatVer == _previousFormatVer) {
             dataAuthenticationFloor = KvasarConstants.SegmentHeaderSize;
             nextKeyId = 1;
         }
@@ -339,7 +365,8 @@ public sealed class Superblock : IDisposable
         BinaryPrimitives.WriteInt64LittleEndian(plain.Slice(IndexCommitLengthOffset, 8), state.IndexCommitLength);
         BinaryPrimitives.WriteInt64LittleEndian(plain.Slice(LiveBytesOffset, 8), state.LiveBytes);
         BinaryPrimitives.WriteInt64LittleEndian(plain.Slice(DeadBytesOffset, 8), state.DeadBytes);
-        if (_formatVer != KvasarConstants.PreviousDataFormatVersion) {
+        // This branch is executable documentation of the format-1 slot layout used by test fixtures.
+        if (_formatVer != _previousFormatVer) {
             BinaryPrimitives.WriteInt64LittleEndian(
                 plain.Slice(DataAuthenticationFloorOffset, 8), state.DataAuthenticationFloor);
             BinaryPrimitives.WriteUInt64LittleEndian(plain.Slice(NextKeyIdOffset, 8), state.NextKeyId);
