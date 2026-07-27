@@ -185,7 +185,10 @@ public sealed class DataLog : IAsyncDisposable
     public ValueTask<RecordRead> TryReadRecord(Locator loc, CancellationToken cancellationToken = default)
     {
         var st = TryGetSlot(loc.FileId);
-        return st == null ? default : TryReadAt(st, loc.Offset, cancellationToken);
+        if (st == null)
+            return default;
+        var slotCacheId = st.File.FileId;
+        return TryReadWithLease(st, loc.Offset, slotCacheId, cancellationToken);
     }
 
     public bool TryReadRecordCached(Locator loc, out RecordView view)
@@ -448,6 +451,31 @@ public sealed class DataLog : IAsyncDisposable
 
     internal uint SlotCacheId(int slot) => _slots[slot].File.FileId;
 
+    internal ReadLease AcquireReadLease()
+    {
+        if (!_slots[0].File.TryAcquireRead(out var first))
+            throw new InvalidOperationException("The first data slot is being recycled.");
+        if (_slots[1].File.TryAcquireRead(out var second))
+            return new ReadLease(first, second);
+
+        first.Dispose();
+        throw new InvalidOperationException("The second data slot is being recycled.");
+    }
+
+    internal ValueTask<RecordRead> TryReadRecordLeased(
+        Locator loc, CancellationToken cancellationToken = default)
+    {
+        var st = TryGetSlot(loc.FileId);
+        return st == null ? default : TryReadAt(st, loc.Offset, cancellationToken);
+    }
+
+    internal ValueTask<RecordRead> TryReadRecord(
+        Locator loc, uint slotCacheId, CancellationToken cancellationToken)
+    {
+        var st = TryGetSlot(loc.FileId);
+        return st == null ? default : TryReadWithLease(st, loc.Offset, slotCacheId, cancellationToken);
+    }
+
     // Private methods
 
     private async ValueTask<(Locator Locator, int RecordLength)> AppendTo(
@@ -551,6 +579,16 @@ public sealed class DataLog : IAsyncDisposable
             p += next.TotalLength;
         }
         return p <= len ? first : default;
+    }
+
+    private async ValueTask<RecordRead> TryReadWithLease(
+        SlotState st, long offset, uint slotCacheId, CancellationToken cancellationToken)
+    {
+        if (!st.File.TryAcquireRead(slotCacheId, out var lease))
+            return RecordRead.Retry;
+
+        using (lease)
+            return await TryReadAt(st, offset, cancellationToken).ConfigureAwait(false);
     }
 
     private ValueTask<RecordRead> TryReadAt(
@@ -714,5 +752,25 @@ public sealed class DataLog : IAsyncDisposable
         foreach (var slot in slots)
             if (slot is not null)
                 await slot.File.DisposeAsync().ConfigureAwait(false);
+    }
+
+    // Nested types
+
+    internal readonly struct ReadLease : IDisposable
+    {
+        private readonly PagedFile.ReadLease _first;
+        private readonly PagedFile.ReadLease _second;
+
+        public ReadLease(PagedFile.ReadLease first, PagedFile.ReadLease second)
+        {
+            _first = first;
+            _second = second;
+        }
+
+        public void Dispose()
+        {
+            _second.Dispose();
+            _first.Dispose();
+        }
     }
 }

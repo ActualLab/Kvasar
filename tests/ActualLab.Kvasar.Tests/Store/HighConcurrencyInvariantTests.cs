@@ -50,13 +50,7 @@ public sealed class HighConcurrencyInvariantTests : IDisposable
         catch (UnauthorizedAccessException) { }
     }
 
-    // KNOWN DEFECTS, and the reason this is skipped rather than relaxed: it fails on two invariants that
-    // 450 other tests do not cover. (1) Scan still omits keys that were live before it started and were
-    // never deleted -- including manifest keys, which are seeded before any concurrency and never
-    // deleted, and in runs where no compaction ran at all, so this is neither the relocation path R4/C1
-    // repaired nor a delete-boundary artifact. (2) An owner occasionally reads absent immediately after
-    // its own acknowledged Set/SetMany. Un-skipping this is the acceptance criterion for fixing them.
-    [Fact(Skip = "Fails on two real, still-open defects — see the note above. Do not relax the invariants.")]
+    [Fact]
     public async Task OwnedKeyInvariantsHoldUnderConcurrentReadsWritesAndCompaction()
     {
         var deepMode = Environment.GetEnvironmentVariable("KVASAR_CONCURRENCY_DEEP");

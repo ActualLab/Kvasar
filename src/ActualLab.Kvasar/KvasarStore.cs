@@ -16,6 +16,7 @@ public sealed class KvasarStore : IAsyncDisposable
 {
     private const int CompactionBatchBytes = 64 * 1024;
     private const int CompactionBatchRecords = 64;
+    private const int ReadRetryLimit = 2;
     // Below this, a GetMany batch cannot consume the ~1 MiB run a prefetch pulls, so it costs more
     // than it saves. See the note in GetMany.
     private const int MinPrefetchBatchSize = 8;
@@ -317,6 +318,7 @@ public sealed class KvasarStore : IAsyncDisposable
         // readahead, so a cold batch walks the log forward instead of paying one random I/O per key.
         // The resolved hash and first locator are carried into the read pass, which still performs
         // full-key verification and walks any further collision candidates.
+        var slotCacheIds = new[] { _data.SlotCacheId(0), _data.SlotCacheId(1) };
         var order = new (ulong Packed, int Index, ulong Hash)[keys.Count];
         for (var i = 0; i < keys.Count; i++) {
             var h = _hasher.Hash(keys[i].Span, _hashKey);
@@ -340,8 +342,10 @@ public sealed class KvasarStore : IAsyncDisposable
         var prefetchedFile = uint.MaxValue;
         var nextPrefetchPage = 0L;
         foreach (var (packed, index, hash) in order) {
-            if (packed != ulong.MaxValue && prefetchPages > 0) {
-                var loc = Locator.FromPacked(packed);
+            if (packed == ulong.MaxValue)
+                continue;
+            var loc = Locator.FromPacked(packed);
+            if (prefetchPages > 0) {
                 var pageId = loc.Offset / _pageSize;
                 if (loc.FileId != prefetchedFile || pageId >= nextPrefetchPage) {
                     await _data.Prefetch(loc.FileId, pageId, prefetchPages, cancellationToken)
@@ -350,9 +354,9 @@ public sealed class KvasarStore : IAsyncDisposable
                     nextPrefetchPage = pageId + prefetchPages;
                 }
             }
-            if (packed != ulong.MaxValue)
-                results[index] = await GetManyValue(
-                    keys[index], hash, Locator.FromPacked(packed), cancellationToken).ConfigureAwait(false);
+            results[index] = await GetManyValue(
+                keys[index], hash, loc, slotCacheIds[(int)loc.FileId - 1], cancellationToken)
+                .ConfigureAwait(false);
         }
         return results;
     }
@@ -387,19 +391,17 @@ public sealed class KvasarStore : IAsyncDisposable
             var loc = e.Locator;
             var slot = (int)loc.FileId - 1;
             var slotCacheId = slotCacheIds[slot];
-            var mustResolve = _data.SlotCacheId(slot) != slotCacheId;
-            RecordRead read;
-            while (true) {
-                read = default;
-                if (mustResolve) {
+            RecordRead read = default;
+            for (var attempt = 0; attempt <= ReadRetryLimit; attempt++) {
+                if (attempt > 0 || _data.SlotCacheId(slot) != slotCacheId) {
                     cancellationToken.ThrowIfCancellationRequested();
-                    var slot0CacheId = _data.SlotCacheId(0);
-                    var slot1CacheId = _data.SlotCacheId(1);
+                    var firstSlotCacheId = _data.SlotCacheId(0);
+                    var secondSlotCacheId = _data.SlotCacheId(1);
                     if (!TryResolveIndexEntry(e, out loc))
                         break;
 
                     slot = (int)loc.FileId - 1;
-                    slotCacheId = slot == 0 ? slot0CacheId : slot1CacheId;
+                    slotCacheId = slot == 0 ? firstSlotCacheId : secondSlotCacheId;
                 }
 
                 var pageId = loc.Offset / _pageSize;
@@ -410,19 +412,22 @@ public sealed class KvasarStore : IAsyncDisposable
                     nextPrefetchPage = pageId + prefetchPages;
                 }
                 try {
-                    read = await _data.TryReadRecord(loc, cancellationToken).ConfigureAwait(false);
+                    read = await _data.TryReadRecord(loc, slotCacheId, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException) {
-                    if (_data.SlotCacheId(slot) == slotCacheId)
+                    read = default;
+                }
+                if (read.IsFound && !read.View.IsTombstone)
+                    break;
+                var mustRetry = read.MustRetry || _data.SlotCacheId(slot) != slotCacheId;
+                if (!mustRetry)
+                    break;
+                if (attempt == ReadRetryLimit) {
+                    if (!TryResolveIndexEntry(e, out _))
                         break;
 
-                    mustResolve = true;
-                    continue;
+                    throw new InvalidOperationException("A read raced more than two consecutive data-slot recycles.");
                 }
-                if (_data.SlotCacheId(slot) == slotCacheId)
-                    break;
-
-                mustResolve = true;
             }
             if (!read.IsFound || read.View.IsTombstone)
                 continue;
@@ -1452,51 +1457,84 @@ public sealed class KvasarStore : IAsyncDisposable
     private async ValueTask<KvasarValue?> GetSlow(
         KvasarKey key, ulong keyHash, CancellationToken cancellationToken)
     {
-        var cursor = _index.Probe(keyHash);
-        while (cursor.MoveNext(out var loc, out _)) {
-            if (cursor.CurrentHash != keyHash)
-                continue;
-            var value = await TryReadValue(loc, key, cancellationToken).ConfigureAwait(false);
-            if (value is not null)
-                return value;
+        for (var attempt = 0; attempt <= ReadRetryLimit; attempt++) {
+            var mustRetry = false;
+            var firstSlotCacheId = _data.SlotCacheId(0);
+            var secondSlotCacheId = _data.SlotCacheId(1);
+            var cursor = _index.Probe(keyHash);
+            while (cursor.MoveNext(out var loc, out _)) {
+                if (cursor.CurrentHash != keyHash)
+                    continue;
+                var slotCacheId = loc.FileId == 1 ? firstSlotCacheId : secondSlotCacheId;
+                var read = await TryReadValue(loc, key, slotCacheId, cancellationToken).ConfigureAwait(false);
+                if (read.MustRetry) {
+                    mustRetry = true;
+                    break;
+                }
+                if (read.Value is { } value)
+                    return value;
+            }
+            if (!mustRetry)
+                return null;
         }
-        return null;
+        throw new InvalidOperationException("A read raced more than two consecutive data-slot recycles.");
     }
 
     private async ValueTask<KvasarValue?> GetManyValue(
-        KvasarKey key, ulong keyHash, Locator firstLoc, CancellationToken cancellationToken)
+        KvasarKey key, ulong keyHash, Locator firstLoc, uint firstSlotCacheId,
+        CancellationToken cancellationToken)
     {
-        var value = await TryReadValue(firstLoc, key, cancellationToken).ConfigureAwait(false);
-        if (value is not null)
-            return value;
-
-        var cursor = _index.Probe(keyHash);
-        while (cursor.MoveNext(out var loc, out _)) {
-            if (cursor.CurrentHash != keyHash || loc == firstLoc)
-                continue;
-            value = await TryReadValue(loc, key, cancellationToken).ConfigureAwait(false);
-            if (value is not null)
-                return value;
+        for (var attempt = 0; attempt <= ReadRetryLimit; attempt++) {
+            var mustRetry = false;
+            if (attempt == 0) {
+                var firstRead = await TryReadValue(
+                    firstLoc, key, firstSlotCacheId, cancellationToken).ConfigureAwait(false);
+                if (firstRead.MustRetry)
+                    mustRetry = true;
+                else if (firstRead.Value is { } firstValue)
+                    return firstValue;
+            }
+            if (!mustRetry) {
+                var firstProbeCacheId = _data.SlotCacheId(0);
+                var secondProbeCacheId = _data.SlotCacheId(1);
+                var cursor = _index.Probe(keyHash);
+                while (cursor.MoveNext(out var loc, out _)) {
+                    if (cursor.CurrentHash != keyHash || (attempt == 0 && loc == firstLoc))
+                        continue;
+                    var slotCacheId = loc.FileId == 1 ? firstProbeCacheId : secondProbeCacheId;
+                    var read = await TryReadValue(loc, key, slotCacheId, cancellationToken)
+                        .ConfigureAwait(false);
+                    if (read.MustRetry) {
+                        mustRetry = true;
+                        break;
+                    }
+                    if (read.Value is { } value)
+                        return value;
+                }
+            }
+            if (!mustRetry)
+                return null;
         }
-        return null;
+        throw new InvalidOperationException("A read raced more than two consecutive data-slot recycles.");
     }
 
-    private async ValueTask<KvasarValue?> TryReadValue(
-        Locator loc, KvasarKey key, CancellationToken cancellationToken)
+    private async ValueTask<ValueRead> TryReadValue(
+        Locator loc, KvasarKey key, uint slotCacheId, CancellationToken cancellationToken)
     {
         try {
-            var read = await _data.TryReadRecord(loc, cancellationToken).ConfigureAwait(false);
+            var read = await _data.TryReadRecord(loc, slotCacheId, cancellationToken).ConfigureAwait(false);
+            if (read.MustRetry)
+                return ValueRead.Retry;
             if (!read.IsFound || read.View.IsTombstone)
-                return null;
+                return default;
             if (!read.View.Key.Span.SequenceEqual(key.Span))
-                return null; // hash collision ⇒ different key
-            return new KvasarValue(read.View.Value, read.View.ValueKind);
+                return default; // hash collision ⇒ different key
+            return new ValueRead(new KvasarValue(read.View.Value, read.View.ValueKind), false);
         }
         catch (Exception e) when (e is not OperationCanceledException) {
             // A page that fails its tag is a miss, never an error (§5.3): it can only be one that a torn
-            // tail burned or that never landed, and the caller's answer for both is "not cached". The
-            // same goes for a slot recycled under a locator a reader was already holding.
-            return null;
+            // tail burned or that never landed, and the caller's answer for both is "not cached".
+            return default;
         }
     }
 
@@ -1593,7 +1631,8 @@ public sealed class KvasarStore : IAsyncDisposable
         Add(version ?? "");
         return hash | 0x8000_0000; // keep it distinct from small numeric versions
 
-        void Add(string s) {
+        void Add(string s)
+        {
             foreach (var b in Encoding.UTF8.GetBytes(s)) {
                 hash ^= b;
                 hash *= 16777619;
@@ -1606,6 +1645,10 @@ public sealed class KvasarStore : IAsyncDisposable
     private readonly record struct AppendResult(
         Locator Locator, Locator CompactionLocator, int RecordLength, bool IsTombstone);
     private readonly record struct IndexedRecord(bool IsFound, Locator Locator, int Length, ulong KeyId);
+    private readonly record struct ValueRead(KvasarValue? Value, bool MustRetry)
+    {
+        public static readonly ValueRead Retry = new(null, true);
+    }
 
     private readonly record struct CompactionCopy(
         IndexEntry Entry, RecordView View, bool IsCorrupt, bool IsCopy);

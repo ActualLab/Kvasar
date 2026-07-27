@@ -320,6 +320,32 @@ public class PagedFileTests
     }
 
     [Fact]
+    public async Task RecycleWaitsForReadersOfPreviousIncarnation()
+    {
+        var file = new PagedFileTestFile();
+        var page = MakePages(1)[0];
+        await using var pf = await PagedFile.Create(
+            file, 8, PageSize, new FakePageCipherFactory(16), FormatVer, new PageCache(1 << 20));
+        await pf.AppendPage(page);
+        await pf.Flush();
+        var oldFileId = pf.FileId;
+        pf.TryAcquireRead(oldFileId, out var lease).Should().BeTrue();
+
+        var recycleTask = pf.Recycle(9).AsTask();
+        try {
+            recycleTask.IsCompleted.Should().BeFalse();
+            (await pf.GetPage(0)).ToArray().Should().Equal(page);
+        }
+        finally {
+            lease.Dispose();
+        }
+        await recycleTask;
+        pf.FileId.Should().Be(9u);
+        pf.PageCount.Should().Be(0);
+        pf.TryAcquireRead(oldFileId, out _).Should().BeFalse();
+    }
+
+    [Fact]
     public async Task RecycleStampsFreshSaltAndRestartsPageIds()
     {
         var file = new PagedFileTestFile();

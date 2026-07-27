@@ -30,8 +30,6 @@ public sealed class PagedFile : IAsyncDisposable
     // Recycle swaps it atomically: readers are lock-free, so reading the two separately let a reader
     // decrypt with the old cipher and then publish under the *new* id, poisoning the cache with a page
     // from the slot's previous life. AES-GCM cannot catch that — both pages are genuine.
-    private sealed record Incarnation(uint FileId, IPageCipher Cipher);
-
     private volatile Incarnation _incarnation;
     private long _pendingFirstPageId;
     private int _pendingCount;
@@ -163,8 +161,9 @@ public sealed class PagedFile : IAsyncDisposable
 
     public bool TryGetCachedPage(long pageId, out ReadOnlyMemory<byte> page)
     {
+        var incarnation = _incarnation;
         if ((ulong)pageId < (ulong)PageCount) {
-            if (_cache.TryGet(FileId, pageId, out var cached)) {
+            if (_cache.TryGet(incarnation.FileId, pageId, out var cached)) {
                 page = cached;
                 return true;
             }
@@ -177,17 +176,32 @@ public sealed class PagedFile : IAsyncDisposable
         return false;
     }
 
+    internal bool TryAcquireRead(out ReadLease lease)
+        => TryAcquireRead(FileId, out lease);
+
+    internal bool TryAcquireRead(uint fileId, out ReadLease lease)
+    {
+        var incarnation = _incarnation;
+        if (incarnation.FileId == fileId && incarnation.TryAcquireRead()) {
+            lease = new ReadLease(incarnation);
+            return true;
+        }
+        lease = default;
+        return false;
+    }
+
     public ValueTask<ReadOnlyMemory<byte>> GetPage(long pageId, CancellationToken cancellationToken = default)
     {
         // Deliberately not an async method: a cache hit returns an already-completed ValueTask, so the
         // hot read path costs no state machine and no allocation. Only a miss builds one.
+        var incarnation = _incarnation;
         if ((ulong)pageId >= (ulong)PageCount)
             throw new ArgumentOutOfRangeException(nameof(pageId));
-        if (_cache.TryGet(FileId, pageId, out var cached))
+        if (_cache.TryGet(incarnation.FileId, pageId, out var cached))
             return new ValueTask<ReadOnlyMemory<byte>>(cached);
         if (_pendingPlain.TryGetValue(pageId, out var staged))
             return new ValueTask<ReadOnlyMemory<byte>>(staged);
-        return ReadAndCache(pageId, cancellationToken);
+        return ReadAndCache(incarnation, pageId, cancellationToken);
     }
 
     public async ValueTask ReadPage(long pageId, Memory<byte> payload, CancellationToken cancellationToken = default)
@@ -318,12 +332,14 @@ public sealed class PagedFile : IAsyncDisposable
     {
         // Resets the file for a new life instead of unlinking it (§3.2/§4). The fresh fileSalt is what
         // makes restarting page ids at 0 safe: it puts this life's nonces in a different space entirely.
-        // The new incarnation is published only after its page bounds are reset, so a lock-free reader
-        // never combines it with the previous life's extent.
+        // Readers that acquired this incarnation before its index locators moved keep the old file intact
+        // until they finish. Later readers re-resolve against the index instead of touching a recycled slot.
+        var oldIncarnation = _incarnation;
+        await oldIncarnation.DrainReads().ConfigureAwait(false);
         _pendingCount = 0;
         _pendingPlain.Clear();
-        _cache.DropSegment(FileId);
-        if (fileId != FileId)
+        _cache.DropSegment(oldIncarnation.FileId);
+        if (fileId != oldIncarnation.FileId)
             _cache.DropSegment(fileId);
 
         var header = new SegmentHeader(_formatVer, PageSize, fileId);
@@ -373,14 +389,14 @@ public sealed class PagedFile : IAsyncDisposable
         return new PagedFile(file, cipherFactory, cache, header, pageCount, commitLength, cacheId);
     }
 
-    private async ValueTask<ReadOnlyMemory<byte>> ReadAndCache(long pageId, CancellationToken cancellationToken)
+    private async ValueTask<ReadOnlyMemory<byte>> ReadAndCache(
+        Incarnation incarnation, long pageId, CancellationToken cancellationToken)
     {
-        // The decrypt and the cache insert must name the same incarnation, so it is captured once here
-        // and threaded through rather than re-read after the await.
-        var inc = _incarnation;
-        var page = await ReadAndDecrypt(inc, pageId, cancellationToken).ConfigureAwait(false);
+        // The decrypt and the cache insert must name the same incarnation, so the caller captures it once
+        // and threads it through rather than re-reading it after the await.
+        var page = await ReadAndDecrypt(incarnation, pageId, cancellationToken).ConfigureAwait(false);
         // Redundant concurrent decrypts of the same page are harmless (identical bytes); Add keeps the first.
-        _cache.Add(inc.FileId, pageId, page);
+        _cache.Add(incarnation.FileId, pageId, page);
         return page;
     }
 
@@ -410,5 +426,53 @@ public sealed class PagedFile : IAsyncDisposable
         header.Write(headerBytes);
         await file.Truncate(0).ConfigureAwait(false);
         await file.Write(0, headerBytes).ConfigureAwait(false);
+    }
+
+    // Nested types
+
+    internal readonly struct ReadLease : IDisposable
+    {
+        private readonly Incarnation? _incarnation;
+
+        internal ReadLease(Incarnation incarnation)
+            => _incarnation = incarnation;
+
+        public void Dispose()
+            => _incarnation?.ReleaseRead();
+    }
+
+    internal sealed record Incarnation(uint FileId, IPageCipher Cipher)
+    {
+        private readonly TaskCompletionSource _whenDrained =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _readCount;
+        private int _isDraining;
+
+        public bool TryAcquireRead()
+        {
+            if (Volatile.Read(ref _isDraining) != 0)
+                return false;
+
+            Interlocked.Increment(ref _readCount);
+            if (Volatile.Read(ref _isDraining) == 0)
+                return true;
+
+            ReleaseRead();
+            return false;
+        }
+
+        public Task DrainReads()
+        {
+            Interlocked.Increment(ref _readCount);
+            Volatile.Write(ref _isDraining, 1);
+            ReleaseRead();
+            return _whenDrained.Task;
+        }
+
+        public void ReleaseRead()
+        {
+            if (Interlocked.Decrement(ref _readCount) == 0 && Volatile.Read(ref _isDraining) != 0)
+                _whenDrained.TrySetResult();
+        }
     }
 }
