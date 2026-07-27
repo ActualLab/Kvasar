@@ -117,7 +117,7 @@ public sealed class KvasarStore : IAsyncDisposable
         if (string.IsNullOrEmpty(options.Version)
             && uint.TryParse(options.FormatVersion, out var requestedFormat)
             && requestedFormat == KvasarConstants.PreviousDataFormatVersion)
-            throw new NotSupportedException("Data format version 1 is read-only and can only be migrated to version 2.");
+            throw new NotSupportedException("Data format version 1 cannot be selected for new writes.");
 
         // The lock is taken here and held across wipe-and-recreate. Releasing it around the wipe would let
         // another process open a fresh store that we then delete out from under it — on Unix the unlink
@@ -294,12 +294,15 @@ public sealed class KvasarStore : IAsyncDisposable
         ThrowIfDisposed();
         // Not an async method: when the record's page is already decrypted in the cache — the common
         // case — this returns an already-completed ValueTask with no state machine and no allocation.
+        var firstSlotCacheId = _data.SlotCacheId(0);
+        var secondSlotCacheId = _data.SlotCacheId(1);
         var h = _hasher.Hash(key.Span, _hashKey);
         var cursor = _index.Probe(h);
         while (cursor.MoveNext(out var loc, out _)) {
             if (cursor.CurrentHash != h)
                 continue;
-            if (!_data.TryReadRecordCached(loc, out var view))
+            var slotCacheId = loc.FileId == 1 ? firstSlotCacheId : secondSlotCacheId;
+            if (!_data.TryReadRecordCached(loc, slotCacheId, out var view))
                 return GetSlow(key, h, cancellationToken);
             if (view.IsTombstone)
                 continue;
@@ -637,18 +640,6 @@ public sealed class KvasarStore : IAsyncDisposable
             throw new KvasarKeyException(
                 $"The store '{_options.BasePath}' was created under a different encryption key.");
 
-        LegacyRecord[]? legacyRecords = null;
-        if (read.Status == SuperblockStatus.FormatMismatch)
-            legacyRecords = await LegacyStoreImporter.TryRead(
-                    _options,
-                    _storage,
-                    _kvsPath,
-                    _kdatPaths,
-                    _kidxPaths,
-                    _indexMacKey,
-                    cancellationToken)
-                .ConfigureAwait(false);
-
         var isAdopted = false;
         if (read.Status == SuperblockStatus.Ok) {
             // Newest generation first; the older candidate is the fallback for step 3 of §5.2.
@@ -666,8 +657,6 @@ public sealed class KvasarStore : IAsyncDisposable
             await CloseFiles().ConfigureAwait(false);
             WipeFiles();
             await CreateFresh(cancellationToken).ConfigureAwait(false);
-            if (legacyRecords is not null)
-                await ImportLegacy(legacyRecords).ConfigureAwait(false);
         }
         if (_flushDelay > TimeSpan.Zero)
             _flushLoopTask = Task.Run(RunFlushLoop, CancellationToken.None);
@@ -825,19 +814,6 @@ public sealed class KvasarStore : IAsyncDisposable
         _indexSlot = 1; // so the checkpoint below rotates into slot 0
         _mustRotateIndex = true;
         await Commit(true).ConfigureAwait(false);
-    }
-
-    private async ValueTask ImportLegacy(LegacyRecord[] records)
-    {
-        foreach (var record in records) {
-            var key = new KvasarKey(record.Key);
-            var value = new KvasarValue(record.Value, record.ValueKind);
-            var appended = await AppendOne(key, value).ConfigureAwait(false);
-            await Publish(key, _hasher.Hash(key.Span, _hashKey), appended).ConfigureAwait(false);
-            _uncommittedBytes += appended.RecordLength;
-        }
-        if (_uncommittedBytes != 0)
-            await Commit(true).ConfigureAwait(false);
     }
 
     private async ValueTask<IStorageFile[]> OpenSlotFiles(string[] paths, CancellationToken cancellationToken)
@@ -1000,7 +976,9 @@ public sealed class KvasarStore : IAsyncDisposable
         var generation = _generation + 1;
         await indexLog.WriteCommitMac(generation).ConfigureAwait(false);
         var dataAuthenticationFloor = _data.ActiveSlot == _committedDataSlot
-            ? _committedDataLength
+            ? Math.Max(
+                _committedDataLength,
+                _data.BurnedBytes > 0 ? _data.ActiveResumeLength : _committedDataLength)
             : KvasarConstants.SegmentHeaderSize;
         await _superblock.Write(_superblockFile!, new SuperblockState(
             generation, (byte)_data.ActiveSlot, dataCommitLength,
@@ -1412,7 +1390,8 @@ public sealed class KvasarStore : IAsyncDisposable
                 continue;
             try {
                 RecordView view;
-                if (!_data.TryReadRecordCached(loc, out view)) {
+                var slotCacheId = _data.SlotCacheId((int)loc.FileId - 1);
+                if (!_data.TryReadRecordCached(loc, slotCacheId, out view)) {
                     var read = await _data.TryReadRecord(loc, CancellationToken.None).ConfigureAwait(false);
                     if (!read.IsFound) {
                         unreadable ??= new IndexedRecord(true, loc, length, cursor.CurrentKeyId);
@@ -1676,8 +1655,7 @@ public sealed class KvasarStore : IAsyncDisposable
         Add(version ?? "");
         return hash | 0x8000_0000; // keep it distinct from small numeric versions
 
-        void Add(string s)
-        {
+        void Add(string s) {
             foreach (var b in Encoding.UTF8.GetBytes(s)) {
                 hash ^= b;
                 hash *= 16777619;

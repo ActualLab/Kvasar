@@ -24,8 +24,9 @@
 > A round-3 pass over the fixed code then found 13 more issues (see [`REVIEW-R3.md`](REVIEW-R3.md)),
 > including a **P0 introduced by the R5 fix itself** — adoption authenticated a candidate's whole
 > committed extent, which §5.2.1 guarantees contains an unauthenticatable burned page, so any store whose
-> tail had ever been torn was wiped on the fallback path. Fixed. **Only R7 and X3 remain open across
-> both rounds.** C3, previously listed here, is now fully closed by data format 2: the earlier fix
+> tail had ever been torn was wiped on the fallback path. Fixed. **Across review rounds 2–5, only the
+> deliberately deferred R7 and X3 remain open; every actionable round-4 and round-5 finding is closed.**
+> C3, previously listed here, is now fully closed by data format 2: the earlier fix
 > restored the different-slot check, and each superblock slot now persists its own authentication floor
 > so predecessorless adoption checks a bounded window.
 >

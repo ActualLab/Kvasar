@@ -86,8 +86,9 @@ public class DataLogTests
 
         // Both read paths must see the record while it lives only in the in-RAM tail.
         (await log.ReadRecord(loc)).Value.ToArray().Should().Equal(value);
-        log.TryReadRecordCached(loc, out var cached).Should().BeTrue();
+        log.TryReadRecordCached(loc, log.SlotCacheId(0), out var cached).Should().BeTrue();
         cached.Value.ToArray().Should().Equal(value);
+        log.TryReadRecordCached(loc, log.SlotCacheId(1), out _).Should().BeFalse();
     }
 
     [Fact]
@@ -454,7 +455,7 @@ public class DataLogTests
         (await log.TryReadRecord(new Locator(3, 0))).IsFound.Should().BeFalse();
         (await log.TryReadRecord(new Locator(1, recordLength))).IsFound.Should().BeFalse();
         (await log.TryReadRecord(new Locator(2, 0))).IsFound.Should().BeFalse();
-        log.TryReadRecordCached(new Locator(3, 0), out _).Should().BeFalse();
+        log.TryReadRecordCached(new Locator(3, 0), 0, out _).Should().BeFalse();
         (await log.TryReadRecord(loc)).IsFound.Should().BeTrue();
     }
 
@@ -496,7 +497,8 @@ public class DataLogTests
                         read.IsFound.Should().BeTrue($"record {index} at {loc} was published");
                         read.View.Key.ToArray().Should().Equal(Key(index));
                         read.View.Value.ToArray().Should().Equal(Value(index, 30 + (index % 50)));
-                        if (log.TryReadRecordCached(loc, out var cached))
+                        var slotCacheId = log.SlotCacheId((int)loc.FileId - 1);
+                        if (log.TryReadRecordCached(loc, slotCacheId, out var cached))
                             cached.Key.ToArray().Should().Equal(Key(index));
                         Interlocked.Increment(ref readCount);
                     }

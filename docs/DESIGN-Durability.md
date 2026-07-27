@@ -697,8 +697,7 @@ is changing anyway).
 - **A storage-layer rewrite.** `SegmentSet`, `PagedSegment`, `IndexFile` and `KvasarStore`'s
   open/flush/compact paths all change. Crypto (M1) and the record codec are untouched.
 - **A format change.** Data format 2 adds authenticated page frames and two superblock fields. The
-  dedicated format-1 importer rewrites every recoverable live record into a fresh format-2 file set;
-  other mismatches remain cache wipes.
+  format-1 file set is rejected and rebuilt as an empty format-2 cache, like every other mismatch.
 - **Authentication work at open.** The normal path decrypts only the pages between the older and newer
   committed extents; a data-slot switch starts at the data header, and a missing predecessor starts at
   the candidate's persisted authentication floor.

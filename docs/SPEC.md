@@ -145,7 +145,7 @@ public sealed record KvasarOptions
 {
     public required string BasePath { get; init; }                       // -> fixed .kvs/.N.kdat/.N.kidx/.lock set
     public required byte[] EncryptionKey { get; init; }                  // 32 bytes (AES-256)
-    public string FormatVersion { get; init; } = "2";                    // on-disk format; mismatch => migrate/wipe (§11)
+    public string FormatVersion { get; init; } = "2";                    // on-disk format; mismatch => wipe & recreate (§11)
     public string Version { get; init; } = "";                           // caller's data version; mismatch => wipe & recreate
     public int  PageSize { get; init; } = 0;                             // 0 => probe FS cluster size (fallback 4 KiB)
     public long PageCacheBytes { get; init; } = 16 * 1024 * 1024;        // decrypted-page LRU budget
@@ -337,8 +337,8 @@ value     : recordLen - (…) bytes   (absent for tombstone)
 
 ### 5.3 File header & key privacy
 File header (plaintext, non-secret): `magic "KVSR"`, `formatVer`, `pageSize`, `fileSalt(16)`,
-`flags`. A magic/version/pageSize mismatch on open ⇒ migrate where supported, otherwise wipe and
-recreate. The superblock KCV distinguishes a wrong master key and throws without wiping.
+`flags`. A magic/version/pageSize mismatch on open ⇒ wipe and recreate. The superblock KCV
+distinguishes a wrong master key and throws without wiping.
 
 **Key privacy:** keys live inside the encrypted `.kdat` pages (§5.2), so nothing about a key is
 exposed at rest. The `.kidx` index (§6.5) stores only a **keyed hash** of each key (§6.1) — not
@@ -558,10 +558,9 @@ Overwrites and deletes leave dead records; we reclaim them with **Bitcask-style 
 
 ## 11. Versioning
 Data format **2** adds authenticated page framing plus the superblock authentication floor and
-never-reused key-id counter. A format-1 store is opened only by the dedicated read-only importer:
-recoverable live entries are rewritten into a new format-2 file set, while an unknowable damaged
-legacy boundary stops migration rather than being guessed. Format 1 cannot be selected for new writes.
-Other format mismatches still wipe and recreate the regenerable cache.
+never-reused key-id counter. A format-1 store is rejected and rebuilt as an empty format-2 store,
+exactly like other format mismatches; there is no in-place migration. A wrong encryption key is reported
+before that rebuild and never wipes the format-1 files. Format 1 cannot be selected for new writes.
 
 `FormatVersion` (the on-disk format) and `Version` (the caller's own data version — schema,
 serializer, cache generation) fold into the single on-disk `formatVer` tag stamped into every
@@ -586,7 +585,7 @@ rebuildable and may be discarded across either version boundary.
   `Clear`→`Clear`. `string` keys convert to `KvasarKey` implicitly (UTF-8), and the adapter turns
   `KvasarValue` back into `byte[]` — the store itself stays pure binary. Pass the cache generation
   as `KvasarOptions.Version` (the `(version)` row's replacement) and wrap init in the existing
-  delete-and-retry safety net.
+  delete-and-retry safety net. Format-1 cache files are rejected and repopulated, not migrated.
 - `MauiModule` swaps the SQLite-backed cache/KVAS for Kvasar-backed ones; `BasePath` from
   `FileSystem.CacheDirectory & "CCC"` / `AppDataDirectory & "LocalSettings"`; `EncryptionKey`
   from `MauiPreferences.DbEncryptionKey`.
@@ -602,9 +601,9 @@ rebuildable and may be discarded across either version boundary.
 - **Framed replay:** damage a multi-page record's header page and plant record-shaped continuation
   bytes, including a complete record followed by zero padding to the page end; replay recovers later
   framed starts and never indexes the planted key.
-- **Identity/floor migration:** delete/reinsert under an all-colliding hasher never reuses `KeyId`;
-  predecessorless adoption authenticates from its persisted floor; format-1 fixtures import when
-  readable and degrade safely when not.
+- **Identity/floor/version rejection:** delete/reinsert under an all-colliding hasher never reuses
+  `KeyId`; predecessorless adoption authenticates from its persisted floor; format-1 fixtures rebuild,
+  while a wrong key throws without wiping.
 - **Concurrency:** N readers + 1 writer ⇒ no torn reads, no lost committed writes.
 - **Property-based:** random op sequences vs. an in-memory `Dictionary` oracle; reopen & re-verify.
 - **Benchmark vs SQLCipher** on the real value-size distribution: open time, `Get` p50/p99,

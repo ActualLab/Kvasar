@@ -36,7 +36,7 @@ public sealed class DataLog : IAsyncDisposable
         public int TailFill;
         public bool TailIsContinuation;
         public int TailFirstRecordOffset = -1;
-        public volatile TailSnapshot? Tail; // non-null only while this slot is an append target
+        public volatile TailSnapshot? Tail;
     }
 
     private readonly int _pageSize;
@@ -64,6 +64,7 @@ public sealed class DataLog : IAsyncDisposable
     public long ActiveCommittedOffset => _active.File.CommittedPageCount * _pagePayloadSize;
     // Where appending resumes: at or above the physical end, so a torn tail's page id is never re-issued.
     public long ActiveResumeOffset => _active.File.ResumePageId * _pagePayloadSize;
+    public long ActiveResumeLength => _active.File.ResumeLength;
     // The [committedEnd, resumeOffset) gap burned by a torn tail, measured once at open (§5.2.1).
     // Recovery adds it to the restored dead-byte counter.
     public long BurnedBytes { get; private set; }
@@ -204,7 +205,7 @@ public sealed class DataLog : IAsyncDisposable
         return TryReadWithLease(st, loc.Offset, slotCacheId, cancellationToken);
     }
 
-    public bool TryReadRecordCached(Locator loc, out RecordView view)
+    public bool TryReadRecordCached(Locator loc, uint slotCacheId, out RecordView view)
     {
         // Zero-I/O fast path: a single-page record whose page is already decrypted in the cache — the
         // common case. Anything else (miss, or a record spanning pages) returns false so the caller awaits
@@ -232,7 +233,8 @@ public sealed class DataLog : IAsyncDisposable
         if (inPage + totalLen > span.Length)
             return false;
 
-        return RecordCodec.TryDecode(firstPage.Slice(inPage, totalLen), out view, out _);
+        return RecordCodec.TryDecode(firstPage.Slice(inPage, totalLen), out view, out _)
+            && st.File.FileId == slotCacheId;
     }
 
     public async ValueTask Authenticate(
@@ -467,24 +469,6 @@ public sealed class DataLog : IAsyncDisposable
 
     internal uint SlotCacheId(int slot) => _slots[slot].File.FileId;
 
-    internal ReadLease AcquireReadLease()
-    {
-        if (!_slots[0].File.TryAcquireRead(out var first))
-            throw new InvalidOperationException("The first data slot is being recycled.");
-        if (_slots[1].File.TryAcquireRead(out var second))
-            return new ReadLease(first, second);
-
-        first.Dispose();
-        throw new InvalidOperationException("The second data slot is being recycled.");
-    }
-
-    internal ValueTask<RecordRead> TryReadRecordLeased(
-        Locator loc, CancellationToken cancellationToken = default)
-    {
-        var st = TryGetSlot(loc.FileId);
-        return st == null ? default : TryReadAt(st, loc.Offset, cancellationToken);
-    }
-
     internal ValueTask<RecordRead> TryReadRecord(
         Locator loc, uint slotCacheId, CancellationToken cancellationToken)
     {
@@ -621,12 +605,8 @@ public sealed class DataLog : IAsyncDisposable
             return await TryReadAt(st, offset, cancellationToken).ConfigureAwait(false);
     }
 
-    private ValueTask<RecordRead> TryReadAt(
-        SlotState st, long offset, CancellationToken cancellationToken)
-        => TryReadAt(st, offset, -1, cancellationToken);
-
     private async ValueTask<RecordRead> TryReadAt(
-        SlotState st, long offset, long maxEndOffset, CancellationToken cancellationToken)
+        SlotState st, long offset, CancellationToken cancellationToken)
     {
         // Pin the slot's incarnation for the whole read. A multi-page record is assembled from several
         // GetPage calls, and BeginCompaction can recycle this slot between any two of them — which
@@ -637,8 +617,6 @@ public sealed class DataLog : IAsyncDisposable
         var incarnation = st.File.FileId;
         var tail = st.Tail; // one read: everything below must agree on the same tail generation
         var len = LogicalLength(st, tail);
-        if (maxEndOffset >= 0)
-            len = Math.Min(len, maxEndOffset);
         if (offset < 0 || offset >= len)
             return default;
 
@@ -813,23 +791,4 @@ public sealed class DataLog : IAsyncDisposable
                 await slot.File.DisposeAsync().ConfigureAwait(false);
     }
 
-    // Nested types
-
-    internal readonly struct ReadLease : IDisposable
-    {
-        private readonly PagedFile.ReadLease _first;
-        private readonly PagedFile.ReadLease _second;
-
-        public ReadLease(PagedFile.ReadLease first, PagedFile.ReadLease second)
-        {
-            _first = first;
-            _second = second;
-        }
-
-        public void Dispose()
-        {
-            _second.Dispose();
-            _first.Dispose();
-        }
-    }
 }

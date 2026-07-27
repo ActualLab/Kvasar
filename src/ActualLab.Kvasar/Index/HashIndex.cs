@@ -47,10 +47,9 @@ public sealed class HashIndex
     {
         RequireLiveLocator(loc);
         var previousPacked = previousLoc.Packed;
-        if (previousPacked == Empty) {
-            Insert(keyHash, loc.Packed, loc.Packed, length);
-            return true;
-        }
+        if (previousPacked == Empty)
+            throw new ArgumentOutOfRangeException(nameof(previousLoc));
+
         var t = _table;
         var mask = t.Mask;
         var locators = t.Locators;

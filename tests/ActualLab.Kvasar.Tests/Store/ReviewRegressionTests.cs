@@ -883,6 +883,51 @@ public sealed class ReviewRegressionTests : IDisposable
     }
 
     [Fact]
+    public async Task BurnCommitRemainsAdoptableWhenTheNewestSuperblockSlotTears()
+    {
+        const int total = 60;
+        var options = Options();
+        await using (var store = await KvasarStore.Open(options)) {
+            for (var i = 0; i < total; i++)
+                await store.Set(K(i), V(i, 200));
+            await store.Flush();
+        }
+
+        var committed = await ReadSuperblock();
+        AppendBytes(DataPath(committed.DataSlot), NewBytes(137, 17));
+
+        await using (var store = await KvasarStore.Open(options)) {
+            await store.Set(K("after-burn"), V(1, 200));
+            await store.Flush();
+        }
+
+        SuperblockState newest;
+        SuperblockState burnCommit;
+        await using (var file = await FileStorageBackend.Instance.Open(KvsPath)) {
+            var read = await new Superblock(_key, FormatVer).Read(file);
+            read.States.Should().HaveCount(2);
+            (newest, burnCommit) = (read.States[0], read.States[1]);
+        }
+        newest.DataSlot.Should().Be(burnCommit.DataSlot);
+        burnCommit.DataCommitLength.Should().BeGreaterThan(committed.DataCommitLength);
+        burnCommit.DataAuthenticationFloor.Should().Be(burnCommit.DataCommitLength);
+        newest.DataCommitLength.Should().BeGreaterThan(burnCommit.DataCommitLength);
+        newest.DataAuthenticationFloor.Should().Be(burnCommit.DataCommitLength);
+
+        CorruptSuperblockSlot((int)(newest.Generation % Superblock.SlotCount));
+        await using (var file = await FileStorageBackend.Instance.Open(KvsPath)) {
+            var read = await new Superblock(_key, FormatVer).Read(file);
+            read.States.Should().ContainSingle();
+            read.States[0].Generation.Should().Be(burnCommit.Generation);
+        }
+
+        await using var reopened = await KvasarStore.Open(options);
+        for (var i = 0; i < total; i++)
+            (await reopened.Get(K(i))).Should().NotBeNull(
+                $"key {i} committed before the torn tail must survive adoption of the burn commit");
+    }
+
+    [Fact]
     public async Task ACorruptPageAfterASlotSwitchIsAuthenticatedNotAdopted()
     {
         // R4/C3: the C1 fix stopped authenticating entirely whenever the two superblock candidates named
@@ -993,6 +1038,16 @@ public sealed class ReviewRegressionTests : IDisposable
         var damage = new byte[32];
         Array.Fill(damage, (byte)0x5A);
         fs.Write(damage);
+    }
+
+    private void CorruptSuperblockSlot(int slot)
+    {
+        var offset = Superblock.HeaderSize + ((long)slot * Superblock.SlotSize);
+        using var fs = new FileStream(KvsPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        fs.Position = offset + Superblock.SlotSize - 1;
+        var value = fs.ReadByte();
+        fs.Position--;
+        fs.WriteByte((byte)(value ^ 0x80));
     }
 
     private static void AppendBytes(string path, byte[] bytes)

@@ -140,46 +140,36 @@ public sealed class FormatRevisionTests : IDisposable
     }
 
     [Fact]
-    public async Task PreRevisionStoreIsImportedIntoTheFramedFormat()
+    public async Task PreRevisionStoreIsRejectedAndRebuilt()
     {
         await CreateLegacyStore();
-
-        await using var store = await KvasarStore.Open(Options());
-        (await store.Get("legacy-a"))!.Value.AsString.Should().Be("value-a");
-        (await store.Get("legacy-b"))!.Value.AsString.Should().Be("value-b");
-
-        var state = await ReadSuperblock();
-        state.NextKeyId.Should().Be(3);
-        (await ReadFormatVersion()).Should().Be(KvasarConstants.DataFormatVersion);
-    }
-
-    [Fact]
-    public async Task IndexLessPreRevisionStoreIsImportedIntoTheFramedFormat()
-    {
-        await CreateLegacyStore();
-        foreach (var path in IndexPaths)
-            File.Delete(path);
-
-        await using var store = await KvasarStore.Open(Options());
-        (await store.Get("legacy-a"))!.Value.AsString.Should().Be("value-a");
-        (await store.Get("legacy-b"))!.Value.AsString.Should().Be("value-b");
-        (await ReadFormatVersion()).Should().Be(KvasarConstants.DataFormatVersion);
-    }
-
-    [Fact]
-    public async Task UnreadablePreRevisionStoreDegradesToAnEmptyFramedStore()
-    {
-        await CreateLegacyStore();
-        foreach (var path in IndexPaths)
-            File.Delete(path);
-        CorruptPage(0, 0);
 
         await using var store = await KvasarStore.Open(Options());
         (await store.Get("legacy-a")).Should().BeNull();
         (await store.Get("legacy-b")).Should().BeNull();
         store.Stats.Entries.Should().Be(0);
-
         (await ReadFormatVersion()).Should().Be(KvasarConstants.DataFormatVersion);
+    }
+
+    [Fact]
+    public async Task WrongKeyOnAPreRevisionStoreThrowsWithoutWiping()
+    {
+        await CreateLegacyStore();
+        string[] paths = [SuperblockPath, .. DataPaths, .. IndexPaths];
+        var snapshots = paths.ToDictionary(x => x, x => File.ReadAllBytes(x));
+        var wrongKey = Enumerable.Range(101, 32).Select(x => (byte)x).ToArray();
+        var options = Options() with {
+            EncryptionKey = wrongKey,
+            Version = "app-v3",
+        };
+
+        var act = async () => {
+            await using var store = await KvasarStore.Open(options);
+        };
+        await act.Should().ThrowAsync<KvasarKeyException>();
+
+        foreach (var path in paths)
+            File.ReadAllBytes(path).Should().Equal(snapshots[path]);
     }
 
     // Private methods

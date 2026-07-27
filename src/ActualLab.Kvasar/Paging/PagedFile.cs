@@ -49,6 +49,7 @@ public sealed class PagedFile : IAsyncDisposable
     public long CommitLength => Volatile.Read(ref _commitLength);
     // Logical end of the file. Counts staged pages, and page ids burned by a torn tail.
     public long Length => PagePosition(PageCount);
+    public long ResumeLength => PagePosition(ResumePageId);
     // The lowest page id this incarnation may append at. Uncommitted pages below it are a crash's
     // leftovers: readable, unreferenced, and accounted dead by the store.
     public long ResumePageId { get; private set; }
@@ -175,9 +176,6 @@ public sealed class PagedFile : IAsyncDisposable
         page = default;
         return false;
     }
-
-    internal bool TryAcquireRead(out ReadLease lease)
-        => TryAcquireRead(FileId, out lease);
 
     internal bool TryAcquireRead(uint fileId, out ReadLease lease)
     {

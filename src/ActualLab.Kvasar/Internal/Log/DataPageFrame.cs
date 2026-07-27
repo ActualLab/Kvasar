@@ -2,11 +2,17 @@ using System.Buffers.Binary;
 
 namespace ActualLab.Kvasar.Internal;
 
+/// <summary>
+/// Authenticated metadata decoded from a framed data-log page.
+/// </summary>
 internal readonly record struct DataPageFrame(bool IsContinuation, int FirstRecordOffset)
 {
     public bool HasRecordStart => FirstRecordOffset >= 0;
 }
 
+/// <summary>
+/// Encodes and validates the authenticated header on each data-log page.
+/// </summary>
 internal static class DataPageFraming
 {
     private const byte ContinuationFlag = 1;

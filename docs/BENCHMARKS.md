@@ -39,6 +39,12 @@ format-2 samples was 338.4k Set/s and 9,236.7k Get/s (−0.4% and −0.8%). This
 check, not a replacement for the full sweep: individual lookup samples varied enough that only the
 absence of a material hot-path regression is supported.
 
+The round-5 incarnation check repeated that spot check after `Get` began sampling both slot cache ids
+before its index probe and validating the selected id before returning a cached record. The AES-GCM
+median was 342.0k Set/s and 7,058.5k Get/s, with 0.9 µs p50 and 3.2 µs p99. The three lookup samples
+ranged from 6,665.7k to 9,329.0k Get/s, so this confirms the guarded path remains fast but is too noisy
+to assign a precise cost to the added checks.
+
 ## Representative results
 
 Measured 2026-07-27 on an AMD Ryzen 9 9950X3D (32 logical cores), Windows 11 Pro 24H2

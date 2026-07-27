@@ -80,8 +80,8 @@ public class HashIndexTests
         var second = new Locator(1, 200);
         var replacement = new Locator(1, 300);
 
-        index.Set(42, first, 10, Locator.None).Should().BeTrue();
-        index.Set(42, second, 20, Locator.None).Should().BeTrue();
+        index.Add(42, 1, first, 10);
+        index.Add(42, 2, second, 20);
         index.Set(42, replacement, 30, first).Should().BeTrue();
         index.Remove(42, second).Should().BeTrue();
 
@@ -89,6 +89,16 @@ public class HashIndexTests
         index.TryGetUniqueHash(42, out var loc, out var length).Should().BeTrue();
         loc.Should().Be(replacement);
         length.Should().Be(30);
+    }
+
+    [Fact]
+    public void SetRequiresAnExistingLocator()
+    {
+        var index = new HashIndex(16);
+        var act = () => index.Set(42, new Locator(1, 100), 10, Locator.None);
+
+        act.Should().Throw<ArgumentOutOfRangeException>();
+        index.Count.Should().Be(0);
     }
 
     [Fact]

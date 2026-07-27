@@ -150,7 +150,7 @@ public sealed class Superblock : IDisposable
         BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(FormatVerOffset, 4), _formatVer);
         var kcvNonce = header.Slice(KcvNonceOffset, KvasarConstants.GcmNonceSize);
         RandomNumberGenerator.Fill(kcvNonce);
-        ComputeKcvTag(kcvNonce, header.Slice(KcvTagOffset, KvasarConstants.GcmTagSize));
+        ComputeKcvTag(kcvNonce, header.Slice(KcvTagOffset, KvasarConstants.GcmTagSize), _formatVer);
         return file.Write(0, buffer);
     }
 
@@ -215,29 +215,34 @@ public sealed class Superblock : IDisposable
         var magic = KvasarConstants.KSupMagic;
         if (!header.AsSpan(MagicOffset, magic.Length).SequenceEqual(magic))
             return SuperblockStatus.FormatMismatch;
-        // Ordered ahead of the key check on purpose: a deliberate KvasarOptions.Version bump must read
-        // as FormatMismatch (wipe and recreate) even when the key changed in the same step.
-        if (BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(FormatVerOffset, 4)) != _formatVer)
-            return SuperblockStatus.FormatMismatch;
+        var storedFormatVer = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(FormatVerOffset, 4));
+        if (storedFormatVer != _formatVer) {
+            // Format 1 is rebuild-only, but a wrong key must not let that rebuild wipe the original store.
+            if (storedFormatVer == KvasarConstants.PreviousDataFormatVersion
+                && !IsKcvValid(header, storedFormatVer))
+                return SuperblockStatus.WrongKey;
 
-        return IsKcvValid(header) ? SuperblockStatus.Ok : SuperblockStatus.WrongKey;
+            return SuperblockStatus.FormatMismatch;
+        }
+
+        return IsKcvValid(header, _formatVer) ? SuperblockStatus.Ok : SuperblockStatus.WrongKey;
     }
 
-    private bool IsKcvValid(ReadOnlySpan<byte> header)
+    private bool IsKcvValid(ReadOnlySpan<byte> header, uint formatVer)
     {
         Span<byte> tag = stackalloc byte[KvasarConstants.GcmTagSize];
-        ComputeKcvTag(header.Slice(KcvNonceOffset, KvasarConstants.GcmNonceSize), tag);
+        ComputeKcvTag(header.Slice(KcvNonceOffset, KvasarConstants.GcmNonceSize), tag, formatVer);
         return CryptographicOperations.FixedTimeEquals(tag, header.Slice(KcvTagOffset, KvasarConstants.GcmTagSize));
     }
 
-    private void ComputeKcvTag(ReadOnlySpan<byte> nonce, Span<byte> tag)
+    private void ComputeKcvTag(ReadOnlySpan<byte> nonce, Span<byte> tag, uint formatVer)
     {
         // The plaintext is a fixed constant, so the ciphertext carries no information and is dropped:
         // the tag alone proves the file was created under this key. A constant plaintext also makes the
         // nonce safe to reuse across opens, which is why the header can be written exactly once.
         Span<byte> ciphertext = stackalloc byte[KcvPlaintext.Length];
         Span<byte> aad = stackalloc byte[AadSize];
-        BinaryPrimitives.WriteUInt32LittleEndian(aad, _formatVer);
+        BinaryPrimitives.WriteUInt32LittleEndian(aad, formatVer);
         using var aes = new AesGcm(_key, KvasarConstants.GcmTagSize);
         aes.Encrypt(nonce, KcvPlaintext, ciphertext, tag, aad);
     }
