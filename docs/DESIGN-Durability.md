@@ -729,8 +729,12 @@ can never authenticate. Every read path — `Get`, `Scan` and compaction's copy 
 
 Resolved. Before `Recover` reads the index or replays records, `TryAdopt` authenticates every page in
 the candidate's added window `(L_previous, L_candidate]`. A page failure rejects the candidate and
-tries the older superblock. If the candidates name different data slots, or no older candidate exists,
-the pass authenticates the candidate's whole committed data extent.
+tries the older superblock. If the candidates name **different data slots** — the first open after a
+compaction switch — the pass authenticates the candidate's whole committed extent instead: that slot was
+truncated to its header by `BeginCompaction` and restarted under a fresh salt, so no burned page can lie
+below its extent and all of it is checkable. If there is **no older candidate at all** there is no floor
+to bound a window against and the extent may legitimately contain a burned page, so nothing is
+authenticated; that gap is recorded in `REVIEW-R4.md` rather than implied away.
 
 `DataLog.ScanFrom` has a different contract: an index rebuild skips an unreadable record and
 reconstructs the best available cache beyond it. A readable record header fixes the damaged record's

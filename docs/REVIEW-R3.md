@@ -94,13 +94,18 @@ newest is unadoptable and the fallback is genuinely exercised.
 
 ## Still open
 
-### C3 (P2) — fallback adoption authenticates the whole extent
-`KvasarStore.AuthenticateCommitWindow`. The C1 fix removes the *wipe*, but the remaining full-extent
-path is still O(store) rather than O(index) whenever the two candidates name different data slots — for
-example on the first open after a compaction switch commit. `DESIGN.md` limitation 2 advertises "Open is
-O(index), not O(data)". Bound the fallback against a recorded known-good extent instead of defaulting to
-the whole file. `BENCHMARKS.md` measures only the incremental path (Open 2.3 → 4.1 ms); the full-extent
-path is unmeasured.
+### C3 — **this entry was wrong, and the error mattered**
+It claimed the fallback "still authenticates the whole extent" and was merely slow. It did not: the C1
+fix replaced `fromOffset = 0` with an unconditional `return default`, so **no page was authenticated at
+all** on four paths — including the first open after a compaction switch, which is exactly the §5.2
+step-3 path the guarantee is for. The cost was reviewed and the semantics were not, and this note then
+recorded the missing check as present. Round 4 caught it (Claude C3, Codex X1, the latter rating it P0).
+
+Fixed in `4bc7336`: the different-slot case authenticates the whole extent again, which is sound because
+`BeginCompaction` truncated that slot and the pass wrote every page it names. Regression test
+`ReviewRegressionTests.ACorruptPageAfterASlotSwitchIsAuthenticatedNotAdopted` — 118 of 120 keys survived
+before the fix (two lost to the unvalidated page), 120 after. The predecessorless case is still
+unauthenticated and is now stated as such rather than implied.
 
 ### X3 (P3) — `Recycle` strands the previous page cipher
 `PagedFile.Recycle` replaces `_incarnation` without disposing the old cipher, so its page/nonce key

@@ -29,8 +29,10 @@
 >
 > - **R7** — whether replaying a prior `.kdat` incarnation is in scope, or is already covered by
 >   `DESIGN.md` known-limitation 3. Deferred by decision, not by omission.
-> - **C3** — fallback adoption still authenticates the whole extent when two superblock candidates name
->   different data slots, so open is O(store) there rather than O(index). Correct, just slow.
+> - **C3** — *fixed in `4bc7336`.* This entry previously said the fallback "still authenticates the whole
+>   extent … correct, just slow". That was wrong: the check had been removed entirely. See `REVIEW-R3.md`.
+>   What remains open is narrower: adoption authenticates nothing when there is **no older superblock
+>   candidate at all**, because there is no known-good floor to bound the window against.
 > - **X3** — `PagedFile.Recycle` strands the previous page cipher without zeroizing it. Disposing it at
 >   that point races the R1 fix, so it needs refcounting or quiescence tracking.
 >
