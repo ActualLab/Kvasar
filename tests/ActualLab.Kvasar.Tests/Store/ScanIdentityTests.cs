@@ -31,11 +31,6 @@ public sealed class ScanIdentityTests : IDisposable
     [Fact]
     public async Task ARecycledSnapshotLocatorIsNotIdentifiedByItsHash()
     {
-        // Every key hashes the same here, which is the state R12's fan-out made legal. The scan's snapshot
-        // is taken on the first MoveNextAsync and then the slot it points into is recycled twice, so its
-        // pending locators resolve onto *other* keys' records. Verifying by re-hashing the decoded record
-        // — what Scan used to do — accepts every one of them, so a scan yields some keys twice and drops
-        // the entries those locators actually stood for.
         var options = Options();
         var keys = Enumerable.Range(0, KeyCount).Select(i => $"k{i:D2}").ToArray();
         await using var store = await KvasarStore.Open(options);
@@ -43,33 +38,72 @@ public sealed class ScanIdentityTests : IDisposable
             await store.Set(key, Value(key));
         await store.Flush();
 
-        var seen = new List<string>();
-        var postSnapshotFills = new List<string>();
+        var seen = new Dictionary<string, byte[]>();
         await using var scan = store.Scan().GetAsyncEnumerator();
-        // The first step captures the snapshot and consumes the record at offset 0.
         (await scan.MoveNextAsync()).Should().BeTrue();
-        seen.Add(scan.Current.Key.AsString);
+        seen.Add(scan.Current.Key.AsString, scan.Current.Value.ToArray());
 
-        // Drop that first record and rewrite the slot twice, so the live set slides down by one record and
-        // slot 0 — which every pending snapshot locator names — comes back holding different keys.
-        await store.Set(seen[0], null);
+        await store.Set(scan.Current.Key, null);
         await store.Compact();
         await store.Set(keys[^1], Value(keys[^1], PostSnapshotFill));
         await store.Compact();
 
-        while (await scan.MoveNextAsync()) {
-            seen.Add(scan.Current.Key.AsString);
-            if (scan.Current.Value.Span[^1] == PostSnapshotFill)
-                postSnapshotFills.Add(scan.Current.Key.AsString);
-        }
+        while (await scan.MoveNextAsync())
+            seen.Add(scan.Current.Key.AsString, scan.Current.Value.ToArray());
 
-        // The snapshot was taken before any of this ran, so no entry in it can legitimately resolve to a
-        // record written afterwards. Verifying a locator by re-hashing whatever it now decodes to cannot
-        // tell the difference — with fan-out legal, the hash stopped being an identity.
-        postSnapshotFills.Should().BeEmpty(
-            "a snapshot entry must not resolve onto a record written after the scan began");
-        seen.Should().OnlyHaveUniqueItems("a scan must never yield one key twice");
-        seen.Should().BeSubsetOf(keys, "a scan must never yield a key that was not stored");
+        seen.Keys.Should().BeEquivalentTo(keys);
+        foreach (var key in keys)
+            seen[key].Should().Equal(Value(key, key == keys[^1] ? PostSnapshotFill : (byte)0xA1));
+    }
+
+    [Fact]
+    public async Task ACompactionDuringScanDoesNotTruncateItsSnapshot()
+    {
+        var options = Options() with { Hasher = KeyHashers.SipHash24 };
+        var expected = Enumerable.Range(0, 39).ToDictionary(
+            i => $"k{i:D2}",
+            i => Value($"k{i:D2}"));
+        await using var store = await KvasarStore.Open(options);
+        foreach (var (key, value) in expected)
+            await store.Set(key, value);
+        await store.Set(expected.First().Key, expected.First().Value);
+
+        var seen = new Dictionary<string, byte[]>();
+        await using var scan = store.Scan().GetAsyncEnumerator();
+        (await scan.MoveNextAsync()).Should().BeTrue();
+        seen.Add(scan.Current.Key.AsString, scan.Current.Value.ToArray());
+
+        await store.Compact();
+
+        while (await scan.MoveNextAsync())
+            seen.Add(scan.Current.Key.AsString, scan.Current.Value.ToArray());
+
+        seen.Should().BeEquivalentTo(expected);
+    }
+
+    [Fact]
+    public async Task AnOverwriteDuringScanDoesNotTruncateItsSnapshot()
+    {
+        var options = Options() with { Hasher = KeyHashers.SipHash24 };
+        var expected = Enumerable.Range(0, 40).ToDictionary(
+            i => $"k{i:D2}",
+            i => Value($"k{i:D2}"));
+        await using var store = await KvasarStore.Open(options);
+        foreach (var (key, value) in expected)
+            await store.Set(key, value);
+
+        var seen = new Dictionary<string, byte[]>();
+        await using var scan = store.Scan().GetAsyncEnumerator();
+        (await scan.MoveNextAsync()).Should().BeTrue();
+        seen.Add(scan.Current.Key.AsString, scan.Current.Value.ToArray());
+
+        foreach (var (key, value) in expected)
+            await store.Set(key, value);
+
+        while (await scan.MoveNextAsync())
+            seen.Add(scan.Current.Key.AsString, scan.Current.Value.ToArray());
+
+        seen.Should().BeEquivalentTo(expected);
     }
 
     // Private methods
