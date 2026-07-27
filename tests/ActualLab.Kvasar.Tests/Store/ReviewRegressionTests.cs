@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.IO;
 using System.Linq;
 using System.Text;
+using ActualLab.Kvasar.Crypto;
 using ActualLab.Kvasar.Internal;
 using ActualLab.Kvasar.Internal.Storage;
 using ActualLab.Kvasar.Tests.Storage;
@@ -317,6 +318,33 @@ public sealed class ReviewRegressionTests : IDisposable
             (await rebuilt.Get(K(name))).Should().NotBeNull($"'{name}' was never deleted");
     }
 
+    /// <summary>
+    /// Regression for C3, found by this suite and not by any review pass. A store that does not persist
+    /// index entries used to read back <b>completely empty</b> on the next open: the entry-less
+    /// checkpoint was stamped at the committed extent, so recovery replayed nothing and adopted it.
+    /// An entry-less checkpoint is consistent with offset 0, so that is what it is stamped at now.
+    /// Reached through <see cref="IndexEncryption.Auto"/> plus a non-keyed hasher — the other half of
+    /// the condition, now that <see cref="IndexEncryption.On"/> is rejected outright (R15).
+    /// </summary>
+    [Fact]
+    public async Task AnUnpersistedIndexStillRebuildsFromTheLog()
+    {
+        var options = Options() with {
+            IndexEncryption = IndexEncryption.Auto,
+            Hasher = KeyHashers.XxHash3,
+        };
+        await using (var store = await KvasarStore.Open(options)) {
+            for (var i = 0; i < 50; i++)
+                await store.Set(K(i), V(i, 100));
+            await store.Flush();
+            store.Stats.Entries.Should().Be(50);
+        }
+
+        await using var reopened = await KvasarStore.Open(options);
+        for (var i = 0; i < 50; i++)
+            (await reopened.Get(K(i)))!.Value.ToArray().Should().Equal(V(i, 100));
+    }
+
     // --- Known defects found while writing this suite ----------------------
 
     /// <summary>
@@ -621,7 +649,7 @@ public sealed class ReviewRegressionTests : IDisposable
                 await using var store = await KvasarStore.Open(options);
                 for (var i = 0; i < keyCount; i++)
                     await store.Set(K(i), V(i, 8));
-                await store.Flush(true);
+                await store.Flush();
 
                 run.ArmCrashPoints();
                 for (var i = 0; i < keyCount; i++)
@@ -665,7 +693,7 @@ public sealed class ReviewRegressionTests : IDisposable
             await store.Compact();
             for (var i = 0; i < keyCount; i++)
                 await store.Set(K(i), V(i + 100, 512));
-            await store.Flush(true);
+            await store.Flush();
         }
 
         var options = setupOptions with {
@@ -696,7 +724,7 @@ public sealed class ReviewRegressionTests : IDisposable
                 await store.Set(K(i), V(i, 200));
             for (var i = 0; i < keyCount; i++)
                 await store.Set(K(i), V(i + 1, 200));
-            await store.Flush(true);
+            await store.Flush();
         }
 
         var persisted = await ReadSuperblock();
@@ -719,7 +747,7 @@ public sealed class ReviewRegressionTests : IDisposable
         await using (var store = await KvasarStore.Open(options)) {
             for (var i = 0; i < keyCount; i++)
                 await store.Set(K(i), V(i, 200));
-            await store.Flush(true);
+            await store.Flush();
         }
 
         // Both slots, because a legacy store persisted the inflated value on *every* commit — one bad

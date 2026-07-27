@@ -168,9 +168,11 @@ public sealed class Superblock : IDisposable
     {
         if (state.DataSlot >= SlotCount || state.IndexSlot >= SlotCount)
             throw new ArgumentOutOfRangeException(nameof(state), "Data and index slot indexes must be 0 or 1.");
-        if (state.DataCommitLength < 0 || state.IndexCommitLength < 0
-            || state.LiveBytes < 0 || state.DeadBytes < 0)
-            throw new ArgumentOutOfRangeException(nameof(state), "Commit lengths and accounting must be non-negative.");
+        // Commit lengths only: LiveBytes/DeadBytes are an advisory compaction hint, and this runs inside
+        // Commit, so rejecting them here would turn an accounting bug into a failed write. Recovery
+        // already degrades to deriving the accounting when the persisted pair makes no sense.
+        if (state.DataCommitLength < 0 || state.IndexCommitLength < 0)
+            throw new ArgumentOutOfRangeException(nameof(state), "Commit lengths must be non-negative.");
 
         var slot = (int)(state.Generation % SlotCount);
         var buffer = new byte[SlotSize];
@@ -270,10 +272,11 @@ public sealed class Superblock : IDisposable
         if (dataCommitLength < 0 || indexCommitLength < 0)
             return null;
 
+        // Accounting is parsed as-is, however odd: rejecting the slot for it would invalidate an
+        // otherwise-adoptable generation and reach WipeFiles. SeedAccounting derives its own numbers
+        // when the persisted pair cannot describe the committed extent.
         var liveBytes = BinaryPrimitives.ReadInt64LittleEndian(plain.Slice(LiveBytesOffset, 8));
         var deadBytes = BinaryPrimitives.ReadInt64LittleEndian(plain.Slice(DeadBytesOffset, 8));
-        if (liveBytes < 0 || deadBytes < 0)
-            return null;
 
         return new SuperblockState(
             generation,
