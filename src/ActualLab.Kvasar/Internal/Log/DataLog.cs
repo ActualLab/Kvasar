@@ -240,8 +240,8 @@ public sealed class DataLog : IAsyncDisposable
         }
     }
 
-    // Walks records in write order over one slot. toOffset < 0 means "to the logical end"; recovery passes
-    // the committed offset instead, so the walk can never step into the burned range above it (§5.2.1).
+    // Walks records in write order over one slot. A readable header pins the record's full span before its
+    // pages are decoded, so a broken interior page cannot turn continuation bytes into record candidates.
     public async IAsyncEnumerable<(Locator Loc, RecordView View, int RecordLength)> ScanFrom(
         int slot, long fromOffset, long toOffset,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
@@ -257,6 +257,7 @@ public sealed class DataLog : IAsyncDisposable
         var p = Math.Max(0, fromOffset);
         var prefetchPages = PrefetchPages;
         var nextPrefetchPage = p / _pageSize;
+        var mustResynchronize = false;
         while (p < len) {
             var pageId = p / _pageSize;
             if (pageId >= nextPrefetchPage) {
@@ -265,30 +266,47 @@ public sealed class DataLog : IAsyncDisposable
             }
 
             RecordRead read;
-            var isPageBroken = false;
+            if (!mustResynchronize) {
+                int recordLength;
+                try {
+                    recordLength = await ReadRecordLengthAt(st, p, len, cancellationToken).ConfigureAwait(false);
+                }
+                catch (KvasarCorruptException) {
+                    p = (pageId + 1) * _pageSize;
+                    mustResynchronize = true;
+                    continue;
+                }
+                if (recordLength == 0) {
+                    mustResynchronize = p % _pageSize == 0;
+                    p = (pageId + 1) * _pageSize;
+                    continue;
+                }
+
+                try {
+                    read = await TryReadAt(st, p, cancellationToken).ConfigureAwait(false);
+                }
+                catch (KvasarCorruptException) {
+                    read = default;
+                }
+                if (read.IsFound)
+                    yield return (new Locator(fileId, p), read.View, read.TotalLength);
+                p += recordLength;
+                continue;
+            }
+
             try {
                 read = await TryReadAt(st, p, cancellationToken).ConfigureAwait(false);
             }
             catch (KvasarCorruptException) {
                 read = default;
-                isPageBroken = true;
             }
-            if (isPageBroken) {
-                p = (p / _pageSize + 1) * _pageSize;
-                continue;
-            }
-
             if (read.IsFound) {
+                mustResynchronize = false;
                 yield return (new Locator(fileId, p), read.View, read.TotalLength);
                 p += read.TotalLength;
             }
-            else {
-                var nextPage = (p / _pageSize + 1) * _pageSize;
-                if (p % _pageSize != 0 && nextPage <= len)
-                    p = nextPage; // page-end padding: skip to the next page
-                else
-                    yield break; // torn tail: stop
-            }
+            else
+                p = (pageId + 1) * _pageSize;
         }
     }
 
@@ -559,6 +577,16 @@ public sealed class DataLog : IAsyncDisposable
         return RecordCodec.TryDecode(buf.AsMemory(0, totalLen), out var spanned, out _)
             ? new RecordRead(true, spanned, totalLen)
             : default;
+    }
+
+    private async ValueTask<int> ReadRecordLengthAt(
+        SlotState st, long offset, long len, CancellationToken cancellationToken)
+    {
+        var tail = st.Tail;
+        var pageId = offset / _pageSize;
+        var inPage = (int)(offset % _pageSize);
+        var page = await GetLogicalPage(st, tail, pageId, cancellationToken).ConfigureAwait(false);
+        return TryReadRecordLength(page.Span, offset, len, inPage, out var totalLen) ? totalLen : 0;
     }
 
     // The record's on-stream length, read from its varint header. Every bound is checked against len — the

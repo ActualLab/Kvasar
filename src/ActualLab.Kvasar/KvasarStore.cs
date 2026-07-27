@@ -1303,6 +1303,7 @@ public sealed class KvasarStore : IAsyncDisposable
     private async ValueTask<IndexedRecord> FindIndexed(KvasarKey key, ulong keyHash, Locator newLoc)
     {
         var isKeyIdUsed = false;
+        IndexedRecord? unreadable = null;
         var cursor = _index.Probe(keyHash);
         while (cursor.MoveNext(out var loc, out var length)) {
             if (cursor.CurrentHash != keyHash)
@@ -1313,17 +1314,22 @@ public sealed class KvasarStore : IAsyncDisposable
                 RecordView view;
                 if (!_data.TryReadRecordCached(loc, out view)) {
                     var read = await _data.TryReadRecord(loc, CancellationToken.None).ConfigureAwait(false);
-                    if (!read.IsFound)
+                    if (!read.IsFound) {
+                        unreadable ??= new IndexedRecord(true, loc, length, cursor.CurrentKeyId);
                         continue;
+                    }
                     view = read.View;
                 }
                 if (!view.IsTombstone && view.Key.Span.SequenceEqual(key.Span))
                     return new IndexedRecord(true, loc, length, cursor.CurrentKeyId);
             }
             catch (KvasarCorruptException) {
-                continue;
+                unreadable ??= new IndexedRecord(true, loc, length, cursor.CurrentKeyId);
             }
         }
+        if (unreadable is { } candidate)
+            return candidate;
+
         var keyId = isKeyIdUsed ? MintKeyId(keyHash, newLoc) : newLoc.Packed;
         return new IndexedRecord(false, default, 0, keyId);
     }

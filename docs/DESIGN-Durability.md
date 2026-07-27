@@ -732,10 +732,13 @@ the candidate's added window `(L_previous, L_candidate]`. A page failure rejects
 tries the older superblock. If the candidates name different data slots, or no older candidate exists,
 the pass authenticates the candidate's whole committed data extent.
 
-`DataLog.ScanFrom` has a different contract: an index rebuild skips an unauthenticatable page and
-continues at the next page, reconstructing the best available cache. This preserves §5.3's read-miss
-semantics for damage outside the candidate's newly authenticated window without letting replay decide
-whether a superblock is adoptable.
+`DataLog.ScanFrom` has a different contract: an index rebuild skips an unreadable record and
+reconstructs the best available cache beyond it. A readable record header fixes the damaged record's
+full span before its pages are decoded, so an interior page failure resumes at the record's end rather
+than treating continuation bytes as a new record. If the header page itself is unreadable, replay probes
+later page boundaries until a complete record decodes; a failed decode at a page boundary advances
+rather than ending the replay. This preserves §5.3's read-miss semantics for damage outside the
+candidate's newly authenticated window without letting replay decide whether a superblock is adoptable.
 
 ### 14.5 Smaller notes
 

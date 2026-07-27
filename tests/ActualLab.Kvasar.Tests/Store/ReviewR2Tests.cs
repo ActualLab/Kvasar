@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Text;
+using ActualLab.Kvasar.Crypto;
 using ActualLab.Kvasar.Internal;
 using ActualLab.Kvasar.Internal.Storage;
 
@@ -269,6 +270,93 @@ public sealed class ReviewR2Tests : IDisposable
             .Should().Be("survives-reopen");
     }
 
+    [Fact]
+    public async Task IndexLessRebuildResynchronizesAfterACorruptMultiPageRecord()
+    {
+        const int damagedRecordLength = 4 * PageSize;
+        const string damagedKey = "damaged";
+        const string phantomKey = "never-written";
+        var options = Options(FileStorageBackend.Instance);
+        var damagedValueLength = damagedRecordLength;
+        while (RecordCodec.GetRecordLength(damagedKey.Length, damagedValueLength, false) > damagedRecordLength)
+            damagedValueLength--;
+        RecordCodec.GetRecordLength(damagedKey.Length, damagedValueLength, false).Should().Be(damagedRecordLength);
+
+        var damagedValue = new byte[damagedValueLength];
+        var phantomValue = Encoding.UTF8.GetBytes("phantom");
+        var phantomRecord = new byte[RecordCodec.GetRecordLength(phantomKey.Length, phantomValue.Length, false)];
+        RecordCodec.Encode(
+            phantomRecord, RecordFlags.None, KvasarValueKind.Raw,
+            Encoding.UTF8.GetBytes(phantomKey), phantomValue, false);
+        var damagedHeaderLength = damagedRecordLength - damagedValueLength;
+        phantomRecord.CopyTo(damagedValue, (3 * PageSize) - damagedHeaderLength);
+
+        var expected = Enumerable.Range(0, 10)
+            .ToDictionary(i => $"after-{i:D2}", i => $"value-{i:D2}", StringComparer.Ordinal);
+        expected.Add("before", "value-before");
+        await using (var store = await KvasarStore.Open(options)) {
+            await store.Set("before", "value-before");
+            await store.Set(damagedKey, damagedValue);
+            foreach (var (key, value) in expected.Where(x => x.Key != "before"))
+                await store.Set(key, value);
+            await store.Flush();
+        }
+
+        var state = await ReadSuperblock();
+        var snapshot = await ReadIndex(options.BasePath, state);
+        var damagedEntry = snapshot.Entries.Single(x => x.Length == damagedRecordLength);
+        foreach (var path in IndexPaths(options.BasePath))
+            File.Delete(path);
+        CorruptPage(
+            $"{options.BasePath}.{state.DataSlot}.kdat",
+            (damagedEntry.Locator.Offset / PageSize) + 1);
+
+        await using var reopened = await KvasarStore.Open(options);
+        foreach (var (key, value) in expected)
+            (await reopened.Get(key))!.Value.AsString.Should().Be(value);
+        (await reopened.Get(damagedKey)).Should().BeNull();
+
+        var scanned = new Dictionary<string, string>(StringComparer.Ordinal);
+        await foreach (var (key, value) in reopened.Scan())
+            scanned.Add(key.AsString, value.AsString);
+        scanned.Should().BeEquivalentTo(expected);
+        scanned.Should().NotContainKey(phantomKey);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AnUnreadableIndexedRecordCanBeUpdatedOrDeleted(bool isDelete)
+    {
+        var backend = new FailingReadBackend(FileStorageBackend.Instance, PageSize);
+        var options = Options(backend) with {
+            DisableEncryption = true,
+            CompactionMinBytes = long.MaxValue,
+        };
+        KvasarKey key = "key";
+        var oldValue = new byte[2 * PageSize];
+        oldValue.AsSpan().Fill(0x3C);
+        await using (var store = await KvasarStore.Open(options)) {
+            await store.Set(key, oldValue);
+            await store.Set("newest-commit", "keeps the target pages out of the reopened cache");
+            await store.Flush();
+        }
+
+        await using var reopened = await KvasarStore.Open(options);
+        backend.Arm(mustThrowCorrupt: true);
+        if (isDelete)
+            await reopened.Set(key, null);
+        else
+            await reopened.Set(key, "new-value");
+
+        var targetSlotCount = reopened.Stats.Entries - 1;
+        targetSlotCount.Should().Be(isDelete ? 0 : 1);
+        if (isDelete)
+            (await reopened.Get(key)).Should().BeNull();
+        else
+            (await reopened.Get(key))!.Value.AsString.Should().Be("new-value");
+    }
+
     private KvasarOptions Options(IStorageBackend storageBackend) => new() {
         BasePath = Path.Combine(_dir, "store"),
         EncryptionKey = _encryptionKey,
@@ -285,8 +373,22 @@ public sealed class ReviewR2Tests : IDisposable
         return read.Newest!.Value;
     }
 
+    private async Task<IndexSnapshot> ReadIndex(string basePath, SuperblockState state)
+    {
+        var authenticationKey = new byte[KvasarConstants.IndexMacKeySize];
+        KeyDerivations.HkdfSha256.Derive(
+            _encryptionKey, [], KvasarConstants.IndexMacKeyInfo, authenticationKey);
+        await using var log = await IndexLog.Open(
+            await FileStorageBackend.Instance.Open($"{basePath}.{state.IndexSlot}.kidx"),
+            1,
+            authenticationKey);
+        return (await log.Read(state.IndexCommitLength, state.Generation))!.Value;
+    }
+
     private static string[] DataPaths(string basePath)
         => [$"{basePath}.0.kdat", $"{basePath}.1.kdat"];
+    private static string[] IndexPaths(string basePath)
+        => [$"{basePath}.0.kidx", $"{basePath}.1.kidx"];
     private KvasarOptions CompactionOptions(IStorageBackend storageBackend)
         => Options(storageBackend) with {
             DisableEncryption = true,
@@ -345,6 +447,18 @@ public sealed class ReviewR2Tests : IDisposable
 
     private static TimeSpan Max(TimeSpan x, TimeSpan y)
         => x >= y ? x : y;
+
+    private static void CorruptPage(string dataPath, long pageId)
+    {
+        var onDiskPageSize = PageSize + KvasarConstants.GcmTagSize;
+        var offset = KvasarConstants.SegmentHeaderSize + (pageId * onDiskPageSize);
+        using var file = new FileStream(dataPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        file.Position = offset + 16;
+        var value = file.ReadByte();
+        value.Should().BeGreaterThanOrEqualTo(0);
+        file.Position--;
+        file.WriteByte((byte)(value ^ 0x80));
+    }
 
     private sealed class CompactionGateBackend(IStorageBackend backend) : IStorageBackend
     {
@@ -492,9 +606,13 @@ public sealed class ReviewR2Tests : IDisposable
     private sealed class FailingReadBackend(IStorageBackend backend, int pageSize) : IStorageBackend
     {
         private int _isArmed;
+        private bool _mustThrowCorrupt;
 
-        public void Arm()
-            => _isArmed = 1;
+        public void Arm(bool mustThrowCorrupt = false)
+        {
+            _mustThrowCorrupt = mustThrowCorrupt;
+            _isArmed = 1;
+        }
         public void Disarm()
             => _isArmed = 0;
 
@@ -512,8 +630,11 @@ public sealed class ReviewR2Tests : IDisposable
         internal void Fail(string path, int length)
         {
             if (length == pageSize && path.EndsWith(".kdat", StringComparison.Ordinal)
-                && Interlocked.Exchange(ref _isArmed, 0) == 1)
+                && Interlocked.Exchange(ref _isArmed, 0) == 1) {
+                if (_mustThrowCorrupt)
+                    throw new KvasarCorruptException("Injected unauthenticatable page.");
                 throw new IOException("Injected transient compaction read failure.");
+            }
         }
     }
 
