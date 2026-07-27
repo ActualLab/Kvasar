@@ -159,22 +159,21 @@ public sealed class IndexLogTests
         var file = new IndexLogTestFile();
         await using var log = await IndexLog.Open(file, FormatVer);
         await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 0);
-        var checkpointEnd = log.Length;
 
         await log.AppendDelta(Entry(2, 1, 200, 20));
         await log.AppendDelta(Entry(3, 1, 300, 30));
         await log.Flush();
         var afterFirstDeltas = log.Length;
+        await log.WriteCommitMac(1);
 
         await log.AppendDelta(Entry(4, 1, 400, 40));
         await log.AppendDelta(Entry(5, 1, 500, 50));
         await log.Flush();
+        await log.WriteCommitMac(0);
 
-        (await log.Read(checkpointEnd))!.Value.Entries.Select(e => e.KeyHash)
-            .Should().BeEquivalentTo([1UL]);
-        (await log.Read(afterFirstDeltas))!.Value.Entries.Select(e => e.KeyHash)
+        (await log.Read(afterFirstDeltas, 1))!.Value.Entries.Select(e => e.KeyHash)
             .Should().BeEquivalentTo([1UL, 2UL, 3UL]);
-        (await log.Read())!.Value.Entries.Select(e => e.KeyHash)
+        (await log.Read(log.Length, 0))!.Value.Entries.Select(e => e.KeyHash)
             .Should().BeEquivalentTo([1UL, 2UL, 3UL, 4UL, 5UL]);
     }
 
@@ -195,8 +194,8 @@ public sealed class IndexLogTests
         var snapshot = await log.Read(validLength);
         snapshot.Should().NotBeNull();
         snapshot!.Value.Entries.Select(e => e.KeyHash).Should().BeEquivalentTo([1UL, 2UL]);
-        // The same bytes are visible without the bound, which is what makes the bound the thing under test.
-        (await log.Read())!.Value.Entries.Length.Should().BeGreaterThan(2);
+        (await log.Read(file.Length, 0)).Should().BeNull(
+            "bytes beyond the authenticated committed prefix must never be parsed");
     }
 
     [Fact]
@@ -320,6 +319,7 @@ public sealed class IndexLogTests
         await using (var log = await IndexLog.Open(file, FormatVer)) {
             await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 555);
             await log.AppendDelta(Entry(2, 1, 200, 20));
+            await log.WriteCommitMac(0);
         }
         // Torn tail: a partial delta left by a crash. The reopened log overwrites it rather than appending
         // past it, so no later delta is ever misaligned by it.
@@ -327,6 +327,7 @@ public sealed class IndexLogTests
 
         await using var reopened = await IndexLog.Open(file, FormatVer);
         reopened.Length.Should().Be(IndexLog.HeaderSize + (2 * IndexLog.EntrySize));
+        (await reopened.Read(reopened.Length, 0)).Should().NotBeNull();
         await reopened.AppendDelta(Entry(3, 1, 300, 30));
 
         var snapshot = await reopened.Read();

@@ -327,9 +327,11 @@ record scheme is needed.
 
 **Configurable crypto.** The page cipher (`IPageCipher`), key hasher (`IKeyHasher`), and key
 derivation (`IKeyDerivation`) are pluggable via `KvasarOptions` with secure defaults —
-**AES-256-GCM**, **SipHash-2-4** (keyed), **HKDF-SHA256** (master key → AES key + hash key; per-file
-random salt). **Safety rule:** `.kidx` may be unencrypted only with a keyed-PRF hasher;
-`IndexEncryption.Auto` enforces it (encrypts `.kidx` for any non-PRF hasher, e.g. xxHash3).
+**AES-256-GCM**, **SipHash-2-4** (keyed), **HKDF-SHA256** (master key → separate page, hash, index-MAC,
+and superblock keys; per-file random salt). **Safety rule:** `.kidx` may be unencrypted only with a keyed-PRF hasher;
+`IndexEncryption.Auto` enforces it (encrypts `.kidx` for any non-PRF hasher, e.g. xxHash3). The
+plaintext index is still authenticated: a separate HMAC key is derived from the master key with its
+own KDF info label, distinct from the page, keyed-hash, and superblock subkeys.
 
 ---
 
@@ -393,11 +395,14 @@ IndexEntry (fixed, [StructLayout(Sequential)], ~24 B):
   length    : u32  — value/record length
   flags     : u8   — tombstone, etc.
 ```
-The `.kidx` header records `magic/formatVer`, a link to `.klog`'s identity, and the **`.klog`
-high-water-mark (HWM)** the file is consistent up to.
+The `.kidx` v3 header records `magic/formatVer`, entry-layout version, the **data high-water-mark
+(HWM)** the file is consistent up to, and two generation-parity HMAC-SHA256/128 tags. Each tag commits
+the stable header fields plus the checkpoint region and the committed delta range named by its
+superblock generation.
 
 **Startup read:**
-1. Validate `.kidx` header vs `.klog`.
+1. Validate `.kidx` header and authenticate the superblock-named prefix. An old layout or MAC failure
+   is the same as a missing index.
 2. **Load checkpoint** — the file *is* the array: `MemoryMarshal.Cast` the checkpoint region
    straight into the table's backing array (sized to the stored capacity). **No decryption, no
    parsing** — near-memcpy; `mmap`-able if we ever want it. *Fastest path.*
@@ -416,8 +421,9 @@ ms, scaling with index size not data size** (vs. ~15–30 ms to decrypt-scan a 2
 - **Periodic checkpoint** (rewrite compact/blittable live table) bounds the delta tail. Triggers:
   graceful `DisposeAsync` (always), tail > ~50 % of live entries, and after data compaction
   (offsets change ⇒ index rewritten anyway).
-- **Consistency:** write `.klog` record → then its `.kidx` delta; trust `.kidx` only up to the
-  recovered `.klog` end and tail-scan the gap ⇒ `.kidx` needs **no fsync of its own** (lazy).
+- **Consistency:** write data → write the `.kidx` delta and committed-prefix MAC → publish the
+  superblock. The index still needs **no fsync of its own**: a lost prefix or tag fails authentication
+  and triggers data replay.
 
 **[DECISION]** checkpoint form: blittable full array (fastest load, ~43 % empty-slot waste,
 *recommended* for startup) vs compact live-list (smaller read, re-insert on load).
@@ -458,8 +464,9 @@ ms, scaling with index size not data size** (vs. ~15–30 ms to decrypt-scan a 2
 ## 8. Durability, recovery & corruption
 - Relaxed by design (regenerable cache). `Flush(false)` = bytes to OS cache (survives app
   crash); `fsync` on graceful `DisposeAsync`/compaction.
-- **Recovery scan:** walk `.klog` by `recordLen`; on a truncated/torn tail (crash), **truncate**
-  there — earlier data intact. Value integrity is separately guaranteed by the page GCM tag.
+- **Recovery scan:** adoption strictly authenticates the candidate generation's newly committed page
+  window and falls back to the older superblock on failure. A cache rebuild is separately best-effort:
+  it skips a page that fails GCM authentication and continues reconstructing later records.
 - **Corruption** (bad magic/version/key, global auth failure, unreadable index) ⇒ the adapter
   (§13) deletes the file set and recreates — today's behavior. **Kvasar never throws an
   unrecoverable error to the app.** *Isolated* single-record issue ⇒ drop that key, keep the store.

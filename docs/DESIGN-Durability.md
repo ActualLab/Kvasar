@@ -273,16 +273,17 @@ Two rules govern them:
 ### 3.3 The index files — `<base>.N.kidx`
 
 The index is a **pure function of the data prefix**. It exists only so that `Open` is O(index)
-instead of O(log). That single observation removes it from the durability story entirely:
+instead of O(log). It is outside the durability story, but not outside the authentication boundary:
 
 - **It is never flushed.** Not per commit, not ever.
-- **It is never trusted.** Recovery uses whatever prefix of it is valid and consistent with the
-  committed data extent, then replays data records from that point to `dataCommitLength`.
+- **Its committed prefix is authenticated.** The header carries two HMAC-SHA256/128 tags, selected by
+  superblock-generation parity, over the stable header fields plus the checkpoint and committed delta
+  range. A missing prefix, old layout, or MAC failure makes the index absent; recovery replays data.
 
-So a lost, torn, or stale index costs *replay time at open* and nothing else. This is the biggest
-simplification in the design: it deletes `.kidx` fsync (**I8**), `.kidx` authentication as a
-correctness requirement (**I12**), the blocking `.kidx` flush (**I36**), and the HWM-outruns-log
-ordering hazard (**I10**) — because there is no longer an ordering relationship to get wrong.
+So a lost, torn, stale, or tampered index costs *replay time at open* and nothing else. This keeps the
+important simplification: no `.kidx` fsync (**I8**), no blocking `.kidx` flush (**I36**), and no
+HWM-outruns-log correctness dependency (**I10**). Authentication prevents a structurally parseable
+corruption from suppressing replay (**I12**); it does not make the index authoritative.
 
 The delta tail is kept: 21 bytes per write is much cheaper at open than replaying full records
 (values included) from the data file, and on mobile *unclean* open is the common case, not the rare
@@ -369,12 +370,13 @@ for v1:
 ```
 1. append this commit's data pages to the active .kdat
 2. FlushToDisk(.kdat)                            ← the only durability call
-3. write superblock slot (G mod 2) for generation G     (no flush)
-4. append index deltas to the active .kidx              (no flush, ever)
+3. write index deltas and the prefix MAC for generation G   (no flush)
+4. write superblock slot (G mod 2) for generation G         (no flush)
 ```
 
-One `FlushToDisk` per commit, on one file. Steps 3 and 4 are unordered with respect to each other
-and to anything else; their correctness comes from validation, not ordering.
+One `FlushToDisk` per commit, on one file. Step 3 completes before step 4 is issued so the tag describes
+the exact prefix named by the superblock. Neither index write is flushed: if the prefix or its tag does
+not survive, recovery rejects the index and derives it again from data.
 
 ### 5.2 Recovery
 
@@ -388,8 +390,9 @@ and to anything else; their correctness comes from validation, not ordering.
        KvasarCorruptException. Under Buffered that is the *expected* path, not corruption —
        recovery must catch it and fall back, never propagate it to the wipe path.
 4. adopt G*: data is authoritative through L_{G*}
-5. index := longest valid prefix consistent with ≤ L_{G*}; replay data from there to L_{G*};
-   if anything was replayed, rotate the index (§3.3) — NOT "if the open was unclean" (§14.1)
+5. authenticate the index prefix named by G*; on absence, old layout, or MAC failure treat it as empty;
+   otherwise load it and replay data from its stamp to L_{G*}; if anything was replayed, rotate the
+   index (§3.3) — NOT "if the open was unclean" (§14.1)
 6. resume appending at ceil(physicalLength / pageSize) — never at L_{G*}
 ```
 
@@ -639,6 +642,11 @@ is changing anyway).
   open/flush/compact paths all change. Crypto (M1) and the record codec are untouched.
 - **A format change.** `formatVer` bumps; existing stores are wiped. Cheap for a cache, but a
   one-way door for anyone already running v1.
+- **Authentication work at open.** The normal path decrypts only the pages between the older and newer
+  committed extents; a data-slot switch or missing older candidate requires the whole candidate extent.
+  Index MAC verification is folded into the index read already required at open.
+- **One small index write per commit.** The rolling HMAC avoids rescanning the index; committing writes
+  one 16-byte generation-parity tag in its header.
 - **Peak disk 1.25× store size** during compaction at the default threshold.
 - **Compaction writes more per pass**, in exchange for running far less often and for not producing
   the segment-lifecycle bug family.
@@ -707,19 +715,17 @@ load-bearing rather than a remark. Rounding `pageCount` **up** past a torn tail 
 can never authenticate. Every read path — `Get`, `Scan` and compaction's copy loop — has to treat
 `KvasarCorruptException` from a page decrypt as a miss. Only `Open` may still read it as "wipe".
 
-### 14.4 `ScanFrom` cannot deliver §5.2 step 3
+### 14.4 Adoption authentication is separate from best-effort replay
 
-Step 3 says recovery verifies the pages a commit added and, on failure, **discards that generation and
-falls back**. The implementation cannot: `DataLog.ScanFrom` swallows a page's `KvasarCorruptException`
-and ends the walk, because that is the right answer for the torn-tail walk it was built for. A page that
-fails inside the committed extent therefore silently *truncates the replay* instead of triggering the
-fallback.
+Resolved. Before `Recover` reads the index or replays records, `TryAdopt` authenticates every page in
+the candidate's added window `(L_previous, L_candidate]`. A page failure rejects the candidate and
+tries the older superblock. If the candidates name different data slots, or no older candidate exists,
+the pass authenticates the candidate's whole committed data extent.
 
-What survives of step 3 is the check `PagedFile.Open` does — a slot naming more data than its file holds
-is not adoptable — which covers the realistic failure (the tail pages never landed) and is what the
-`Buffered` fallback rests on. A page present but torn *within* the extent is not caught at open; per §5.3
-it surfaces later as a read miss. Closing this properly needs an authenticate-only pass over
-`(L_{G*-1}, L_{G*}]` that reports failure instead of stopping — worth adding, not added here.
+`DataLog.ScanFrom` has a different contract: an index rebuild skips an unauthenticatable page and
+continues at the next page, reconstructing the best available cache. This preserves §5.3's read-miss
+semantics for damage outside the candidate's newly authenticated window without letting replay decide
+whether a superblock is adoptable.
 
 ### 14.5 Smaller notes
 

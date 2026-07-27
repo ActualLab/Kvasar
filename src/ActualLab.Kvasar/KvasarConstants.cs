@@ -25,6 +25,7 @@ public static class KvasarConstants
     public const int MasterKeySize = 32;      // AES-256 master key
     public const int PageKeySize = 32;        // AES-256 page key
     public const int SuperblockKeySize = 32;  // AES-256 superblock key
+    public const int IndexMacKeySize = 32;    // HMAC-SHA256 index key
     public const int HashKeySize = 16;        // SipHash-2-4 key
     public const int FileSaltSize = 16;       // per-segment random salt
     public const int GcmTagSize = 16;         // AES-GCM tag (per-page overhead)
@@ -33,5 +34,6 @@ public static class KvasarConstants
     // KDF info labels (subkey separation).
     public static ReadOnlySpan<byte> PageKeyInfo => "kvasar:page-key/v1"u8;
     public static ReadOnlySpan<byte> HashKeyInfo => "kvasar:index-hash-key/v1"u8;
+    public static ReadOnlySpan<byte> IndexMacKeyInfo => "kvasar:index-mac-key/v1"u8;
     public static ReadOnlySpan<byte> SuperblockKeyInfo => "kvasar:superblock-key/v1"u8;
 }
