@@ -473,10 +473,6 @@ public sealed class KvasarStore : IAsyncDisposable
 
     // Private methods
 
-    private readonly record struct AppendResult(
-        Locator Locator, Locator CompactionLocator, int RecordLength, bool IsTombstone);
-    private readonly record struct IndexedRecord(bool IsFound, Locator Locator, int Length, ulong KeyId);
-
     // --- Private: write-lock bodies ----------------------------------------
     // Each of these is entered with the write lock already held and releases it; they return Task (not
     // ValueTask) because the public wrapper awaits them through Task.WaitAsync.
@@ -1264,6 +1260,35 @@ public sealed class KvasarStore : IAsyncDisposable
         return new AppendResult(locator, compactionLocator, recordLength, isTombstone);
     }
 
+    private async ValueTask Publish(KvasarKey key, ulong h, AppendResult appended)
+    {
+        var (loc, compactionLoc, recordLength, isTombstone) = appended;
+        var old = await FindIndexed(key, h, loc).ConfigureAwait(false);
+        if (isTombstone) {
+            if (old.IsFound) {
+                _index.Remove(h, old.Locator);
+                TrackCompactionSupersession(old.Locator);
+                _data.OnSuperseded(old.Locator, old.Length);
+            }
+            _data.OnSuperseded(loc, recordLength); // the tombstone itself is reclaimable space
+            await AppendDelta(h, old.KeyId, loc, recordLength, true).ConfigureAwait(false);
+        }
+        else {
+            if (!compactionLoc.IsNone && _compaction is { } compaction)
+                compaction.WriteRelocations.Add(new CompactionRelocation(
+                    h, loc, recordLength, compactionLoc, recordLength));
+            if (old.IsFound) {
+                TrackCompactionSupersession(old.Locator);
+                _data.OnSuperseded(old.Locator, old.Length);
+                if (!_index.Set(h, loc, recordLength, old.Locator))
+                    throw new InvalidOperationException("The index entry changed while the write lock was held.");
+            }
+            if (!old.IsFound)
+                _index.Add(h, old.KeyId, loc, recordLength);
+            await AppendDelta(h, old.KeyId, loc, recordLength, false).ConfigureAwait(false);
+        }
+    }
+
     private async ValueTask<IndexedRecord> FindIndexed(KvasarKey key, ulong keyHash, Locator newLoc)
     {
         var isKeyIdUsed = false;
@@ -1307,35 +1332,6 @@ public sealed class KvasarStore : IAsyncDisposable
             if (!isUsed)
                 return keyId;
             keyId = keyId == ulong.MaxValue ? 1 : keyId + 1;
-        }
-    }
-
-    private async ValueTask Publish(KvasarKey key, ulong h, AppendResult appended)
-    {
-        var (loc, compactionLoc, recordLength, isTombstone) = appended;
-        var old = await FindIndexed(key, h, loc).ConfigureAwait(false);
-        if (isTombstone) {
-            if (old.IsFound) {
-                _index.Remove(h, old.Locator);
-                TrackCompactionSupersession(old.Locator);
-                _data.OnSuperseded(old.Locator, old.Length);
-            }
-            _data.OnSuperseded(loc, recordLength); // the tombstone itself is reclaimable space
-            await AppendDelta(h, old.KeyId, loc, recordLength, true).ConfigureAwait(false);
-        }
-        else {
-            if (!compactionLoc.IsNone && _compaction is { } compaction)
-                compaction.WriteRelocations.Add(new CompactionRelocation(
-                    h, loc, recordLength, compactionLoc, recordLength));
-            if (old.IsFound) {
-                TrackCompactionSupersession(old.Locator);
-                _data.OnSuperseded(old.Locator, old.Length);
-                if (!_index.Set(h, loc, recordLength, old.Locator))
-                    throw new InvalidOperationException("The index entry changed while the write lock was held.");
-            }
-            if (!old.IsFound)
-                _index.Add(h, old.KeyId, loc, recordLength);
-            await AppendDelta(h, old.KeyId, loc, recordLength, false).ConfigureAwait(false);
         }
     }
 
@@ -1509,6 +1505,10 @@ public sealed class KvasarStore : IAsyncDisposable
     }
 
     // Nested types
+
+    private readonly record struct AppendResult(
+        Locator Locator, Locator CompactionLocator, int RecordLength, bool IsTombstone);
+    private readonly record struct IndexedRecord(bool IsFound, Locator Locator, int Length, ulong KeyId);
 
     private readonly record struct CompactionCopy(
         IndexEntry Entry, RecordView View, bool IsCorrupt, bool IsCopy);
