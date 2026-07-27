@@ -134,8 +134,16 @@ decoded wholesale from whatever record the locator lands on, the caller receives
 currently-live `(key, value)`. It just isn't the entry the snapshot named, and one live key vanishes from
 a full scan. That is a real identity bug, but it is P3, not P2: no caller ever sees fabricated bytes.
 
-The caller-observable discriminator the test asserts is that a snapshot-based scan must never return a
-record written *after* the snapshot was taken. Pre-fix it returns one; post-fix it does not.
+**Superseded by the round-4 C1 repair.** The discriminator above — that a snapshot scan never returns a
+record written *after* the snapshot — was how the X2 fix behaved, but that fix also dropped every entry
+the writer or compactor touched (39 live keys → 1). The repair re-resolves a moved entry to its *current*
+locator instead of dropping it, so a scan now enumerates every key that was live at snapshot time, each
+at whatever version is current when it is read. `ScanIdentityTests` asserts that, and this paragraph
+previously contradicted it.
+
+SPEC §4 promises `Scan()` as an *unordered enumeration of all pairs* and never promises point-in-time
+value isolation, so the new semantics are within contract — but they are weaker than the sentence above
+implied, and completeness is the property that actually matters to callers.
 
 ### A coverage gap worth naming
 A P0 shipped through a green 440-test suite. What the suite did not have, and still should, is a crash

@@ -185,6 +185,10 @@ After `DisposeAsync` completes, every public read or write entry point, includin
 - **`Set`/`SetMany`** — write core; **delete = null value** (matches the backend's `null = delete`),
   so no separate remove primitive. `SetMany` applies in order, last dup wins.
 - **`Scan()`** — unordered enumeration of **all** `(key, value)` pairs; this *is* `ListAllEntries`.
+  Concurrency: the key set is fixed when enumeration begins, and every key live at that moment is
+  yielded even if a concurrent write or compaction relocates its record. Values are **not** isolated to
+  that instant — a key rewritten mid-scan may be yielded at its newer value. Keys created after
+  enumeration begins may or may not appear.
   Reads keys+values from disk (keys aren't in RAM) ⇒ O(n) disk, a rare op. **No server-side
   filtering:** callers wanting pattern/prefix selection enumerate and act per key themselves.
 - No bulk/regex delete — use `Clear()` to wipe, or `Scan()` + per-key `Set(key, null)`.
