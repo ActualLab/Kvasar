@@ -640,29 +640,38 @@ public sealed class KvasarStore : IAsyncDisposable
     private ValueTask AuthenticateCommitWindow(
         SuperblockState state, SuperblockState? previousState, CancellationToken cancellationToken)
     {
-        // Only the pages this generation *adds* may be authenticated. Everything below the previous
-        // committed extent was already adopted by an earlier open, and §5.2.1 deliberately leaves
-        // unauthenticatable pages down there: a torn tail burns its page id, and the commit that follows
-        // stamps an extent covering it forever. Authenticating from 0 therefore fails permanently once
-        // any tail has been torn — and because a rejected candidate falls through to the older one and
-        // then to WipeFiles, that turns a single burned page into total loss on exactly the crash path
-        // §5.2 step 3 exists to survive. Below the previous extent a failing page is a read-time miss
-        // (§5.3), never grounds to reject the slot. With no comparable predecessor there is no window to
-        // check, so this generation is adopted on the strength of the superblock's own authentication.
-        if (previousState is not { } previous
-            || previous.DataSlot != state.DataSlot
-            || previous.DataCommitLength < KvasarConstants.SegmentHeaderSize
-            || previous.DataCommitLength > state.DataCommitLength)
-            return default;
+        // Only the pages this generation *adds* may be authenticated. Below the previous committed extent
+        // §5.2.1 deliberately leaves unauthenticatable pages: a torn tail burns its page id and the commit
+        // that follows stamps an extent covering it forever, so authenticating from 0 there fails
+        // permanently once any tail has been torn — and a rejected candidate falls through to the older
+        // one and then to WipeFiles, turning one burned page into total loss on exactly the crash path
+        // §5.2 step 3 exists to survive. Down there a failing page is a read-time miss (§5.3).
+        if (previousState is { } previous
+            && previous.DataSlot == state.DataSlot
+            && previous.DataCommitLength >= KvasarConstants.SegmentHeaderSize
+            && previous.DataCommitLength <= state.DataCommitLength) {
+            var onDiskPageSize = _pageSize + _cipherFactory.Overhead;
+            var previousBodyLength = previous.DataCommitLength - KvasarConstants.SegmentHeaderSize;
+            if (previousBodyLength % onDiskPageSize != 0)
+                return default;
 
-        var onDiskPageSize = _pageSize + _cipherFactory.Overhead;
-        var previousBodyLength = previous.DataCommitLength - KvasarConstants.SegmentHeaderSize;
-        if (previousBodyLength % onDiskPageSize != 0)
-            return default;
+            var fromOffset = previousBodyLength / onDiskPageSize * _pageSize;
+            return _data.Authenticate(
+                state.DataSlot, fromOffset, _data.ActiveCommittedOffset, cancellationToken);
+        }
 
-        var fromOffset = previousBodyLength / onDiskPageSize * _pageSize;
-        return _data.Authenticate(
-            state.DataSlot, fromOffset, _data.ActiveCommittedOffset, cancellationToken);
+        // A different data slot means a compaction switch: BeginCompaction truncated that slot to its
+        // header and restarted page ids under a fresh salt, and the switch commit names only pages the
+        // pass itself wrote and flushed — so nothing below the extent is burned and the whole extent is
+        // checkable. This is the §5.2 step-3 path, so skipping it entirely (as the C1 fix briefly did)
+        // would drop the guarantee precisely where it is load-bearing.
+        if (previousState is { } other && other.DataSlot != state.DataSlot)
+            return _data.Authenticate(state.DataSlot, 0, _data.ActiveCommittedOffset, cancellationToken);
+
+        // No predecessor at all: there is no floor to bound the window against, and the extent may
+        // legitimately contain a burned page, so there is nothing safe to check here. Recorded as an
+        // open gap in docs/REVIEW-R4.md rather than papered over.
+        return default;
     }
 
     private async ValueTask OpenLogs(SuperblockState state, CancellationToken cancellationToken)

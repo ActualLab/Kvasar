@@ -882,6 +882,46 @@ public sealed class ReviewRegressionTests : IDisposable
         survivors.Should().Be(total, "a torn tail must never cost the whole store");
     }
 
+    [Fact]
+    public async Task ACorruptPageAfterASlotSwitchIsAuthenticatedNotAdopted()
+    {
+        // R4/C3: the C1 fix stopped authenticating entirely whenever the two superblock candidates named
+        // different data slots — which is exactly the first open after a compaction switch, the §5.2
+        // step-3 path the guarantee is for. That slot is provably clean (BeginCompaction truncated it and
+        // the pass wrote every page it names), so the whole extent is checkable and a damaged page there
+        // must reject the generation rather than be adopted unvalidated.
+        const int total = 120;
+        var options = Options();
+        await using (var store = await KvasarStore.Open(options)) {
+            for (var i = 0; i < total; i++)
+                await store.Set(K(i), V(i, 200));
+            for (var i = 0; i < total; i += 2)
+                await store.Set(K(i), V(i + 1, 200)); // dead bytes, so Compact actually runs
+            await store.Compact();
+            await store.Flush();
+        }
+
+        SuperblockState newest, older;
+        await using (var file = await FileStorageBackend.Instance.Open(KvsPath)) {
+            var read = await new Superblock(_key, FormatVer).Read(file);
+            read.States.Length.Should().Be(2);
+            (newest, older) = (read.States[0], read.States[1]);
+        }
+        newest.DataSlot.Should().NotBe(older.DataSlot, "the compaction must have switched slots");
+
+        // Damage a page well inside the switched-to slot's committed extent.
+        CorruptPage(DataPath(newest.DataSlot), 2);
+
+        await using var reopened = await KvasarStore.Open(options);
+        var survivors = 0;
+        for (var i = 0; i < total; i++)
+            if (await reopened.Get(K(i)) is not null)
+                survivors++;
+        survivors.Should().Be(total,
+            "a damaged page in the switched-to slot must reject that generation so adoption falls back "
+            + "to the intact older one, rather than adopting it unvalidated and serving misses");
+    }
+
     // Private methods
 
     private string BasePath => Path.Combine(_dir, "store");
