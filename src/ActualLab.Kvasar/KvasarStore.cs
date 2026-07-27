@@ -550,7 +550,8 @@ public sealed class KvasarStore : IAsyncDisposable
             await DisposeFiles(dataFiles).ConfigureAwait(false);
             throw;
         }
-        _indexLogs = await OpenIndexLogs(cancellationToken).ConfigureAwait(false);
+        _indexLogs = await OpenIndexLogs(
+            cancellationToken, state.IndexSlot, state.IndexCommitLength).ConfigureAwait(false);
     }
 
     private async ValueTask Recover(SuperblockState state, CancellationToken cancellationToken)
@@ -559,10 +560,9 @@ public sealed class KvasarStore : IAsyncDisposable
         var committedOffset = _data.ActiveCommittedOffset;
         var indexLog = _indexLogs[state.IndexSlot];
         var snapshot = await indexLog.Read(state.IndexCommitLength, cancellationToken).ConfigureAwait(false);
-        // An index prefix as long as the commit named holds a delta for every record below the committed
-        // extent, so there is nothing to replay and the index can be adopted as it stands.
+        // Only an index at the exact committed extent can be adopted without rotation.
         var isIndexComplete = snapshot is not null
-            && _mustPersistIndex && indexLog.Length >= state.IndexCommitLength;
+            && _mustPersistIndex && indexLog.Length == state.IndexCommitLength;
         var replayFrom = 0L;
         if (snapshot is { } s) {
             _index.BulkLoad(s.Entries);
@@ -576,7 +576,7 @@ public sealed class KvasarStore : IAsyncDisposable
                 .ConfigureAwait(false))
                 ApplyLoaded(loc, view, recordLength);
         }
-        SeedAccounting();
+        SeedAccounting(state);
 
         _generation = state.Generation;
         _indexSlot = state.IndexSlot;
@@ -643,13 +643,18 @@ public sealed class KvasarStore : IAsyncDisposable
         return files;
     }
 
-    private async ValueTask<IndexLog[]> OpenIndexLogs(CancellationToken cancellationToken)
+    private async ValueTask<IndexLog[]> OpenIndexLogs(
+        CancellationToken cancellationToken, int committedSlot = -1, long committedLength = long.MaxValue)
     {
         var files = await OpenSlotFiles(_kidxPaths, cancellationToken).ConfigureAwait(false);
         var logs = new IndexLog[files.Length];
         try {
-            for (var i = 0; i < files.Length; i++)
-                logs[i] = await IndexLog.Open(files[i], _formatVer, cancellationToken).ConfigureAwait(false);
+            for (var i = 0; i < files.Length; i++) {
+                var slotCommitLength = i == committedSlot ? committedLength : long.MaxValue;
+                logs[i] = await IndexLog
+                    .Open(files[i], _formatVer, slotCommitLength, cancellationToken)
+                    .ConfigureAwait(false);
+            }
         }
         catch {
             await DisposeFiles(files).ConfigureAwait(false);
@@ -1061,7 +1066,7 @@ public sealed class KvasarStore : IAsyncDisposable
 
     private void ApplyLoaded(Locator loc, in RecordView view, int recordLength)
     {
-        // Accounting is seeded afterwards from the final index (SeedAccounting), so no OnSuperseded here.
+        // The adopted superblock supplies accounting after replay, so recovery does not mutate it here.
         var h = _hasher.Hash(view.Key.Span, _hashKey);
         if (view.IsTombstone) {
             if (_index.TryGetFirst(h, out var oldLoc, out _))
@@ -1071,18 +1076,30 @@ public sealed class KvasarStore : IAsyncDisposable
             _index.Set(h, loc, recordLength);
     }
 
-    private void SeedAccounting()
+    private void SeedAccounting(SuperblockState state)
     {
-        // Seed live/dead bytes from the final index (no extra decrypt) instead of scanning the log. Dead
-        // is whatever the file holds beyond the live set, so the range a torn tail burned is counted too.
-        var live = new long[DataLog.SlotCount];
-        foreach (var e in _index.Snapshot()) {
-            var slot = (int)e.Locator.FileId - 1;
-            if ((uint)slot < live.Length)
-                live[slot] += e.Length;
+        // Accounting only drives the compaction trigger, so a pair that cannot describe this committed
+        // extent must not fail adoption: the slot is authenticated, which makes an out-of-range value a
+        // bug or a store written before the counters were trusted — never tampering. Rejecting it here
+        // would reach WipeFiles through TryAdopt and throw away intact data over a hint. Fall back to
+        // deriving it from the index instead, which is where these numbers came from before §3.1.
+        var committedOffset = _data.ActiveCommittedOffset;
+        var isUsable = state.LiveBytes >= 0 && state.DeadBytes >= 0
+            && state.LiveBytes <= committedOffset
+            && state.DeadBytes <= committedOffset - state.LiveBytes
+            && state.DeadBytes <= long.MaxValue - _data.BurnedBytes;
+        if (isUsable) {
+            _data.SeedAccounting(state.DataSlot, state.LiveBytes, state.DeadBytes + _data.BurnedBytes);
+            return;
         }
-        for (var slot = 0; slot < live.Length; slot++)
-            _data.SeedAccounting(slot, live[slot]);
+
+        // FileId is 1-based (Locator), so slot n is file id n+1.
+        var live = 0L;
+        foreach (var e in _index.Snapshot())
+            if ((int)e.Locator.FileId - 1 == state.DataSlot)
+                live += e.Length;
+        _data.SeedAccounting(state.DataSlot, live);
+        _data.ResetAccounting(1 - state.DataSlot);
     }
 
     private uint MintCacheId()

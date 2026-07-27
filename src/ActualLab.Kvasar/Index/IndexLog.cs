@@ -51,16 +51,16 @@ public sealed class IndexLog : IAsyncDisposable
 
     public static int EntrySize => Unsafe.SizeOf<IndexEntry>();
 
-    // Where the next delta lands: the file's content end, staged deltas included.
+    // Where the next delta lands: the adopted content end, staged deltas included.
     public long Length => _flushedLength + (_pendingCount * (long)EntrySize);
 
     public static async ValueTask<IndexLog> Open(
-        IStorageFile file, uint formatVer, CancellationToken cancellationToken = default)
+        IStorageFile file, uint formatVer, long committedLength = long.MaxValue,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(file);
+        ArgumentOutOfRangeException.ThrowIfNegative(committedLength);
         try {
-            // A header we can't parse leaves the physical end as the append point: nothing here is valid,
-            // Read returns null until the caller writes a checkpoint, and until then we clobber nothing.
             var fileLength = file.Length;
             var flushedLength = fileLength;
             if (fileLength >= HeaderSize) {
@@ -71,6 +71,7 @@ public sealed class IndexLog : IAsyncDisposable
                     flushedLength = checkpointEnd + ((fileLength - checkpointEnd) / EntrySize * EntrySize);
                 }
             }
+            flushedLength = Math.Min(flushedLength, committedLength);
             return new IndexLog(file, formatVer, flushedLength);
         }
         catch {

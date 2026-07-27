@@ -55,8 +55,8 @@ public sealed class DataLog : IAsyncDisposable
     public long ActiveCommittedOffset => _active.File.CommittedPageCount * _pageSize;
     // Where appending resumes: at or above the physical end, so a torn tail's page id is never re-issued.
     public long ActiveResumeOffset => _active.File.ResumePageId * _pageSize;
-    // The [committedEnd, resumeOffset) gap burned by a torn tail, measured once at open (§5.2.1). It is
-    // dead space the store must account for; DeadBytes below does not include it.
+    // The [committedEnd, resumeOffset) gap burned by a torn tail, measured once at open (§5.2.1).
+    // Recovery adds it to the restored dead-byte counter.
     public long BurnedBytes { get; private set; }
 
     public long LiveBytes => _slots[0].LiveBytes + _slots[1].LiveBytes;
@@ -285,9 +285,8 @@ public sealed class DataLog : IAsyncDisposable
         st.DeadBytes += oldRecordLength;
     }
 
-    // Seeds a slot's accounting at open from the loaded index (no log decrypt): LiveBytes is the sum of the
-    // live record lengths in that slot; DeadBytes is the rest of its logical bytes (superseded records plus
-    // page padding — a slight over-count that only makes compaction a touch more eager).
+    // Reconstructs a slot's accounting from an index without decrypting the log. DeadBytes includes page
+    // padding, so it is intentionally less precise than restoring persisted counters.
     public void SeedAccounting(int slot, long liveBytes)
     {
         if ((uint)slot >= SlotCount)
@@ -296,6 +295,21 @@ public sealed class DataLog : IAsyncDisposable
         var st = _slots[slot];
         st.LiveBytes = liveBytes;
         st.DeadBytes = Math.Max(0, LogicalLength(st) - liveBytes);
+    }
+
+    public void SeedAccounting(int activeSlot, long liveBytes, long deadBytes)
+    {
+        if ((uint)activeSlot >= SlotCount)
+            throw new ArgumentOutOfRangeException(nameof(activeSlot));
+        ArgumentOutOfRangeException.ThrowIfNegative(liveBytes);
+        ArgumentOutOfRangeException.ThrowIfNegative(deadBytes);
+
+        var active = _slots[activeSlot];
+        active.LiveBytes = liveBytes;
+        active.DeadBytes = deadBytes;
+        var inactive = _slots[1 - activeSlot];
+        inactive.LiveBytes = 0;
+        inactive.DeadBytes = 0;
     }
 
     // Zeroes a slot's counters. Used on the slot a compaction just drained: its bytes are awaiting
