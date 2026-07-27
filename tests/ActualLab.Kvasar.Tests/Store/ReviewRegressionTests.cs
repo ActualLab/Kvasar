@@ -187,7 +187,7 @@ public sealed class ReviewRegressionTests : IDisposable
 
         var state = await ReadSuperblock();
         var indexPath = IndexPath(state.IndexSlot);
-        var real = (await ReadIndex(state.IndexSlot, state.IndexCommitLength))!.Value.Entries[0];
+        var real = (await ReadIndex(state.IndexSlot, state.IndexCommitLength, state.Generation))!.Value.Entries[0];
         // A whole entry, so nothing about it is torn: it points at a real record under a hash no key has.
         var fabricated = real;
         fabricated.KeyHash ^= 0xA5A5_A5A5_A5A5_A5A5;
@@ -345,19 +345,12 @@ public sealed class ReviewRegressionTests : IDisposable
             (await reopened.Get(K(i)))!.Value.ToArray().Should().Equal(V(i, 100));
     }
 
-    // --- Known defects found while writing this suite ----------------------
+    // --- R5 AdoptionAuthenticatesCommitWindow (P0) -------------------------
 
-    /// <summary>
-    /// KNOWN GAP, documented at <c>docs/DESIGN-Durability.md</c> §14.4: <c>DataLog.ScanFrom</c> ends the
-    /// walk at a page that fails its tag, so on an open that has to replay — no usable <c>.kidx</c> — a
-    /// single bad page mid-file still discards every record above it. That is I2's shape at a smaller
-    /// volume: with the index intact the same damage costs one page's keys
-    /// (<see cref="AMidFileCorruptPageIsAMissForItsOwnKeysOnly"/>), without it, 392 of 400.
-    /// Closing it needs an authenticate-only pass that reports failure instead of stopping.
-    /// </summary>
-    [Fact(Skip = "Known gap (DESIGN-Durability.md §14.4): an index-less replay stops at the first bad page.")]
+    [Fact]
     public async Task AnIndexLessRebuildRecoversPastACorruptPage_KnownGap()
     {
+        // A rebuild is best-effort even though adoption validates the candidate commit window strictly.
         const int total = 400;
         var options = Options();
         await using (var store = await KvasarStore.Open(options)) {
@@ -378,6 +371,42 @@ public sealed class ReviewRegressionTests : IDisposable
                 missing.Add(i);
         }
         missing.Should().HaveCountLessThan(8, "only the records on the broken page may be lost");
+    }
+
+    [Fact]
+    public async Task ATornPageInTheNewestCommitWindowFallsBackToTheOlderSuperblock()
+    {
+        const int baselineCount = 40;
+        const int newestCount = 40;
+        var options = Options() with {
+            FlushDelay = TimeSpan.FromHours(1),
+            CommitBytes = long.MaxValue,
+        };
+        await using (var store = await KvasarStore.Open(options)) {
+            for (var i = 0; i < baselineCount; i++)
+                await store.Set(K(i), V(i, 200));
+            await store.Flush();
+            for (var i = baselineCount; i < baselineCount + newestCount; i++)
+                await store.Set(K(i), V(i, 200));
+            await store.Flush();
+        }
+
+        await using var superblockFile = await FileStorageBackend.Instance.Open(KvsPath);
+        var read = await new Superblock(_key, FormatVer).Read(superblockFile);
+        read.States.Should().HaveCount(2);
+        var newest = read.States[0];
+        var older = read.States[1];
+        newest.DataSlot.Should().Be(older.DataSlot);
+        newest.DataCommitLength.Should().BeGreaterThan(older.DataCommitLength);
+        var firstAddedPage = (older.DataCommitLength - KvasarConstants.SegmentHeaderSize)
+            / OnDiskPageSize(encrypt: true);
+        CorruptPage(DataPath(newest.DataSlot), firstAddedPage);
+
+        await using var reopened = await KvasarStore.Open(options);
+        for (var i = 0; i < baselineCount; i++)
+            (await reopened.Get(K(i)))!.Value.ToArray().Should().Equal(V(i, 200));
+        for (var i = baselineCount; i < baselineCount + newestCount; i++)
+            (await reopened.Get(K(i))).Should().BeNull("the newest generation must be rejected as a unit");
     }
 
     // --- I9 WrongKeyAcceptedWhenActiveEmpty (P1) ---------------------------
@@ -803,11 +832,13 @@ public sealed class ReviewRegressionTests : IDisposable
         return read.Newest!.Value;
     }
 
-    private async Task<IndexSnapshot?> ReadIndex(int slot, long validLength)
+    private async Task<IndexSnapshot?> ReadIndex(int slot, long validLength, ulong generation)
     {
+        var authenticationKey = new byte[KvasarConstants.IndexMacKeySize];
+        KeyDerivations.HkdfSha256.Derive(_key, [], KvasarConstants.IndexMacKeyInfo, authenticationKey);
         await using var log = await IndexLog.Open(
-            await FileStorageBackend.Instance.Open(IndexPath(slot)), FormatVer);
-        return await log.Read(validLength);
+            await FileStorageBackend.Instance.Open(IndexPath(slot)), FormatVer, authenticationKey);
+        return await log.Read(validLength, generation);
     }
 
     private static int OnDiskPageSize(bool encrypt)

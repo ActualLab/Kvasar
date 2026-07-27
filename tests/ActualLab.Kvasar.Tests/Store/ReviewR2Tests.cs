@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Text;
 using ActualLab.Kvasar.Internal;
 using ActualLab.Kvasar.Internal.Storage;
@@ -105,6 +106,50 @@ public sealed class ReviewR2Tests : IDisposable
             (await reopened.Get(key)).Should().NotBeNull();
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CorruptCommittedIndexRebuildsFromDataWithoutWiping(bool isDelta)
+    {
+        const int checkpointKeyCount = 60;
+        const int keyCount = 100;
+        var options = Options(FileStorageBackend.Instance);
+        await using (var store = await KvasarStore.Open(options)) {
+            for (var i = 0; i < checkpointKeyCount; i++)
+                await store.Set($"key-{i:D4}", $"value-{i:D4}");
+            await store.Flush();
+        }
+
+        var preRotationState = await ReadSuperblock();
+        using (var file = File.OpenWrite($"{options.BasePath}.{preRotationState.IndexSlot}.kidx"))
+            file.SetLength(IndexLog.HeaderSize);
+        await using (var store = await KvasarStore.Open(options)) {
+            for (var i = checkpointKeyCount; i < keyCount; i++)
+                await store.Set($"key-{i:D4}", $"value-{i:D4}");
+            await store.Flush();
+        }
+
+        var state = await ReadSuperblock();
+        var indexPath = $"{options.BasePath}.{state.IndexSlot}.kidx";
+        var indexBytes = await File.ReadAllBytesAsync(indexPath);
+        var checkpointCount = BinaryPrimitives.ReadInt64LittleEndian(indexBytes.AsSpan(16, 8));
+        var checkpointEnd = IndexLog.HeaderSize + (checkpointCount * IndexLog.EntrySize);
+        checkpointCount.Should().BeGreaterThan(0);
+        state.IndexCommitLength.Should().BeGreaterThan(checkpointEnd);
+        var corruptOffset = isDelta ? checkpointEnd : IndexLog.HeaderSize;
+        indexBytes[checked((int)corruptOffset)] ^= 0x80;
+        await File.WriteAllBytesAsync(indexPath, indexBytes);
+
+        var dataBefore = DataPaths(options.BasePath).ToDictionary(
+            path => path, File.ReadAllBytes, StringComparer.Ordinal);
+        await using (var reopened = await KvasarStore.Open(options)) {
+            for (var i = 0; i < keyCount; i++)
+                (await reopened.Get($"key-{i:D4}"))!.Value.AsString.Should().Be($"value-{i:D4}");
+        }
+        foreach (var (path, bytes) in dataBefore)
+            File.ReadAllBytes(path).Should().Equal(bytes, "index recovery must not wipe or rewrite data files");
+    }
+
     private KvasarOptions Options(IStorageBackend storageBackend) => new() {
         BasePath = Path.Combine(_dir, "store"),
         EncryptionKey = _encryptionKey,
@@ -112,6 +157,17 @@ public sealed class ReviewR2Tests : IDisposable
         StorageBackend = storageBackend,
         FlushDelay = TimeSpan.Zero,
     };
+
+    private async Task<SuperblockState> ReadSuperblock()
+    {
+        await using var file = await FileStorageBackend.Instance.Open(Path.Combine(_dir, "store.kvs"));
+        var read = await new Superblock(_encryptionKey, 1).Read(file);
+        read.Status.Should().Be(SuperblockStatus.Ok);
+        return read.Newest!.Value;
+    }
+
+    private static string[] DataPaths(string basePath)
+        => [$"{basePath}.0.kdat", $"{basePath}.1.kdat"];
 
     private sealed class PausingWriteBackend(IStorageBackend backend) : IStorageBackend
     {

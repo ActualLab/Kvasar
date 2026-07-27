@@ -26,6 +26,7 @@ public sealed class KvasarStore : IAsyncDisposable
     private readonly IKeyHasher _hasher;
     private readonly byte[] _hashKey;
     private readonly IPageCipherFactory _cipherFactory;
+    private readonly byte[] _indexMacKey;
     private readonly IStorageBackend _storage;
     private readonly Superblock _superblock;
     private readonly bool _mustPersistIndex;
@@ -161,8 +162,10 @@ public sealed class KvasarStore : IAsyncDisposable
         // file's own random salt, so a store-level KDF salt isn't needed (the master key is already
         // a uniformly-random 256-bit secret); subkeys are separated by info label.
         var pageKey = new byte[KvasarConstants.PageKeySize];
+        _indexMacKey = new byte[KvasarConstants.IndexMacKeySize];
         _hashKey = new byte[_hasher.IsKeyed ? Math.Max(1, _hasher.SecretSize) : 0];
         kdf.Derive(options.EncryptionKey, [], KvasarConstants.PageKeyInfo, pageKey);
+        kdf.Derive(options.EncryptionKey, [], KvasarConstants.IndexMacKeyInfo, _indexMacKey);
         if (_hashKey.Length != 0)
             kdf.Derive(options.EncryptionKey, [], KvasarConstants.HashKeyInfo, _hashKey);
 
@@ -225,6 +228,7 @@ public sealed class KvasarStore : IAsyncDisposable
                 // set, so a retry would no-op and the store lock would leak for the rest of the process.
                 await CloseFiles().ConfigureAwait(false);
                 CryptographicOperations.ZeroMemory(_hashKey);
+                CryptographicOperations.ZeroMemory(_indexMacKey);
                 (_cipherFactory as IDisposable)?.Dispose();
                 _superblock.Dispose();
                 _lock.Dispose();
@@ -569,8 +573,10 @@ public sealed class KvasarStore : IAsyncDisposable
         var isAdopted = false;
         if (read.Status == SuperblockStatus.Ok) {
             // Newest generation first; the older candidate is the fallback for step 3 of §5.2.
-            foreach (var state in read.States) {
-                isAdopted = await TryAdopt(state, cancellationToken).ConfigureAwait(false);
+            for (var i = 0; i < read.States.Length; i++) {
+                SuperblockState? previousState = i + 1 < read.States.Length ? read.States[i + 1] : null;
+                isAdopted = await TryAdopt(read.States[i], previousState, cancellationToken)
+                    .ConfigureAwait(false);
                 if (isAdopted)
                     break;
             }
@@ -586,10 +592,12 @@ public sealed class KvasarStore : IAsyncDisposable
             _flushLoopTask = Task.Run(RunFlushLoop, CancellationToken.None);
     }
 
-    private async ValueTask<bool> TryAdopt(SuperblockState state, CancellationToken cancellationToken)
+    private async ValueTask<bool> TryAdopt(
+        SuperblockState state, SuperblockState? previousState, CancellationToken cancellationToken)
     {
         try {
             await OpenLogs(state, cancellationToken).ConfigureAwait(false);
+            await AuthenticateCommitWindow(state, previousState, cancellationToken).ConfigureAwait(false);
             await Recover(state, cancellationToken).ConfigureAwait(false);
             return true;
         }
@@ -599,6 +607,23 @@ public sealed class KvasarStore : IAsyncDisposable
             await CloseLogs().ConfigureAwait(false);
             return false;
         }
+    }
+
+    private ValueTask AuthenticateCommitWindow(
+        SuperblockState state, SuperblockState? previousState, CancellationToken cancellationToken)
+    {
+        var fromOffset = 0L;
+        if (previousState is { } previous
+            && previous.DataSlot == state.DataSlot
+            && previous.DataCommitLength >= KvasarConstants.SegmentHeaderSize
+            && previous.DataCommitLength <= state.DataCommitLength) {
+            var onDiskPageSize = _pageSize + _cipherFactory.Overhead;
+            var previousBodyLength = previous.DataCommitLength - KvasarConstants.SegmentHeaderSize;
+            if (previousBodyLength % onDiskPageSize == 0)
+                fromOffset = previousBodyLength / onDiskPageSize * _pageSize;
+        }
+        return _data.Authenticate(
+            state.DataSlot, fromOffset, _data.ActiveCommittedOffset, cancellationToken);
     }
 
     private async ValueTask OpenLogs(SuperblockState state, CancellationToken cancellationToken)
@@ -631,7 +656,9 @@ public sealed class KvasarStore : IAsyncDisposable
         _index = new HashIndex();
         var committedOffset = _data.ActiveCommittedOffset;
         var indexLog = _indexLogs[state.IndexSlot];
-        var snapshot = await indexLog.Read(state.IndexCommitLength, cancellationToken).ConfigureAwait(false);
+        var snapshot = await indexLog
+            .Read(state.IndexCommitLength, state.Generation, cancellationToken)
+            .ConfigureAwait(false);
         // Only an index at the exact committed extent can be adopted without rotation.
         var isIndexComplete = snapshot is not null
             && _mustPersistIndex && indexLog.Length == state.IndexCommitLength;
@@ -656,7 +683,12 @@ public sealed class KvasarStore : IAsyncDisposable
         // so the free .kdat/.kidx stop being referenced by any valid superblock slot and the rotation
         // below — and any later compaction — may recycle them (§3.2).
         var generation = _generation + 1;
-        await _superblock.Write(_superblockFile!, state with { Generation = generation }).ConfigureAwait(false);
+        var confirmedState = state with { Generation = generation };
+        if (isIndexComplete)
+            await indexLog.WriteCommitMac(generation).ConfigureAwait(false);
+        else
+            confirmedState = confirmedState with { IndexCommitLength = 0 };
+        await _superblock.Write(_superblockFile!, confirmedState).ConfigureAwait(false);
         _generation = generation;
         _slotSwitchGeneration = 0;
 
@@ -724,7 +756,7 @@ public sealed class KvasarStore : IAsyncDisposable
             for (var i = 0; i < files.Length; i++) {
                 var slotCommitLength = i == committedSlot ? committedLength : long.MaxValue;
                 logs[i] = await IndexLog
-                    .Open(files[i], _formatVer, slotCommitLength, cancellationToken)
+                    .Open(files[i], _formatVer, _indexMacKey, slotCommitLength, cancellationToken)
                     .ConfigureAwait(false);
             }
         }
@@ -851,14 +883,11 @@ public sealed class KvasarStore : IAsyncDisposable
 
         var indexLog = _indexLogs[_indexSlot];
         var generation = _generation + 1;
+        await indexLog.WriteCommitMac(generation).ConfigureAwait(false);
         await _superblock.Write(_superblockFile!, new SuperblockState(
             generation, (byte)_data.ActiveSlot, dataCommitLength,
             (byte)_indexSlot, indexLog.Length, _data.LiveBytes, _data.DeadBytes)).ConfigureAwait(false);
         _generation = generation;
-        // The index goes out last and is never flushed (§3.3): a delta the superblock named but that never
-        // reached the file simply shortens the prefix recovery trusts, which costs replay time only.
-        await indexLog.Flush().ConfigureAwait(false);
-
         _uncommittedBytes = 0;
         if (_isSlotSwitchPending) {
             _slotSwitchGeneration = _generation;
@@ -886,8 +915,8 @@ public sealed class KvasarStore : IAsyncDisposable
         // An entry-less checkpoint is consistent with offset 0, not with the extent — it carries no
         // record of anything. Stamping it at dataStamp made recovery compute replayFrom == committedOffset,
         // replay nothing, and adopt an empty index: every key gone on the first reopen, no crash needed.
-        // The cost of stamping 0 is that replay now starts below any burned range, so the T5 gap
-        // (ScanFrom ends the walk at an unauthenticatable page) applies to this configuration.
+        // Stamping 0 makes recovery replay the whole committed log; damaged pages are skipped by that
+        // best-effort rebuild after the candidate generation has been validated independently.
         var stamp = _mustPersistIndex ? dataStamp : 0L;
         await _indexLogs[slot].WriteCheckpoint(entries, stamp).ConfigureAwait(false);
         _indexSlot = slot;

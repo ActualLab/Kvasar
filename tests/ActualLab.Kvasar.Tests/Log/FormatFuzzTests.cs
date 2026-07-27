@@ -414,13 +414,14 @@ public class FormatFuzzTests
         await log.WriteCheckpoint(checkpoint, dataCommitLength);
         for (var i = 0; i < deltaCount; i++)
             await log.AppendDelta(Entry(DeltaHash(i), 2, (uint)(i * 8), 8));
+        await log.WriteCommitMac(0);
     }
 
     private static async Task<IndexSnapshot?> ReadIndexLog(string path)
     {
         var file = await FileStorageBackend.Instance.Open(path);
         await using var log = await IndexLog.Open(file, FormatVer);
-        return await log.Read();
+        return await log.Read(log.Length, 0);
     }
 
     private static ulong DeltaHash(int i) => (ulong)(100 + i);

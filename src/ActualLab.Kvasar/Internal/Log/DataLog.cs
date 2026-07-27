@@ -216,6 +216,28 @@ public sealed class DataLog : IAsyncDisposable
         return RecordCodec.TryDecode(firstPage.Slice(inPage, totalLen), out view, out _);
     }
 
+    public async ValueTask Authenticate(
+        int slot, long fromOffset, long toOffset, CancellationToken cancellationToken = default)
+    {
+        if ((uint)slot >= SlotCount)
+            throw new ArgumentOutOfRangeException(nameof(slot));
+        if (fromOffset < 0 || toOffset < fromOffset || toOffset > _slots[slot].File.CommittedPageCount * _pageSize)
+            throw new ArgumentOutOfRangeException(nameof(toOffset));
+        if (fromOffset % _pageSize != 0 || toOffset % _pageSize != 0)
+            throw new ArgumentException("Authentication range must be page-aligned.");
+
+        var file = _slots[slot].File;
+        var endPageId = toOffset / _pageSize;
+        var nextPrefetchPageId = fromOffset / _pageSize;
+        for (var pageId = nextPrefetchPageId; pageId < endPageId; pageId++) {
+            if (pageId >= nextPrefetchPageId) {
+                await file.Prefetch(pageId, PrefetchPages, cancellationToken).ConfigureAwait(false);
+                nextPrefetchPageId = pageId + PrefetchPages;
+            }
+            _ = await file.GetPage(pageId, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
     // Walks records in write order over one slot. toOffset < 0 means "to the logical end"; recovery passes
     // the committed offset instead, so the walk can never step into the burned range above it (§5.2.1).
     public async IAsyncEnumerable<(Locator Loc, RecordView View, int RecordLength)> ScanFrom(
@@ -246,13 +268,13 @@ public sealed class DataLog : IAsyncDisposable
                 read = await TryReadAt(st, p, cancellationToken).ConfigureAwait(false);
             }
             catch (KvasarCorruptException) {
-                // A page that fails its tag ends the walk: it is a torn tail or the burned range, and
-                // everything past it is unreferenced by construction.
                 read = default;
                 isPageBroken = true;
             }
-            if (isPageBroken)
-                yield break;
+            if (isPageBroken) {
+                p = (p / _pageSize + 1) * _pageSize;
+                continue;
+            }
 
             if (read.IsFound) {
                 yield return (new Locator(fileId, p), read.View, read.TotalLength);

@@ -439,15 +439,11 @@ readahead with something it is documented to swallow removes it from the picture
 read as the only source of cancellation; `Get` takes no readahead at all, so it needs nothing extra.
 Both tests were verified to fail with the filters reverted to `is not KvasarCorruptException`.
 
-### T5. An index-less replay still stops at the first unreadable page (M)
-[`DESIGN-Durability.md`](DESIGN-Durability.md) §14.4 records this as unfixed; the cost is now measured.
-`Store/ReviewRegressionTests` keeps it as the skipped `AnIndexLessRebuildRecoversPastACorruptPage_KnownGap`.
-With the `.kidx` intact, corrupting one mid-file page costs exactly the records on it — 1 key of 400.
-With no usable `.kidx`, the same damage costs **392 of 400**: `DataLog.ScanFrom` ends the walk at the
-page that fails its tag, and everything above it is dropped and then checkpointed. That is I2's shape at
-a smaller volume, and the index being derivable is what keeps it off the normal path. Closing it needs
-what §14.4 names: an authenticate-only pass over the commit window that reports failure instead of
-stopping, plus a way to resume the walk at the next page boundary above a bad page.
+### T5. An index-less replay still stops at the first unreadable page — **done**
+Adoption now authenticates the candidate's added commit window before recovery, while an index rebuild
+skips an unreadable page and resumes at the next boundary. The formerly skipped
+`AnIndexLessRebuildRecoversPastACorruptPage_KnownGap` runs and limits loss to records on the damaged
+page; a separate regression rejects a newest generation whose added window contains a torn page.
 
 ### T1. Cancellation tests are timing-based, not deterministic — **done**
 `Store/CancellationTests` now has three gate-driven tests alongside the timer-based smoke ones. A

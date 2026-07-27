@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Security.Cryptography;
 using ActualLab.Kvasar.Internal.Storage;
 
 namespace ActualLab.Kvasar.Internal;
@@ -17,19 +18,21 @@ public readonly record struct IndexSnapshot(IndexEntry[] Entries, long DataCommi
 //   12    4  LayoutVersion     uint  — .kidx entry-layout version
 //   16    8  CheckpointCount   long  — # of IndexEntry in the checkpoint region
 //   24    8  DataCommitLength  long  — the .kdat extent this index is consistent up to
-//   32   32  Reserved          zero  — pad to 64
+//   32   16  CommitMac0        HMAC-SHA256/128 for even superblock generations
+//   48   16  CommitMac1        HMAC-SHA256/128 for odd superblock generations
 // Checkpoint/delta entries are cast straight to/from bytes with no byte-swapping, so the file is only
 // portable across identical-endianness (little-endian) devices — acceptable for a single-device store (§2).
 //
 /// <summary>
 /// The <c>&lt;base&gt;.N.kidx</c> index log (DESIGN-Durability.md §3.3): a 64-byte header, a blittable
 /// checkpoint region, then an append-only delta tail. The index is a pure function of the data prefix, so
-/// this file is <b>never flushed and never trusted</b> — a lost, torn or stale one costs replay time at
-/// open and nothing else.
+/// this file is never flushed. Its committed prefix is authenticated; an absent, stale, torn, or invalid
+/// file costs replay time at open and nothing else.
 /// </summary>
 public sealed class IndexLog : IAsyncDisposable
 {
     public const int HeaderSize = 64;
+    public const uint LayoutVersion = 3;
 
     // Header field offsets.
     private const int MagicOffset = 0;
@@ -38,16 +41,21 @@ public sealed class IndexLog : IAsyncDisposable
     private const int LayoutVersionOffset = 12;
     private const int CheckpointCountOffset = 16;
     private const int DataCommitLengthOffset = 24;
-    private const uint LayoutVersion = 2;
+    private const int CommitMac0Offset = 32;
+    private const int CommitMacSize = 16;
 
     // Deltas are staged here and written in one I/O: a Write per entry costs orders of magnitude more than
     // the memcpy, which is why v1 kept a FileStream open for the whole store's life.
     private const int MaxPendingBytes = 1 << 16;
 
+    private static readonly byte[] TestAuthenticationKey = new byte[KvasarConstants.IndexMacKeySize];
+
     private readonly IStorageFile _file;
     private readonly uint _formatVer;
+    private readonly byte[] _authenticationKey;
     private readonly byte[] _pending;
     private readonly int _pendingCapacity;
+    private IncrementalHash? _mac;
     private int _pendingCount;
     private long _flushedLength;
 
@@ -56,11 +64,21 @@ public sealed class IndexLog : IAsyncDisposable
     // Where the next delta lands: the adopted content end, staged deltas included.
     public long Length => _flushedLength + (_pendingCount * (long)EntrySize);
 
-    public static async ValueTask<IndexLog> Open(
+    internal static ValueTask<IndexLog> Open(
         IStorageFile file, uint formatVer, long committedLength = long.MaxValue,
+        CancellationToken cancellationToken = default)
+        => Open(file, formatVer, TestAuthenticationKey, committedLength, cancellationToken);
+
+    public static async ValueTask<IndexLog> Open(
+        IStorageFile file, uint formatVer, ReadOnlyMemory<byte> authenticationKey,
+        long committedLength = long.MaxValue,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(file);
+        if (authenticationKey.Length != KvasarConstants.IndexMacKeySize)
+            throw new ArgumentException(
+                $"Authentication key must be {KvasarConstants.IndexMacKeySize} bytes.",
+                nameof(authenticationKey));
         ArgumentOutOfRangeException.ThrowIfNegative(committedLength);
         try {
             var fileLength = file.Length;
@@ -74,7 +92,7 @@ public sealed class IndexLog : IAsyncDisposable
                 }
             }
             flushedLength = Math.Min(flushedLength, committedLength);
-            return new IndexLog(file, formatVer, flushedLength);
+            return new IndexLog(file, formatVer, authenticationKey.Span, flushedLength);
         }
         catch {
             await file.DisposeAsync().ConfigureAwait(false);
@@ -82,10 +100,12 @@ public sealed class IndexLog : IAsyncDisposable
         }
     }
 
-    private IndexLog(IStorageFile file, uint formatVer, long flushedLength)
+    private IndexLog(
+        IStorageFile file, uint formatVer, ReadOnlySpan<byte> authenticationKey, long flushedLength)
     {
         _file = file;
         _formatVer = formatVer;
+        _authenticationKey = authenticationKey.ToArray();
         _flushedLength = flushedLength;
         _pendingCapacity = Math.Max(1, MaxPendingBytes / EntrySize);
         _pending = new byte[_pendingCapacity * EntrySize];
@@ -99,10 +119,30 @@ public sealed class IndexLog : IAsyncDisposable
         catch {
             // Ignored: the index is derivable from the data prefix, so a lost tail costs replay time only.
         }
-        await _file.DisposeAsync().ConfigureAwait(false);
+        try {
+            await _file.DisposeAsync().ConfigureAwait(false);
+        }
+        finally {
+            _mac?.Dispose();
+            CryptographicOperations.ZeroMemory(_authenticationKey);
+        }
     }
 
-    public async ValueTask<IndexSnapshot?> Read(long validLength = -1, CancellationToken cancellationToken = default)
+    public ValueTask<IndexSnapshot?> Read(
+        ulong generation, CancellationToken cancellationToken = default)
+        => Read(Length, generation, cancellationToken);
+
+    internal async ValueTask<IndexSnapshot?> Read(
+        long validLength = -1, CancellationToken cancellationToken = default)
+    {
+        if (_mac is not null)
+            await WriteCommitMac(0).ConfigureAwait(false);
+        var end = validLength < 0 ? Length : validLength;
+        return await Read(end, 0, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async ValueTask<IndexSnapshot?> Read(
+        long validLength, ulong generation, CancellationToken cancellationToken = default)
     {
         // Staged deltas are part of the log's content, so they must be on the file before it is parsed.
         await Flush().ConfigureAwait(false);
@@ -115,12 +155,19 @@ public sealed class IndexLog : IAsyncDisposable
 
         var bytes = new byte[end];
         await _file.ReadExact(0, bytes, cancellationToken).ConfigureAwait(false);
-        return Parse(bytes, _formatVer);
+        var snapshot = Parse(bytes, _formatVer, generation, _authenticationKey);
+        if (snapshot is not null && end == Length)
+            InitializeMac(bytes);
+        return snapshot;
     }
 
     public ValueTask AppendDelta(IndexEntry entry)
     {
-        MemoryMarshal.Write(_pending.AsSpan(_pendingCount * EntrySize), in entry);
+        var mac = _mac ?? throw new InvalidOperationException(
+            "The index must be loaded or checkpointed before appending.");
+        var entryBytes = _pending.AsSpan(_pendingCount * EntrySize, EntrySize);
+        MemoryMarshal.Write(entryBytes, in entry);
+        mac.AppendData(entryBytes);
         _pendingCount++;
         return _pendingCount == _pendingCapacity ? Flush() : default;
     }
@@ -137,6 +184,16 @@ public sealed class IndexLog : IAsyncDisposable
         _pendingCount = 0;
     }
 
+    public async ValueTask WriteCommitMac(ulong generation)
+    {
+        var mac = _mac ?? throw new InvalidOperationException(
+            "The index must be loaded or checkpointed before it can be committed.");
+        await Flush().ConfigureAwait(false);
+        var hash = mac.GetCurrentHash();
+        var offset = CommitMac0Offset + ((int)(generation % Superblock.SlotCount) * CommitMacSize);
+        await _file.Write(offset, hash.AsMemory(0, CommitMacSize)).ConfigureAwait(false);
+    }
+
     public async ValueTask<long> WriteCheckpoint(ReadOnlyMemory<IndexEntry> liveEntries, long dataCommitLength)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(dataCommitLength);
@@ -149,14 +206,18 @@ public sealed class IndexLog : IAsyncDisposable
         await _file.Truncate(0).ConfigureAwait(false);
         await _file.Write(0, buffer).ConfigureAwait(false);
         _flushedLength = buffer.Length;
+        InitializeMac(buffer);
         return _flushedLength;
     }
 
     // Private methods
 
-    private static IndexSnapshot? Parse(byte[] bytes, uint formatVer)
+    private static IndexSnapshot? Parse(
+        byte[] bytes, uint formatVer, ulong generation, byte[] authenticationKey)
     {
         if (!TryReadHeader(bytes, formatVer, bytes.Length, out var checkpointCount, out var dataCommitLength))
+            return null;
+        if (!IsMacValid(bytes, generation, authenticationKey))
             return null;
 
         var entrySize = EntrySize;
@@ -179,6 +240,18 @@ public sealed class IndexLog : IAsyncDisposable
         var entries = new IndexEntry[resolved.Count];
         resolved.Values.CopyTo(entries, 0);
         return new IndexSnapshot(entries, dataCommitLength);
+    }
+
+    private static bool IsMacValid(
+        ReadOnlySpan<byte> bytes, ulong generation, byte[] authenticationKey)
+    {
+        using var mac = IncrementalHash.CreateHMAC(HashAlgorithmName.SHA256, authenticationKey);
+        mac.AppendData(bytes[..CommitMac0Offset]);
+        mac.AppendData(bytes[HeaderSize..]);
+        var hash = mac.GetCurrentHash();
+        var offset = CommitMac0Offset + ((int)(generation % Superblock.SlotCount) * CommitMacSize);
+        return CryptographicOperations.FixedTimeEquals(
+            hash.AsSpan(0, CommitMacSize), bytes.Slice(offset, CommitMacSize));
     }
 
     private static bool TryReadHeader(
@@ -214,6 +287,14 @@ public sealed class IndexLog : IAsyncDisposable
         checkpointCount = count;
         dataCommitLength = commitLength;
         return true;
+    }
+
+    private void InitializeMac(ReadOnlySpan<byte> bytes)
+    {
+        _mac?.Dispose();
+        _mac = IncrementalHash.CreateHMAC(HashAlgorithmName.SHA256, _authenticationKey);
+        _mac.AppendData(bytes[..CommitMac0Offset]);
+        _mac.AppendData(bytes[HeaderSize..]);
     }
 
     private static byte[] BuildCheckpoint(
