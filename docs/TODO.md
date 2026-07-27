@@ -1,5 +1,29 @@
 # Kvasar — outstanding items
 
+> **Round-2 review (2026-07-27) closed most of what was still open here.** See
+> [`REVIEW-R2.md`](REVIEW-R2.md) for the findings and the fix commits for the work. In particular:
+>
+> - **C4 is solved and no longer blocks shipping.** The operative cause was `PagedFile.Prefetch`
+>   capturing the page incarnation *after* awaiting its read, so a concurrent `Recycle` let the old
+>   incarnation's bytes be decrypted with the new cipher and cached under the new `FileId` — permanently,
+>   since `PageCache.Add` keeps the first entry. That is exactly why the failures clustered on
+>   `encrypt: False` (under AES-GCM the cross-incarnation decrypt fails its tag and is swallowed) and
+>   why commenting out `GetMany`'s single `Prefetch` call made it green. Fixed as R1, with a
+>   deterministic regression test rather than a stress run.
+> - **C1** (64-bit hash collisions) fixed as R12; `EdgeCaseTests.HashCollisionFanOut_KnownBug` is
+>   un-skipped and passing. `.kidx` is at layout version 2 (`IndexEntry` 24 → 32 bytes).
+> - **T6** (leaked crash workers) fixed as R22 — which also removes the contamination that inflated the
+>   C4 flake rates and the benchmarks. **C5** should be re-checked against a clean machine before any
+>   further work; it may have been a symptom of T6.
+> - **P5** (durability-matched benchmarks) fixed as R15: the benchmark now configures
+>   `KvasarDurability.Flushed` and the obsolete `Flush(bool)` overload is gone. **The numbers in
+>   [`BENCHMARKS.md`](BENCHMARKS.md) predate that change and need re-measuring.**
+> - **P4** (compaction blocks writers) and **T5** (index-less replay stops at the first unreadable page)
+>   are addressed by R14 and R5 respectively.
+>
+> Treat the per-item text below as the historical record; where it conflicts with the above, the above
+> is current.
+
 > **Largely superseded by [`DESIGN-Durability.md`](DESIGN-Durability.md) (2026-07-25).** That
 > proposal replaces segments with a fixed five-file set governed by an authenticated superblock, and
 > in doing so eliminates D1–D5, G1–G5 and C-cluster items *structurally* rather than fixing them
@@ -369,7 +393,12 @@ there is a second path through the cache. Note the failures cluster on `encrypt:
 page is authenticated — that asymmetry is the sharpest clue available and should drive the next
 attempt.
 
-**Do not ship this.** Until it is understood, compaction can serve bytes the caller never wrote.
+**RESOLVED (2026-07-27) as R1** — see the banner at the top of this file. The lead recorded above was
+correct: the path ran through `GetMany`'s `Prefetch`, and the `encrypt: False` clustering was the
+mechanism, not a coincidence. `Prefetch` captured `_incarnation` *after* awaiting `ReadExact` — the
+comment directly above that line already stated the invariant the code broke. Fixed by capturing the
+incarnation before the read and re-checking it afterwards, plus publishing the new incarnation in
+`Recycle` only after its page bounds are reset.
 
 ### P5. The benchmark comparison is no longer durability-matched (S)
 `Durability` defaults to `Buffered` and `Flush(fsync: true)` ignores the flag, so Kvasar ends a
