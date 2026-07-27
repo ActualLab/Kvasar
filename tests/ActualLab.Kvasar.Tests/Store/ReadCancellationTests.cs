@@ -97,7 +97,7 @@ public sealed class ReadCancellationTests : IDisposable
         await using (var store = await KvasarStore.Open(Options())) {
             for (var i = 0; i < KeyCount; i++)
                 await store.Set(K(i), V(i));
-            await store.Flush(true);
+            await store.Flush();
         }
         // Reopened, so the page cache is cold and every read below really reaches the device.
         return await KvasarStore.Open(Options());

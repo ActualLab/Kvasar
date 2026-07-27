@@ -67,7 +67,7 @@ public class CancellationTests : IDisposable
                     // The write may or may not have landed — both are correct.
                 }
             }
-            await store.Flush(true);
+            await store.Flush();
         }
 
         await using (var store = await KvasarStore.Open(Options())) {
@@ -100,7 +100,7 @@ public class CancellationTests : IDisposable
                     // Fine: SetMany is not transactional across keys (§4.3), only per key.
                 }
             }
-            await store.Flush(true);
+            await store.Flush();
         }
 
         // Every value that survived must be intact — a partial value is corruption, a missing one isn't.
@@ -137,7 +137,7 @@ public class CancellationTests : IDisposable
 
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => setTask);
             // Flush queues on the write lock, so it returns only once the cancelled body has released it.
-            await store.Flush(true);
+            await store.Flush();
             (await store.Get(K("gated")))!.Value.ToArray().Should().Equal(value);
         }
 
@@ -166,7 +166,7 @@ public class CancellationTests : IDisposable
             gate.Resume();
 
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => setTask);
-            await store.Flush(true);
+            await store.Flush();
             (await store.Get(K("gated")))!.Value.ToArray().Should().Equal(value);
         }
 
@@ -194,7 +194,7 @@ public class CancellationTests : IDisposable
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => loserTask);
             gate.Resume();
             await winnerTask;
-            await store.Flush(true);
+            await store.Flush();
         }
 
         await using (var store = await KvasarStore.Open(Options())) {
@@ -210,7 +210,6 @@ public class CancellationTests : IDisposable
         BasePath = Path.Combine(_dir, "store"),
         EncryptionKey = _key,
         PageSize = 512,
-        SegmentBytes = 32 * 1024,
         FlushDelay = TimeSpan.Zero, // every Set writes through, so cancellation hits real I/O
     };
 

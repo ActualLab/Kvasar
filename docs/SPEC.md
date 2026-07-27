@@ -113,7 +113,8 @@ public sealed class KvasarStore : IAsyncDisposable
     public ValueTask Clear(CancellationToken ct = default);              // wipe everything (fast reset)
 
     // --- lifecycle ---
-    public Task Flush();                                                 // completes when durable; no ct
+    public ValueTask Flush();                                            // commit using configured durability
+    [Obsolete("Use Flush(); configure durability through KvasarOptions.Durability.")]
     public ValueTask Flush(bool fsync, CancellationToken ct = default);
     public ValueTask Compact(CancellationToken ct = default);
     public ValueTask DisposeAsync();
@@ -150,18 +151,34 @@ public sealed record KvasarOptions
     public long PageCacheBytes { get; init; } = 16 * 1024 * 1024;        // decrypted-page LRU budget
     public int  MaxValueBytes { get; init; } = 8 * 1024 * 1024;
     public int  MaxInlineValueBytes { get; init; } = 0;                 // 0 => PageSize; ≤ this stays single-page (zero-copy, §5.2)
+    public KvasarDurability Durability { get; init; } = KvasarDurability.Buffered;
     public TimeSpan FlushDelay { get; init; } = TimeSpan.FromSeconds(0.5); // 0 => every Set durable on return
+    public long CommitBytes { get; init; } = 8 * 1024 * 1024;
     // Pluggable crypto — secure defaults (§5.3)
     public IKeyHasher      Hasher { get; init; } = KeyHashers.SipHash24;      // keyed PRF (default)
     public IKeyDerivation  Kdf    { get; init; } = KeyDerivations.HkdfSha256; // master key -> subkeys
     public IndexEncryption IndexEncryption { get; init; } = IndexEncryption.Auto; // encrypt .kidx iff Hasher isn't a keyed PRF
-    public long SegmentBytes { get; init; } = 16 * 1024 * 1024;         // .klog segment roll size (§9)
-    public double CompactionDeadRatio { get; init; } = 0.5;
-    public long CompactionMinBytes { get; init; } = 4 * 1024 * 1024;
+    [Obsolete("SegmentBytes is unused; use CommitBytes to bound the commit and recovery window.")]
+    public long SegmentBytes { get; init; } = 16 * 1024 * 1024;         // compatibility only; ignored
+    public double CompactionDeadRatio { get; init; } = 2.0 / 3.0;
+    public long CompactionMinBytes { get; init; } = 1024 * 1024;
 }
 
-public enum IndexEncryption { Auto, On, Off }   // Auto: encrypt .kidx unless Hasher is a keyed PRF
+public static class KvasarConstants
+{
+    public const int MaxKeyBytes = 64 * 1024;
+}
+
+public enum IndexEncryption { Auto, On, Off }   // On is rejected until encrypted .kidx is implemented
 ```
+
+`Open` rejects non-positive `MaxValueBytes`, `CommitBytes`, and `PageCacheBytes`; a negative
+`MaxInlineValueBytes` or `CompactionMinBytes`; a `CompactionDeadRatio` outside `(0, 1]`; and a
+`MaxInlineValueBytes` greater than `MaxValueBytes`. `IndexEncryption.On` is not implemented and
+throws `NotSupportedException` instead of silently disabling index persistence.
+
+After `DisposeAsync` completes, every public read or write entry point, including `Stats`, throws
+`ObjectDisposedException`. `DisposeAsync` itself remains idempotent.
 
 ### 4.1 Operation rationale
 - **`Get`/`GetMany`** — read core; `GetMany` positional, `null` = miss; called concurrently.
@@ -175,6 +192,8 @@ public enum IndexEncryption { Auto, On, Off }   // Auto: encrypt .kidx unless Ha
 ### 4.2 Key & value semantics
 - **Key identity = the raw key bytes** (the whole `KvasarKey.Memory` content). A `string` key is
   its UTF-8 encoding, so `"a"` and `"a"u8` are the same key.
+- Keys passed to `Set`/`SetMany` may not exceed `KvasarConstants.MaxKeyBytes`; an oversized key is
+  rejected at the public API boundary with `ArgumentOutOfRangeException`.
 - **Empty vs missing:** an empty value is a present value; a miss is `null`. Delete = `null`.
   Mind the difference between `KvasarValue?` = `null` (delete) and a `KvasarValue` built from a
   `null` array/string (a *present*, empty value) — the implicit conversions treat null like

@@ -1,4 +1,4 @@
-namespace ActualLab.Kvasar.Internal;
+namespace ActualLab.Kvasar;
 
 /// <summary>Repo-wide on-disk constants shared by the paging, log and index layers.</summary>
 public static class KvasarConstants

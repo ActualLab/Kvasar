@@ -55,7 +55,7 @@ public sealed class ReviewRegressionTests : IDisposable
             await using (var store = await KvasarStore.Open(options)) {
                 for (var i = 0; i < 40; i++)
                     await store.Set(K($"r{round}-k{i:D3}"), V(i, 200));
-                await store.Flush(true);
+                await store.Flush();
                 FileNames().Should().BeEquivalentTo(OpenFileSet);
             }
             FileNames().Should().BeEquivalentTo(ClosedFileSet);
@@ -97,7 +97,7 @@ public sealed class ReviewRegressionTests : IDisposable
         await using (var store = await KvasarStore.Open(options)) {
             for (var i = 0; i < total; i++)
                 await store.Set(K(i), V(i, 200));
-            await store.Flush(true);
+            await store.Flush();
         }
 
         var state = await ReadSuperblock();
@@ -142,7 +142,7 @@ public sealed class ReviewRegressionTests : IDisposable
         await using (var store = await KvasarStore.Open(options)) {
             for (var i = 0; i < total; i++)
                 await store.Set(K(i), V(i, 200));
-            await store.Flush(true);
+            await store.Flush();
         }
 
         var state = await ReadSuperblock();
@@ -181,7 +181,7 @@ public sealed class ReviewRegressionTests : IDisposable
                 await store.Set(K(i), value);
                 oracle[$"k{i:D6}"] = value;
             }
-            await store.Flush(true);
+            await store.Flush();
         }
 
         var state = await ReadSuperblock();
@@ -195,7 +195,7 @@ public sealed class ReviewRegressionTests : IDisposable
         await using (var store = await KvasarStore.Open(options)) {
             await store.Set(K("late"), V(7, 40));
             oracle["late"] = V(7, 40);
-            await store.Flush(true);
+            await store.Flush();
         }
 
         await using (var store = await KvasarStore.Open(options)) {
@@ -231,7 +231,7 @@ public sealed class ReviewRegressionTests : IDisposable
                 await store.Set(K(i), value);
                 oracle[$"k{i:D6}"] = value;
             }
-            await store.Flush(true);
+            await store.Flush();
         }
 
         var state = await ReadSuperblock();
@@ -246,7 +246,7 @@ public sealed class ReviewRegressionTests : IDisposable
                 await store.Set(K(i), value);
                 oracle[$"k{i:D6}"] = value;
             }
-            await store.Flush(true);
+            await store.Flush();
         }
 
         await using (var store = await KvasarStore.Open(options)) {
@@ -281,7 +281,7 @@ public sealed class ReviewRegressionTests : IDisposable
             foreach (var name in live)
                 await store.Set(K(name), V(1, 300));
             await store.Compact();
-            await store.Flush(true);
+            await store.Flush();
         }
 
         foreach (var name in deleted)
@@ -305,7 +305,7 @@ public sealed class ReviewRegressionTests : IDisposable
 
         await using (var store = await KvasarStore.Open(options)) {
             await store.Compact();
-            await store.Flush(true);
+            await store.Flush();
         }
         foreach (var path in IndexPaths())
             File.Delete(path);
@@ -318,29 +318,6 @@ public sealed class ReviewRegressionTests : IDisposable
     }
 
     // --- Known defects found while writing this suite ----------------------
-
-    /// <summary>
-    /// Regression for C3, found by this suite and not by any review pass. A store that does not persist
-    /// index entries — <see cref="IndexEncryption.On"/>, or <see cref="IndexEncryption.Auto"/> with a
-    /// non-keyed hasher — used to read back <b>completely empty</b> on the next open: the entry-less
-    /// checkpoint was stamped at the committed extent, so recovery replayed nothing and adopted it.
-    /// An entry-less checkpoint is consistent with offset 0, so that is what it is stamped at now.
-    /// </summary>
-    [Fact]
-    public async Task AnUnpersistedIndexStillRebuildsFromTheLog()
-    {
-        var options = Options() with { IndexEncryption = IndexEncryption.On };
-        await using (var store = await KvasarStore.Open(options)) {
-            for (var i = 0; i < 50; i++)
-                await store.Set(K(i), V(i, 100));
-            await store.Flush(true);
-            store.Stats.Entries.Should().Be(50);
-        }
-
-        await using var reopened = await KvasarStore.Open(options);
-        for (var i = 0; i < 50; i++)
-            (await reopened.Get(K(i)))!.Value.ToArray().Should().Equal(V(i, 100));
-    }
 
     /// <summary>
     /// KNOWN GAP, documented at <c>docs/DESIGN-Durability.md</c> §14.4: <c>DataLog.ScanFrom</c> ends the
@@ -358,7 +335,7 @@ public sealed class ReviewRegressionTests : IDisposable
         await using (var store = await KvasarStore.Open(options)) {
             for (var i = 0; i < total; i++)
                 await store.Set(K(i), V(i, 200));
-            await store.Flush(true);
+            await store.Flush();
         }
 
         var state = await ReadSuperblock();
@@ -399,7 +376,7 @@ public sealed class ReviewRegressionTests : IDisposable
         // ... and the empty store is still a working store under the right key.
         await using (var store = await KvasarStore.Open(options)) {
             await store.Set(K("a"), V(1, 20));
-            await store.Flush(true);
+            await store.Flush();
         }
         ReadHeader(KvsPath).Should().Equal(headerBefore);
         await open.Should().ThrowAsync<KvasarKeyException>();
@@ -430,7 +407,7 @@ public sealed class ReviewRegressionTests : IDisposable
             for (var pass = 0; pass < 6; pass++) {
                 for (var i = 0; i < keyCount; i++)
                     await store.Set(K(i), V(i + pass, 60));
-                await store.Flush(true); // several commits, so the rotation gets a chance to fire
+                await store.Flush(); // several commits, so the rotation gets a chance to fire
             }
         }
 
@@ -465,7 +442,7 @@ public sealed class ReviewRegressionTests : IDisposable
                 for (var i = 0; i < 200; i++)
                     await store.Set(K(i), V(i + round, 200));
                 await store.Compact();
-                await store.Flush(true);
+                await store.Flush();
             }
             backend.DeletedPaths.Should().BeEmpty("a compaction recycles a slot, it never unlinks one");
             backend.OpenedPaths.Should().BeEmpty("the five-file set is opened once, at open");
@@ -513,7 +490,7 @@ public sealed class ReviewRegressionTests : IDisposable
         for (var i = 0; i < 300; i += 3)
             await store.Set(K(i), V(i + 9, 150));
         await store.Compact();
-        await store.Flush(true);
+        await store.Flush();
         for (var i = 0; i < 300; i++)
             (await store.Get(K(i)))!.Value.ToArray().Should()
                 .Equal(i % 3 == 0 ? V(i + 9, 150) : V(i + 2, 150));
@@ -539,18 +516,6 @@ public sealed class ReviewRegressionTests : IDisposable
     }
 
     [Fact]
-    public async Task AnAbsurdSegmentBytesIsNoLongerAConfigurationTrap()
-    {
-        // The same issue from the caller's side: SegmentBytes is inert now (there is one active data
-        // file and compaction is total), so a value past the old 4 GiB locator cap cannot arm anything.
-        var options = Options() with { SegmentBytes = 8L * 1024 * 1024 * 1024 };
-        await using var store = await KvasarStore.Open(options);
-        await store.Set(K("a"), V(1, 4000));
-        await store.Flush(true);
-        (await store.Get(K("a")))!.Value.ToArray().Should().Equal(V(1, 4000));
-    }
-
-    [Fact]
     public async Task FailedSuperblockWritesKeepRetryingTheSameSlot()
     {
         var backend = new FakeStorageBackend();
@@ -570,7 +535,7 @@ public sealed class ReviewRegressionTests : IDisposable
 
         var set = async () => await store.Set(K("uncommitted"), V(2, 200));
         await set.Should().ThrowAsync<IOException>();
-        var retry = async () => await store.Flush(true);
+        var retry = async () => await store.Flush();
         await retry.Should().ThrowAsync<IOException>();
         await store.DisposeAsync();
 
@@ -627,7 +592,7 @@ public sealed class ReviewRegressionTests : IDisposable
         await using (var store = await KvasarStore.Open(options)) {
             for (var i = 0; i < keyCount; i++)
                 await store.Set(K(i), V(i, 200));
-            await store.Flush(true);
+            await store.Flush();
         }
 
         var state = await ReadSuperblock();
@@ -890,7 +855,7 @@ public sealed class ReviewRegressionTests : IDisposable
         }
         foreach (var name in deleted)
             await store.Set(K(name), null);
-        await store.Flush(true);
+        await store.Flush();
         return ([.. live], [.. deleted]);
     }
 

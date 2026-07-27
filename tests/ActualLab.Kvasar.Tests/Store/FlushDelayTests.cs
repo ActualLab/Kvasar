@@ -70,7 +70,7 @@ public class FlushDelayTests : IDisposable
         await using (var store = await KvasarStore.Open(Options(basePath, TimeSpan.FromSeconds(30)))) {
             for (var i = 0; i < 100; i++)
                 await store.Set(Key(i), Value(i, 250));
-            await store.Flush(true);
+            await store.Flush();
         }
 
         await using var reopened = await KvasarStore.Open(Options(basePath, TimeSpan.FromSeconds(30)));
@@ -107,7 +107,7 @@ public class FlushDelayTests : IDisposable
         await using (var store = await KvasarStore.Open(Options(basePath, TimeSpan.FromSeconds(30)))) {
             for (var i = 0; i < 100; i++)
                 await store.Set(Key(i), Value(i, 220));
-            await store.Flush(false); // everything below 100 is now durable
+            await store.Flush(); // everything below 100 is now durable
             for (var i = 100; i < 300; i++)
                 await store.Set(Key(i), Value(i, 220)); // may or may not survive
             Snapshot(basePath, snapshotDir);
@@ -141,7 +141,7 @@ public class FlushDelayTests : IDisposable
         await using (var store = await KvasarStore.Open(Options(basePath, TimeSpan.FromSeconds(30)))) {
             for (var i = 0; i < 50; i++)
                 await store.Set(Key(i), Value(i, 300));
-            await store.Flush(true);
+            await store.Flush();
             Snapshot(basePath, snapshotDir); // copy while open == killed process
         }
 
@@ -155,7 +155,7 @@ public class FlushDelayTests : IDisposable
 
         await using (var recovered = await KvasarStore.Open(Options(snapshotBase, TimeSpan.FromSeconds(30)))) {
             await recovered.Set(Key(1000), Value(1000, 300));
-            await recovered.Flush(true);
+            await recovered.Flush();
         }
 
         new FileInfo(dataPath).Length.Should().BeGreaterThan(tornLength,
@@ -182,7 +182,7 @@ public class FlushDelayTests : IDisposable
         await using (var reopened = await KvasarStore.Open(Options(basePath, TimeSpan.FromSeconds(30)))) {
             await reopened.Set(Key(1000), Value(1000, 300));
             (await reopened.Get(Key(0))).Should().NotBeNull("a clean close must persist everything");
-            await reopened.Flush(true);
+            await reopened.Flush();
         }
 
         // The reopen appended into the same file: no page id was burned, so nothing was skipped either.
@@ -198,7 +198,7 @@ public class FlushDelayTests : IDisposable
         await using var store = await KvasarStore.Open(Options(basePath, flushDelay));
         for (var i = 0; i < count; i++)
             await store.Set(Key(i), Value(i, valueSize));
-        await store.Flush(false);
+        await store.Flush();
         return store.Stats.FileBytes;
     }
 
@@ -236,7 +236,6 @@ public class FlushDelayTests : IDisposable
             EncryptionKey = _key,
             PageSize = 4096,
             PageCacheBytes = 4L * 1024 * 1024,
-            SegmentBytes = 64 * 1024 * 1024,
             FlushDelay = flushDelay,
         };
 

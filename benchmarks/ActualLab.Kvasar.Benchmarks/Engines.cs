@@ -48,7 +48,7 @@ public sealed class KvasarEngine(
             DisableEncryption = !encrypt,
             PageSize = pageSize,
             PageCacheBytes = pageCacheBytes,
-            SegmentBytes = 16 * 1024 * 1024,
+            Durability = KvasarDurability.Flushed,
         };
         if (flushDelay is { } d)
             options = options with { FlushDelay = d };
@@ -67,7 +67,7 @@ public sealed class KvasarEngine(
     }
 
     public ValueTask WriteOne(byte[] key, byte[] value) => _store.Set(key, value);
-    public ValueTask FlushDurable() => _store.Flush(true);
+    public ValueTask FlushDurable() => _store.Flush();
 
     public async ValueTask<byte[]?> Get(byte[] key)
     {

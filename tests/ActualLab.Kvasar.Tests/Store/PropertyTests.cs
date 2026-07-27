@@ -35,7 +35,6 @@ public class PropertyTests : IDisposable
         EncryptionKey = _key,
         DisableEncryption = !encrypt,
         PageSize = PageSize,
-        SegmentBytes = 16 * 1024,          // small ⇒ segments roll frequently
         CompactionMinBytes = 1024,         // small ⇒ compaction actually has work
         CompactionDeadRatio = 0.3,
     };
@@ -133,7 +132,7 @@ public class PropertyTests : IDisposable
             }
         }
         else if (r < 94) {
-            await store.Flush(rnd.Next(2) == 0);
+            await store.Flush();
         }
         else if (r < 98) {
             await store.Compact();
