@@ -89,28 +89,34 @@ public sealed class PagedFile : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(cache);
 
         try {
-            var headerBytes = new byte[KvasarConstants.SegmentHeaderSize];
-            await file.ReadExact(0, headerBytes, cancellationToken).ConfigureAwait(false);
-            var header = SegmentHeader.Read(headerBytes);
-            if (header.FormatVer != formatVer)
-                throw new KvasarCorruptException("Data file format version mismatch.");
-            if (header.PageSize < KvasarConstants.MinPageSize || header.PageSize > KvasarConstants.MaxPageSize)
-                throw new KvasarCorruptException("Data file page size is out of range.");
+            return await OpenCore(
+                file, cipherFactory, formatVer, cache, commitLength, cacheId, 0, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch {
+            await file.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
 
-            var onDiskPageSize = header.PageSize + cipherFactory.Overhead;
-            var bodyLength = Math.Max(0, file.Length - KvasarConstants.SegmentHeaderSize);
-            // Rounded up, not down: a torn trailing page burns its page id rather than getting overwritten.
-            // The nonce is a pure function of (fileSalt, pageId), so re-issuing that id would reuse it.
-            var pageCount = (bodyLength + onDiskPageSize - 1) / onDiskPageSize;
-            var wholePagesLength = KvasarConstants.SegmentHeaderSize + bodyLength / onDiskPageSize * onDiskPageSize;
-            if (commitLength < 0)
-                commitLength = wholePagesLength;
-            else if (commitLength < KvasarConstants.SegmentHeaderSize || commitLength > wholePagesLength)
-                throw new KvasarCorruptException("Committed extent is outside the data file.");
-            else if ((commitLength - KvasarConstants.SegmentHeaderSize) % onDiskPageSize != 0)
-                throw new KvasarCorruptException("Committed extent is not page-aligned.");
+    public static async ValueTask<PagedFile> OpenOrCreateFree(
+        IStorageFile file, uint fileId, int pageSize,
+        IPageCipherFactory cipherFactory, uint formatVer, PageCache cache,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(file);
+        ArgumentNullException.ThrowIfNull(cipherFactory);
+        ArgumentNullException.ThrowIfNull(cache);
+        if (pageSize < KvasarConstants.MinPageSize || pageSize > KvasarConstants.MaxPageSize)
+            throw new ArgumentOutOfRangeException(nameof(pageSize));
 
-            return new PagedFile(file, cipherFactory, cache, header, pageCount, commitLength, cacheId);
+        try {
+            return await OpenCore(
+                file, cipherFactory, formatVer, cache, -1, fileId, pageSize, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (KvasarCorruptException) {
+            return await Create(file, fileId, pageSize, cipherFactory, formatVer, cache).ConfigureAwait(false);
         }
         catch {
             await file.DisposeAsync().ConfigureAwait(false);
@@ -323,6 +329,36 @@ public sealed class PagedFile : IAsyncDisposable
     }
 
     // Private methods
+
+    private static async ValueTask<PagedFile> OpenCore(
+        IStorageFile file, IPageCipherFactory cipherFactory, uint formatVer, PageCache cache,
+        long commitLength, uint? cacheId, int expectedPageSize, CancellationToken cancellationToken)
+    {
+        var headerBytes = new byte[KvasarConstants.SegmentHeaderSize];
+        await file.ReadExact(0, headerBytes, cancellationToken).ConfigureAwait(false);
+        var header = SegmentHeader.Read(headerBytes);
+        if (header.FormatVer != formatVer)
+            throw new KvasarCorruptException("Data file format version mismatch.");
+        if (header.PageSize < KvasarConstants.MinPageSize || header.PageSize > KvasarConstants.MaxPageSize)
+            throw new KvasarCorruptException("Data file page size is out of range.");
+        if (expectedPageSize > 0 && header.PageSize != expectedPageSize)
+            throw new KvasarCorruptException("Data file page size does not match the store's.");
+
+        var onDiskPageSize = header.PageSize + cipherFactory.Overhead;
+        var bodyLength = Math.Max(0, file.Length - KvasarConstants.SegmentHeaderSize);
+        // Rounded up, not down: a torn trailing page burns its page id rather than getting overwritten.
+        // The nonce is a pure function of (fileSalt, pageId), so re-issuing that id would reuse it.
+        var pageCount = (bodyLength + onDiskPageSize - 1) / onDiskPageSize;
+        var wholePagesLength = KvasarConstants.SegmentHeaderSize + bodyLength / onDiskPageSize * onDiskPageSize;
+        if (commitLength < 0)
+            commitLength = wholePagesLength;
+        else if (commitLength < KvasarConstants.SegmentHeaderSize || commitLength > wholePagesLength)
+            throw new KvasarCorruptException("Committed extent is outside the data file.");
+        else if ((commitLength - KvasarConstants.SegmentHeaderSize) % onDiskPageSize != 0)
+            throw new KvasarCorruptException("Committed extent is not page-aligned.");
+
+        return new PagedFile(file, cipherFactory, cache, header, pageCount, commitLength, cacheId);
+    }
 
     private async ValueTask<ReadOnlyMemory<byte>> ReadAndCache(long pageId, CancellationToken cancellationToken)
     {

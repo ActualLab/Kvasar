@@ -69,20 +69,18 @@ public sealed class DataLog : IAsyncDisposable
     {
         RequireArguments(slotFiles, mintCacheId);
         var slots = new SlotState[SlotCount];
-        var openCount = 0;
         try {
             for (var i = 0; i < SlotCount; i++) {
                 var file = await PagedFile
                     .Create(slotFiles[i], mintCacheId(), pageSize, cipherFactory, formatVer, cache)
                     .ConfigureAwait(false);
                 slots[i] = new SlotState { Slot = i, File = file };
-                openCount = i + 1;
             }
             if (slots[0].File.FileId == slots[1].File.FileId)
                 throw new InvalidOperationException("mintCacheId returned the same id twice.");
         }
         catch {
-            await DisposeOpened(slots, openCount).ConfigureAwait(false);
+            await DisposeOpened(slots).ConfigureAwait(false);
             throw;
         }
         return new DataLog(pageSize, maxInlineValueBytes, mintCacheId, slots, 0);
@@ -98,26 +96,28 @@ public sealed class DataLog : IAsyncDisposable
             throw new ArgumentOutOfRangeException(nameof(activeSlot));
 
         var slots = new SlotState[SlotCount];
-        var openCount = 0;
         try {
-            for (var i = 0; i < SlotCount; i++) {
-                // Only the active slot has a committed extent; the other is free or an abandoned compaction
-                // target, so nothing in it is referenced and its whole-page end is extent enough.
-                // Mint the PageCache id rather than inheriting the header's: the header is unauthenticated
-                // plaintext, and the cache holds *decrypted* pages keyed by (fileId, pageId), so two files
-                // claiming one id would serve each other's plaintext past the point AES-GCM could catch it.
-                var file = await PagedFile
-                    .Open(slotFiles[i], cipherFactory, formatVer, cache,
-                        i == activeSlot ? activeCommitLength : -1, mintCacheId(), cancellationToken)
-                    .ConfigureAwait(false);
-                slots[i] = new SlotState { Slot = i, File = file };
-                openCount = i + 1;
-                if (file.PageSize != pageSize)
-                    throw new KvasarCorruptException("Data file page size does not match the store's.");
-            }
+            // Mint the PageCache id rather than inheriting the header's: the header is unauthenticated
+            // plaintext, and the cache holds *decrypted* pages keyed by (fileId, pageId), so two files
+            // claiming one id would serve each other's plaintext past the point AES-GCM could catch it.
+            var activeFile = await PagedFile
+                .Open(slotFiles[activeSlot], cipherFactory, formatVer, cache,
+                    activeCommitLength, mintCacheId(), cancellationToken)
+                .ConfigureAwait(false);
+            slots[activeSlot] = new SlotState { Slot = activeSlot, File = activeFile };
+            if (activeFile.PageSize != pageSize)
+                throw new KvasarCorruptException("Data file page size does not match the store's.");
+
+            var freeSlot = 1 - activeSlot;
+            var freeFile = await PagedFile
+                .OpenOrCreateFree(
+                    slotFiles[freeSlot], mintCacheId(), pageSize, cipherFactory, formatVer, cache,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            slots[freeSlot] = new SlotState { Slot = freeSlot, File = freeFile };
         }
         catch {
-            await DisposeOpened(slots, openCount).ConfigureAwait(false);
+            await DisposeOpened(slots).ConfigureAwait(false);
             throw;
         }
 
@@ -602,9 +602,10 @@ public sealed class DataLog : IAsyncDisposable
             throw new ArgumentException($"Exactly {SlotCount} slot files are required.", nameof(slotFiles));
     }
 
-    private static async ValueTask DisposeOpened(SlotState[] slots, int count)
+    private static async ValueTask DisposeOpened(SlotState[] slots)
     {
-        for (var i = 0; i < count; i++)
-            await slots[i].File.DisposeAsync().ConfigureAwait(false);
+        foreach (var slot in slots)
+            if (slot is not null)
+                await slot.File.DisposeAsync().ConfigureAwait(false);
     }
 }

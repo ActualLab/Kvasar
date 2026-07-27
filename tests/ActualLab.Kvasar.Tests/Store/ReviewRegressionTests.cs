@@ -4,6 +4,7 @@ using System.Linq;
 using System.Text;
 using ActualLab.Kvasar.Internal;
 using ActualLab.Kvasar.Internal.Storage;
+using ActualLab.Kvasar.Tests.Storage;
 
 namespace ActualLab.Kvasar.Tests.Store;
 
@@ -557,6 +558,96 @@ public sealed class ReviewRegressionTests : IDisposable
         (await store.Get(K("a")))!.Value.ToArray().Should().Equal(V(1, 4000));
     }
 
+    [Fact]
+    public async Task FailedSuperblockWritesKeepRetryingTheSameSlot()
+    {
+        var backend = new FakeStorageBackend();
+        var options = Options(encrypt: false) with { StorageBackend = backend };
+        var store = await KvasarStore.Open(options);
+        await store.Set(K("kept"), V(1, 200));
+        backend.ProcessKill();
+
+        var before = await ReadSuperblock(backend);
+        var writeOffsets = new List<long>();
+        backend.WriteFailure = (path, offset, _) => {
+            if (!string.Equals(path, KvsPath, StringComparison.Ordinal) || offset < Superblock.HeaderSize)
+                return null;
+            writeOffsets.Add(offset);
+            return 16;
+        };
+
+        var set = async () => await store.Set(K("uncommitted"), V(2, 200));
+        await set.Should().ThrowAsync<IOException>();
+        var retry = async () => await store.Flush(true);
+        await retry.Should().ThrowAsync<IOException>();
+        await store.DisposeAsync();
+
+        writeOffsets.Should().NotBeEmpty();
+        writeOffsets.Distinct().Should().ContainSingle("every retry must overwrite the already-torn slot");
+        var after = await ReadSuperblock(backend);
+        after.Generation.Should().Be(before.Generation);
+        after.DataSlot.Should().Be(before.DataSlot);
+        backend.WriteFailure = null;
+        await using var reopened = await KvasarStore.Open(options);
+        (await reopened.Get(K("kept")))!.Value.ToArray().Should().Equal(V(1, 200));
+    }
+
+    [Fact]
+    public async Task FailedSlotSwitchCommitProtectsTheReferencedDataSlot()
+    {
+        var backend = new FakeStorageBackend();
+        var options = Options(encrypt: false) with {
+            StorageBackend = backend,
+            CompactionMinBytes = long.MaxValue,
+        };
+        var store = await KvasarStore.Open(options);
+        for (var i = 0; i < 80; i++)
+            await store.Set(K(i), V(i, 200));
+        for (var i = 0; i < 80; i++)
+            await store.Set(K(i), V(i + 1, 200));
+        backend.ProcessKill();
+
+        var state = await ReadSuperblock(backend);
+        var referencedPath = DataPath(state.DataSlot);
+        backend.WriteFailure = (path, offset, _) =>
+            string.Equals(path, KvsPath, StringComparison.Ordinal) && offset >= Superblock.HeaderSize
+                ? 16
+                : null;
+
+        var first = async () => await store.Compact();
+        await first.Should().ThrowAsync<IOException>();
+        var referencedBytes = backend.GetBytes(referencedPath);
+
+        var overwrite = async () => await store.Set(K(0), V(100, 200));
+        await overwrite.Should().ThrowAsync<IOException>();
+        var second = async () => await store.Compact();
+        await second.Should().ThrowAsync<IOException>();
+        backend.GetBytes(referencedPath).Should().Equal(
+            referencedBytes, "a failed safety commit must stop compaction before the referenced slot is recycled");
+        await store.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task ATruncatedInactiveDataSlotDoesNotVetoAdoption()
+    {
+        const int keyCount = 80;
+        var options = Options();
+        await using (var store = await KvasarStore.Open(options)) {
+            for (var i = 0; i < keyCount; i++)
+                await store.Set(K(i), V(i, 200));
+            await store.Flush(true);
+        }
+
+        var state = await ReadSuperblock();
+        var inactivePath = DataPath(1 - state.DataSlot);
+        Truncate(inactivePath, 0);
+
+        await using var reopened = await KvasarStore.Open(options);
+        for (var i = 0; i < keyCount; i++)
+            (await reopened.Get(K(i)))!.Value.ToArray().Should().Equal(V(i, 200));
+        new FileInfo(inactivePath).Length.Should().BeGreaterThanOrEqualTo(KvasarConstants.SegmentHeaderSize);
+    }
+
     // Private methods
 
     private string BasePath => Path.Combine(_dir, "store");
@@ -580,6 +671,14 @@ public sealed class ReviewRegressionTests : IDisposable
     private async Task<SuperblockState> ReadSuperblock()
     {
         await using var file = await FileStorageBackend.Instance.Open(KvsPath);
+        var read = await new Superblock(_key, FormatVer).Read(file);
+        read.Status.Should().Be(SuperblockStatus.Ok);
+        return read.Newest!.Value;
+    }
+
+    private async Task<SuperblockState> ReadSuperblock(FakeStorageBackend backend)
+    {
+        await using var file = await backend.Open(KvsPath);
         var read = await new Superblock(_key, FormatVer).Read(file);
         read.Status.Should().Be(SuperblockStatus.Ok);
         return read.Newest!.Value;

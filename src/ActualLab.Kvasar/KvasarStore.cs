@@ -575,8 +575,9 @@ public sealed class KvasarStore : IAsyncDisposable
         // Confirm the adoption by re-writing it as the next generation. That overwrites the slot below it,
         // so the free .kdat/.kidx stop being referenced by any valid superblock slot and the rotation
         // below — and any later compaction — may recycle them (§3.2).
-        _generation++;
-        await _superblock.Write(_superblockFile!, state with { Generation = _generation }).ConfigureAwait(false);
+        var generation = _generation + 1;
+        await _superblock.Write(_superblockFile!, state with { Generation = generation }).ConfigureAwait(false);
+        _generation = generation;
         _slotSwitchGeneration = 0;
 
         if (!isIndexComplete || _data.BurnedBytes > 0) {
@@ -764,10 +765,11 @@ public sealed class KvasarStore : IAsyncDisposable
             await RotateIndex(_data.ActiveCommittedOffset).ConfigureAwait(false);
 
         var indexLog = _indexLogs[_indexSlot];
-        _generation++;
+        var generation = _generation + 1;
         await _superblock.Write(_superblockFile!, new SuperblockState(
-            _generation, (byte)_data.ActiveSlot, dataCommitLength,
+            generation, (byte)_data.ActiveSlot, dataCommitLength,
             (byte)_indexSlot, indexLog.Length, _data.LiveBytes, _data.DeadBytes)).ConfigureAwait(false);
+        _generation = generation;
         // The index goes out last and is never flushed (§3.3): a delta the superblock named but that never
         // reached the file simply shortens the prefix recovery trusts, which costs replay time only.
         await indexLog.Flush().ConfigureAwait(false);
@@ -885,8 +887,8 @@ public sealed class KvasarStore : IAsyncDisposable
         if (_isCompacting)
             return;
         // A data file may be recycled only once no valid superblock slot names it, which with two slots
-        // means one further commit has to have passed since the last switch (§3.2).
-        if (_generation <= _slotSwitchGeneration)
+        // means the switch commit and one further commit both have to pass (§3.2).
+        while (_isSlotSwitchPending || _generation <= _slotSwitchGeneration)
             await Commit(true).ConfigureAwait(false);
 
         _isCompacting = true;

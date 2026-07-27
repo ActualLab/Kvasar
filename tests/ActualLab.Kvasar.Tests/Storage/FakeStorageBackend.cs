@@ -29,11 +29,13 @@ public sealed class FakeStorageBackend : IStorageBackend
 
     private readonly ConcurrentDictionary<string, FileState> _files = new(StringComparer.Ordinal);
 
+    public Func<string, long, int, int?>? WriteFailure { get; set; }
+
     public ValueTask<IStorageFile> Open(string path, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var state = _files.GetOrAdd(path, _ => new FileState());
-        return new ValueTask<IStorageFile>(new FakeStorageFile(state));
+        return new ValueTask<IStorageFile>(new FakeStorageFile(this, path, state));
     }
 
     public bool Exists(string path)
@@ -162,7 +164,7 @@ public sealed class FakeStorageBackend : IStorageBackend
 
     // Nested types
 
-    private sealed class FakeStorageFile(FileState state) : IStorageFile
+    private sealed class FakeStorageFile(FakeStorageBackend backend, string path, FileState state) : IStorageFile
     {
         public long Length {
             get {
@@ -187,6 +189,16 @@ public sealed class FakeStorageBackend : IStorageBackend
             ArgumentOutOfRangeException.ThrowIfNegative(offset);
             var at = ToInt(offset);
             _ = ToInt(offset + buffer.Length);
+            if (backend.WriteFailure?.Invoke(path, offset, buffer.Length) is { } landedLength) {
+                ArgumentOutOfRangeException.ThrowIfNegative(landedLength);
+                ArgumentOutOfRangeException.ThrowIfGreaterThan(landedLength, buffer.Length);
+                lock (state.Lock) {
+                    var landed = buffer[..landedLength].ToArray();
+                    state.Ops.Add(new WriteOp(at, landed));
+                    state.Merged.Write(at, landed);
+                }
+                throw new IOException("Injected write failure.");
+            }
             lock (state.Lock) {
                 state.Ops.Add(new WriteOp(at, buffer.ToArray()));
                 state.Merged.Write(at, buffer.Span);
