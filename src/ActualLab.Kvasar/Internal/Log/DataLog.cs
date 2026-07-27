@@ -59,6 +59,8 @@ public sealed class DataLog : IAsyncDisposable
     // Recovery adds it to the restored dead-byte counter.
     public long BurnedBytes { get; private set; }
 
+    public long ActiveLiveBytes => _active.LiveBytes;
+    public long ActiveDeadBytes => _active.DeadBytes;
     public long LiveBytes => _slots[0].LiveBytes + _slots[1].LiveBytes;
     public long DeadBytes => _slots[0].DeadBytes + _slots[1].DeadBytes;
     public long FileBytes => _slots[0].File.Length + _slots[1].File.Length;
@@ -330,6 +332,12 @@ public sealed class DataLog : IAsyncDisposable
         await SealTail(_active).ConfigureAwait(false);
         if (_target is { } target)
             await SealTail(target).ConfigureAwait(false);
+    }
+
+    public ValueTask SealCompactionTarget()
+    {
+        var target = _target ?? throw new InvalidOperationException("No compaction is in progress.");
+        return SealTail(target);
     }
 
     public async ValueTask Flush()
