@@ -740,9 +740,15 @@ authenticated; that gap is recorded in `REVIEW-R4.md` rather than implied away.
 reconstructs the best available cache beyond it. A readable record header fixes the damaged record's
 full span before its pages are decoded, so an interior page failure resumes at the record's end rather
 than treating continuation bytes as a new record. If the header page itself is unreadable, replay probes
-later page boundaries until a complete record decodes; a failed decode at a page boundary advances
-rather than ending the replay. This preserves §5.3's read-miss semantics for damage outside the
-candidate's newly authenticated window without letting replay decide whether a superblock is adoptable.
+later page boundaries, but a decoded record alone is not enough to resume. Starting at that boundary,
+records must decode back-to-back until the chain ends exactly on a page boundary or the remainder of its
+final page is all-zero padding. Nothing from the candidate is yielded until that whole chain tiles; a
+failure rejects the boundary and probing continues at the next page. Before allocating a spanning record
+or walking its pages, replay also requires its declared length to fit the remaining replay extent and its
+value-kind byte to be defined. This preserves §5.3's read-miss semantics for damage outside the
+candidate's newly authenticated window without letting replay decide whether a superblock is adoptable,
+without promoting an isolated record-shaped run in continuation bytes, and without quadratic copying
+from candidates whose cheap header fields are already invalid.
 
 ### 14.5 Smaller notes
 
