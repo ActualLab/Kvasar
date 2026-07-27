@@ -186,18 +186,46 @@ the store is open.**
 
 ### 3.1 The superblock — `<base>.kvs`
 
-Two fixed-size slots, written alternately. Each slot is a complete, self-contained commit record:
+The file is exactly 1088 bytes:
+```
+offset  size  field
+0       4     magic "KSUP"
+4       4     data format version, little-endian uint
+8       12    KCV nonce
+20      16    KCV tag over "kvasar:kcv/v1", AAD = format version
+36      28    reserved, zero
+64      512   slot 0
+576     512   slot 1
+```
 
+Each slot is a complete authenticated commit record:
 ```
-magic, formatVer
-generation         u64   monotonic; the highest valid slot wins
-dataSlot           u8    which .kdat is active
-dataCommitLength   u64   committed logical end of the active .kdat
-indexSlot          u8    which .kidx is active
-indexCommitLength  u64   how far the index is known consistent
-liveBytes, deadBytes     accounting, drives the compaction trigger
-MAC                      AES-GCM tag over all of the above, under the derived key
+offset  size  field
+0       12    fresh AES-GCM nonce
+12      484   ciphertext of the plaintext block below
+496     16    AES-GCM tag, AAD = format version
 ```
+
+The 484-byte plaintext block is:
+```
+offset  size  field
+0       8     generation, ulong
+8       1     dataSlot
+9       1     indexSlot
+10      6     reserved, zero
+16      8     dataCommitLength, signed physical byte extent
+24      8     indexCommitLength, signed physical byte extent
+32      8     liveBytes, signed
+40      8     deadBytes, signed
+48      8     dataAuthenticationFloor, signed physical byte offset
+56      8     nextKeyId, ulong and never zero
+64      420   reserved, zero
+```
+
+`dataAuthenticationFloor` is the lower bound of the page window this generation still needs checked
+when no predecessor slot survives. For an ordinary commit it is the preceding committed extent in the
+same data slot; after a slot switch it is the 64-byte data header. `nextKeyId` is the first identity not
+yet minted. Both fields were added in data format 2 without changing the slot size.
 
 Slot for generation *G* is `G mod 2`, and this is **checked on read**, not merely followed on write:
 an authenticated blob is position-independent, so a slot byte-copied into the other position would
@@ -253,7 +281,20 @@ whole class unrepresentable.
 
 ### 3.2 The data files — `<base>.N.kdat`
 
-Append-only, page-structured, AES-GCM per page with nonce = f(`fileSalt`, `pageId`), as today.
+Append-only, page-structured, AES-GCM per page with nonce = f(`fileSalt`, `pageId`).
+
+Each file starts with the existing 64-byte plaintext `KVSR` header. Every decrypted `PageSize`-byte
+page then has this data-format-2 layout:
+```
+offset  size          field
+0       1             flags: bit 0 continuation, bit 1 hasRecordStart
+1       3             reserved, zero
+4       4             firstRecordOffset, signed little-endian; -1 when absent
+8       PageSize - 8  record data
+```
+The entire page, including the frame, is authenticated by the existing page tag. Logical record
+offsets concatenate only the `PageSize - 8` record-data areas. The physical on-disk stride remains
+`PageSize + cipher.Overhead`.
 
 Two rules govern them:
 
@@ -394,7 +435,10 @@ not survive, recovery rejects the index and derives it again from data.
 1. read both superblock slots; discard any failing its MAC
    none valid  ⇒  store is absent or unopenable  ⇒  wipe & rebuild
 2. G* := valid slot with the highest generation
-3. verify the data pages in (L_{G*-1}, L_{G*}] authenticate
+3. verify the data pages from the candidate's authentication bound through L_G* authenticate
+   bound := L_{G*-1} when a same-data-slot predecessor survives
+         := the 64-byte data header after a data-slot switch
+         := candidate.dataAuthenticationFloor when no predecessor survives
    any failure  ⇒  discard G*, retry with the other slot
    NB: a slot naming more data than the file holds makes PagedFile.Open throw
        KvasarCorruptException. Under Buffered that is the *expected* path, not corruption —
@@ -403,10 +447,12 @@ not survive, recovery rejects the index and derives it again from data.
 5. authenticate the index prefix named by G*; on absence, old layout, or MAC failure treat it as empty;
    otherwise load it and replay data from its stamp to L_{G*}; if anything was replayed, rotate the
    index (§3.3) — NOT "if the open was unclean" (§14.1)
-6. resume appending at ceil(physicalLength / pageSize) — never at L_{G*}
+6. resume at pageId = ceil((physicalLength - 64) / (PageSize + cipher.Overhead)), never at L_G*
+   the corresponding logical record offset is pageId * (PageSize - 8)
 ```
 
 Step 3 costs one commit window of authentication — bounded by `FlushDelay`, so a few MB at most.
+The floor carried by each slot preserves that bound when the other superblock slot is unreadable.
 
 Step 6 is the nonce-safety rule and deserves its own statement. A crash mid-append leaves pages
 `P..P+k` physically present but uncommitted. Recovery rebuilds from the committed extent (which ends
@@ -650,10 +696,12 @@ is changing anyway).
 
 - **A storage-layer rewrite.** `SegmentSet`, `PagedSegment`, `IndexFile` and `KvasarStore`'s
   open/flush/compact paths all change. Crypto (M1) and the record codec are untouched.
-- **A format change.** `formatVer` bumps; existing stores are wiped. Cheap for a cache, but a
-  one-way door for anyone already running v1.
+- **A format change.** Data format 2 adds authenticated page frames and two superblock fields. The
+  dedicated format-1 importer rewrites every recoverable live record into a fresh format-2 file set;
+  other mismatches remain cache wipes.
 - **Authentication work at open.** The normal path decrypts only the pages between the older and newer
-  committed extents; a data-slot switch or missing older candidate requires the whole candidate extent.
+  committed extents; a data-slot switch starts at the data header, and a missing predecessor starts at
+  the candidate's persisted authentication floor.
   Index MAC verification is folded into the index read already required at open.
 - **One small index write per commit.** The rolling HMAC avoids rescanning the index; committing writes
   one 16-byte generation-parity tag in its header.
@@ -732,23 +780,22 @@ the candidate's added window `(L_previous, L_candidate]`. A page failure rejects
 tries the older superblock. If the candidates name **different data slots** — the first open after a
 compaction switch — the pass authenticates the candidate's whole committed extent instead: that slot was
 truncated to its header by `BeginCompaction` and restarted under a fresh salt, so no burned page can lie
-below its extent and all of it is checkable. If there is **no older candidate at all** there is no floor
-to bound a window against and the extent may legitimately contain a burned page, so nothing is
-authenticated; that gap is recorded in `REVIEW-R4.md` rather than implied away.
+below its extent and all of it is checkable. Data format 2 also persists
+`dataAuthenticationFloor` in every superblock slot. If there is **no older candidate at all**, adoption
+authenticates from that floor through the candidate extent. The ordinary writer records the preceding
+same-slot committed extent; a slot switch records the data header. Thus losing the predecessor no longer
+turns the validation window into either the whole historical file or an empty check.
 
 `DataLog.ScanFrom` has a different contract: an index rebuild skips an unreadable record and
 reconstructs the best available cache beyond it. A readable record header fixes the damaged record's
 full span before its pages are decoded, so an interior page failure resumes at the record's end rather
-than treating continuation bytes as a new record. If the header page itself is unreadable, replay probes
-later page boundaries, but a decoded record alone is not enough to resume. Starting at that boundary,
-records must decode back-to-back until the chain ends exactly on a page boundary or the remainder of its
-final page is all-zero padding. Nothing from the candidate is yielded until that whole chain tiles; a
-failure rejects the boundary and probing continues at the next page. Before allocating a spanning record
-or walking its pages, replay also requires its declared length to fit the remaining replay extent and its
-value-kind byte to be defined. This preserves §5.3's read-miss semantics for damage outside the
-candidate's newly authenticated window without letting replay decide whether a superblock is adoptable,
-without promoting an isolated record-shaped run in continuation bytes, and without quadratic copying
-from candidates whose cheap header fields are already invalid.
+than treating continuation bytes as a new record. If the header page itself is unreadable, replay walks
+forward one page at a time and resumes only at an authenticated `firstRecordOffset` from the page frame.
+Continuation pages explicitly say that offset zero belongs to an earlier record, so caller-controlled
+bytes are never parsed as a candidate header. Every page is read at most once and there is no tiling
+heuristic or repeated candidate copying. This preserves §5.3's read-miss semantics for damage outside
+the candidate's newly authenticated window without letting replay decide whether a superblock is
+adoptable.
 
 ### 14.5 Smaller notes
 

@@ -106,7 +106,7 @@ public sealed class ReadCancellationTests : IDisposable
     private async Task<int> ActiveDataSlot()
     {
         await using var file = await FileStorageBackend.Instance.Open(BasePath + ".kvs");
-        var read = await new Superblock(_key, 1).Read(file);
+        var read = await new Superblock(_key, KvasarConstants.DataFormatVersion).Read(file);
         return read.Newest!.Value.DataSlot;
     }
 

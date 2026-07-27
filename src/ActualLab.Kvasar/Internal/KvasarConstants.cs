@@ -3,6 +3,9 @@ namespace ActualLab.Kvasar.Internal;
 /// <summary>Repo-wide on-disk constants shared by the paging, log and index layers.</summary>
 public static class KvasarConstants
 {
+    public const uint DataFormatVersion = 2;
+    public const uint PreviousDataFormatVersion = 1;
+
     // File magics (4 ASCII bytes each).
     public static ReadOnlySpan<byte> KLogMagic => "KVSR"u8;
     public static ReadOnlySpan<byte> KIdxMagic => "KIDX"u8;
@@ -15,6 +18,7 @@ public static class KvasarConstants
 
     // Segment file header is a fixed-size plaintext prefix; encrypted pages follow it.
     public const int SegmentHeaderSize = 64;
+    public const int DataPageHeaderSize = 8;
 
     // Record sizing. RecordCodec sums key + value + a <= 16-byte header in int, so both parts are
     // capped to keep that sum from wrapping into a negative length.

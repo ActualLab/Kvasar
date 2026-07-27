@@ -36,7 +36,9 @@ public readonly record struct SuperblockState(
     byte IndexSlot,
     long IndexCommitLength,
     long LiveBytes,
-    long DeadBytes);
+    long DeadBytes,
+    long DataAuthenticationFloor = KvasarConstants.SegmentHeaderSize,
+    ulong NextKeyId = 1);
 
 /// <summary>
 /// The outcome of reading <c>&lt;base&gt;.kvs</c>: a status the caller must branch on, plus every slot
@@ -73,7 +75,9 @@ public readonly record struct SuperblockReadResult(SuperblockStatus Status, Supe
 //   24    8  IndexCommitLength  long
 //   32    8  LiveBytes          long
 //   40    8  DeadBytes          long
-//   48  436  Reserved           zero
+//   48    8  DataAuthenticationFloor long
+//   56    8  NextKeyId          ulong
+//   64  420  Reserved           zero
 //
 // A slot carries no magic and no formatVer of its own — the header identifies the file, and formatVer
 // is bound into every slot as GCM AAD. That leaves no unauthenticated byte in a slot, so a write torn
@@ -111,6 +115,8 @@ public sealed class Superblock : IDisposable
     private const int IndexCommitLengthOffset = 24;
     private const int LiveBytesOffset = 32;
     private const int DeadBytesOffset = 40;
+    private const int DataAuthenticationFloorOffset = 48;
+    private const int NextKeyIdOffset = 56;
 
     private static ReadOnlySpan<byte> KcvPlaintext => "kvasar:kcv/v1"u8;
 
@@ -177,8 +183,12 @@ public sealed class Superblock : IDisposable
         // Commit lengths only: LiveBytes/DeadBytes are an advisory compaction hint, and this runs inside
         // Commit, so rejecting them here would turn an accounting bug into a failed write. Recovery
         // already degrades to deriving the accounting when the persisted pair makes no sense.
-        if (state.DataCommitLength < 0 || state.IndexCommitLength < 0)
-            throw new ArgumentOutOfRangeException(nameof(state), "Commit lengths must be non-negative.");
+        if (state.DataCommitLength < 0 || state.IndexCommitLength < 0
+            || state.DataAuthenticationFloor < KvasarConstants.SegmentHeaderSize
+            || state.DataAuthenticationFloor > state.DataCommitLength
+            || state.NextKeyId == 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(state), "Commit lengths, authentication floor, or next key identity are invalid.");
 
         var slot = (int)(state.Generation % SlotCount);
         var buffer = new byte[SlotSize];
@@ -283,6 +293,17 @@ public sealed class Superblock : IDisposable
         // when the persisted pair cannot describe the committed extent.
         var liveBytes = BinaryPrimitives.ReadInt64LittleEndian(plain.Slice(LiveBytesOffset, 8));
         var deadBytes = BinaryPrimitives.ReadInt64LittleEndian(plain.Slice(DeadBytesOffset, 8));
+        var dataAuthenticationFloor =
+            BinaryPrimitives.ReadInt64LittleEndian(plain.Slice(DataAuthenticationFloorOffset, 8));
+        var nextKeyId = BinaryPrimitives.ReadUInt64LittleEndian(plain.Slice(NextKeyIdOffset, 8));
+        if (_formatVer == KvasarConstants.PreviousDataFormatVersion) {
+            dataAuthenticationFloor = KvasarConstants.SegmentHeaderSize;
+            nextKeyId = 1;
+        }
+        if (dataAuthenticationFloor < KvasarConstants.SegmentHeaderSize
+            || dataAuthenticationFloor > dataCommitLength
+            || nextKeyId == 0)
+            return null;
 
         return new SuperblockState(
             generation,
@@ -291,7 +312,9 @@ public sealed class Superblock : IDisposable
             indexSlot,
             indexCommitLength,
             liveBytes,
-            deadBytes);
+            deadBytes,
+            dataAuthenticationFloor,
+            nextKeyId);
     }
 
     private void FormatSlot(Span<byte> slot, SuperblockState state)
@@ -311,6 +334,11 @@ public sealed class Superblock : IDisposable
         BinaryPrimitives.WriteInt64LittleEndian(plain.Slice(IndexCommitLengthOffset, 8), state.IndexCommitLength);
         BinaryPrimitives.WriteInt64LittleEndian(plain.Slice(LiveBytesOffset, 8), state.LiveBytes);
         BinaryPrimitives.WriteInt64LittleEndian(plain.Slice(DeadBytesOffset, 8), state.DeadBytes);
+        if (_formatVer != KvasarConstants.PreviousDataFormatVersion) {
+            BinaryPrimitives.WriteInt64LittleEndian(
+                plain.Slice(DataAuthenticationFloorOffset, 8), state.DataAuthenticationFloor);
+            BinaryPrimitives.WriteUInt64LittleEndian(plain.Slice(NextKeyIdOffset, 8), state.NextKeyId);
+        }
 
         Span<byte> aad = stackalloc byte[AadSize];
         BinaryPrimitives.WriteUInt32LittleEndian(aad, _formatVer);

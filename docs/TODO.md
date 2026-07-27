@@ -11,7 +11,7 @@
 >   why commenting out `GetMany`'s single `Prefetch` call made it green. Fixed as R1, with a
 >   deterministic regression test rather than a stress run.
 > - **C1** (64-bit hash collisions) fixed as R12; `EdgeCaseTests.HashCollisionFanOut_KnownBug` is
->   un-skipped and passing. `.kidx` is at layout version 2 (`IndexEntry` 24 → 32 bytes).
+>   un-skipped and passing. `.kidx` is at layout version 3 (`IndexEntry` 24 → 32 bytes).
 > - **T6** (leaked crash workers) fixed as R22 — which also removes the contamination that inflated the
 >   C4 flake rates and the benchmarks. **C5** should be re-checked against a clean machine before any
 >   further work; it may have been a symptom of T6.
@@ -24,15 +24,13 @@
 > A round-3 pass over the fixed code then found 13 more issues (see [`REVIEW-R3.md`](REVIEW-R3.md)),
 > including a **P0 introduced by the R5 fix itself** — adoption authenticated a candidate's whole
 > committed extent, which §5.2.1 guarantees contains an unauthenticatable burned page, so any store whose
-> tail had ever been torn was wiped on the fallback path. Fixed. **The only items still open across both
-> rounds are:**
+> tail had ever been torn was wiped on the fallback path. Fixed. **Only R7 and X3 remain open across
+> both rounds.** C3, previously listed here, is now fully closed by data format 2: the earlier fix
+> restored the different-slot check, and each superblock slot now persists its own authentication floor
+> so predecessorless adoption checks a bounded window.
 >
 > - **R7** — whether replaying a prior `.kdat` incarnation is in scope, or is already covered by
 >   `DESIGN.md` known-limitation 3. Deferred by decision, not by omission.
-> - **C3** — *fixed in `4bc7336`.* This entry previously said the fallback "still authenticates the whole
->   extent … correct, just slow". That was wrong: the check had been removed entirely. See `REVIEW-R3.md`.
->   What remains open is narrower: adoption authenticates nothing when there is **no older superblock
->   candidate at all**, because there is no known-good floor to bound the window against.
 > - **X3** — `PagedFile.Recycle` strands the previous page cipher without zeroizing it. Disposing it at
 >   that point races the R1 fix, so it needs refcounting or quiescence tracking.
 >

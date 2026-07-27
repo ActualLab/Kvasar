@@ -50,6 +50,9 @@ public sealed class KvasarStore : IAsyncDisposable
     private IndexLog[] _indexLogs = [];
     private int _indexSlot;
     private ulong _generation;
+    private ulong _nextKeyId = 1;
+    private int _committedDataSlot;
+    private long _committedDataLength = KvasarConstants.SegmentHeaderSize;
     // The generation of the commit that last moved the active data or index file to the other slot. The
     // freed slot stays referenced by the superblock slot below it, so it may only be recycled once one
     // further commit has pushed that generation out of the pair (§3.2).
@@ -111,6 +114,10 @@ public sealed class KvasarStore : IAsyncDisposable
                 nameof(options), options.PageCacheBytes, "PageCacheBytes must be positive.");
         if (options.IndexEncryption == IndexEncryption.On)
             throw new NotSupportedException("Encrypted index persistence is not supported.");
+        if (string.IsNullOrEmpty(options.Version)
+            && uint.TryParse(options.FormatVersion, out var requestedFormat)
+            && requestedFormat == KvasarConstants.PreviousDataFormatVersion)
+            throw new NotSupportedException("Data format version 1 is read-only and can only be migrated to version 2.");
 
         // The lock is taken here and held across wipe-and-recreate. Releasing it around the wipe would let
         // another process open a fresh store that we then delete out from under it — on Unix the unlink
@@ -346,7 +353,7 @@ public sealed class KvasarStore : IAsyncDisposable
                 continue;
             var loc = Locator.FromPacked(packed);
             if (prefetchPages > 0) {
-                var pageId = loc.Offset / _pageSize;
+                var pageId = loc.Offset / _data.PagePayloadSize;
                 if (loc.FileId != prefetchedFile || pageId >= nextPrefetchPage) {
                     await _data.Prefetch(loc.FileId, pageId, prefetchPages, cancellationToken)
                         .ConfigureAwait(false);
@@ -404,7 +411,7 @@ public sealed class KvasarStore : IAsyncDisposable
                     slotCacheId = slot == 0 ? firstSlotCacheId : secondSlotCacheId;
                 }
 
-                var pageId = loc.Offset / _pageSize;
+                var pageId = loc.Offset / _data.PagePayloadSize;
                 if (loc.FileId != prefetchedFile || pageId >= nextPrefetchPage) {
                     await _data.Prefetch(loc.FileId, pageId, prefetchPages, cancellationToken)
                         .ConfigureAwait(false);
@@ -630,6 +637,18 @@ public sealed class KvasarStore : IAsyncDisposable
             throw new KvasarKeyException(
                 $"The store '{_options.BasePath}' was created under a different encryption key.");
 
+        LegacyRecord[]? legacyRecords = null;
+        if (read.Status == SuperblockStatus.FormatMismatch)
+            legacyRecords = await LegacyStoreImporter.TryRead(
+                    _options,
+                    _storage,
+                    _kvsPath,
+                    _kdatPaths,
+                    _kidxPaths,
+                    _indexMacKey,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
         var isAdopted = false;
         if (read.Status == SuperblockStatus.Ok) {
             // Newest generation first; the older candidate is the fallback for step 3 of §5.2.
@@ -647,6 +666,8 @@ public sealed class KvasarStore : IAsyncDisposable
             await CloseFiles().ConfigureAwait(false);
             WipeFiles();
             await CreateFresh(cancellationToken).ConfigureAwait(false);
+            if (legacyRecords is not null)
+                await ImportLegacy(legacyRecords).ConfigureAwait(false);
         }
         if (_flushDelay > TimeSpan.Zero)
             _flushLoopTask = Task.Run(RunFlushLoop, CancellationToken.None);
@@ -672,38 +693,18 @@ public sealed class KvasarStore : IAsyncDisposable
     private ValueTask AuthenticateCommitWindow(
         SuperblockState state, SuperblockState? previousState, CancellationToken cancellationToken)
     {
-        // Only the pages this generation *adds* may be authenticated. Below the previous committed extent
-        // §5.2.1 deliberately leaves unauthenticatable pages: a torn tail burns its page id and the commit
-        // that follows stamps an extent covering it forever, so authenticating from 0 there fails
-        // permanently once any tail has been torn — and a rejected candidate falls through to the older
-        // one and then to WipeFiles, turning one burned page into total loss on exactly the crash path
-        // §5.2 step 3 exists to survive. Down there a failing page is a read-time miss (§5.3).
+        var floor = state.DataAuthenticationFloor;
         if (previousState is { } previous
             && previous.DataSlot == state.DataSlot
             && previous.DataCommitLength >= KvasarConstants.SegmentHeaderSize
-            && previous.DataCommitLength <= state.DataCommitLength) {
-            var onDiskPageSize = _pageSize + _cipherFactory.Overhead;
-            var previousBodyLength = previous.DataCommitLength - KvasarConstants.SegmentHeaderSize;
-            if (previousBodyLength % onDiskPageSize != 0)
-                return default;
+            && previous.DataCommitLength <= state.DataCommitLength)
+            floor = previous.DataCommitLength;
+        else if (previousState is { } other && other.DataSlot != state.DataSlot)
+            floor = KvasarConstants.SegmentHeaderSize;
 
-            var fromOffset = previousBodyLength / onDiskPageSize * _pageSize;
-            return _data.Authenticate(
-                state.DataSlot, fromOffset, _data.ActiveCommittedOffset, cancellationToken);
-        }
-
-        // A different data slot means a compaction switch: BeginCompaction truncated that slot to its
-        // header and restarted page ids under a fresh salt, and the switch commit names only pages the
-        // pass itself wrote and flushed — so nothing below the extent is burned and the whole extent is
-        // checkable. This is the §5.2 step-3 path, so skipping it entirely (as the C1 fix briefly did)
-        // would drop the guarantee precisely where it is load-bearing.
-        if (previousState is { } other && other.DataSlot != state.DataSlot)
-            return _data.Authenticate(state.DataSlot, 0, _data.ActiveCommittedOffset, cancellationToken);
-
-        // No predecessor at all: there is no floor to bound the window against, and the extent may
-        // legitimately contain a burned page, so there is nothing safe to check here. Recorded as an
-        // open gap in docs/REVIEW-R4.md rather than papered over.
-        return default;
+        var fromPageId = GetPageCount(floor);
+        var toPageId = GetPageCount(state.DataCommitLength);
+        return _data.Authenticate(state.DataSlot, fromPageId, toPageId, cancellationToken);
     }
 
     private async ValueTask OpenLogs(SuperblockState state, CancellationToken cancellationToken)
@@ -734,6 +735,7 @@ public sealed class KvasarStore : IAsyncDisposable
     private async ValueTask Recover(SuperblockState state, CancellationToken cancellationToken)
     {
         _index = new HashIndex();
+        _nextKeyId = state.NextKeyId;
         var committedOffset = _data.ActiveCommittedOffset;
         var indexLog = _indexLogs[state.IndexSlot];
         var snapshot = await indexLog
@@ -745,6 +747,7 @@ public sealed class KvasarStore : IAsyncDisposable
         var replayFrom = 0L;
         if (snapshot is { } s) {
             _index.BulkLoad(s.Entries);
+            RestoreNextKeyId(s.Entries);
             // Anything shorter (a tail lost to a crash, or an index that never carried entries at all)
             // falls back to the checkpoint's own stamp, which §5.2.1 keeps above every burned page.
             replayFrom = isIndexComplete ? committedOffset : s.DataCommitLength;
@@ -763,13 +766,19 @@ public sealed class KvasarStore : IAsyncDisposable
         // so the free .kdat/.kidx stop being referenced by any valid superblock slot and the rotation
         // below — and any later compaction — may recycle them (§3.2).
         var generation = _generation + 1;
-        var confirmedState = state with { Generation = generation };
+        var confirmedState = state with {
+            Generation = generation,
+            DataAuthenticationFloor = state.DataCommitLength,
+            NextKeyId = _nextKeyId,
+        };
         if (isIndexComplete)
             await indexLog.WriteCommitMac(generation).ConfigureAwait(false);
         else
             confirmedState = confirmedState with { IndexCommitLength = 0 };
         await _superblock.Write(_superblockFile!, confirmedState).ConfigureAwait(false);
         _generation = generation;
+        _committedDataSlot = state.DataSlot;
+        _committedDataLength = state.DataCommitLength;
         _slotSwitchGeneration = 0;
 
         if (!isIndexComplete || _data.BurnedBytes > 0) {
@@ -804,6 +813,9 @@ public sealed class KvasarStore : IAsyncDisposable
 
         _index = new HashIndex();
         _generation = 0;
+        _nextKeyId = 1;
+        _committedDataSlot = _data.ActiveSlot;
+        _committedDataLength = KvasarConstants.SegmentHeaderSize;
         _slotSwitchGeneration = 0;
         _isSlotSwitchPending = false;
         _isCompacting = false;
@@ -813,6 +825,19 @@ public sealed class KvasarStore : IAsyncDisposable
         _indexSlot = 1; // so the checkpoint below rotates into slot 0
         _mustRotateIndex = true;
         await Commit(true).ConfigureAwait(false);
+    }
+
+    private async ValueTask ImportLegacy(LegacyRecord[] records)
+    {
+        foreach (var record in records) {
+            var key = new KvasarKey(record.Key);
+            var value = new KvasarValue(record.Value, record.ValueKind);
+            var appended = await AppendOne(key, value).ConfigureAwait(false);
+            await Publish(key, _hasher.Hash(key.Span, _hashKey), appended).ConfigureAwait(false);
+            _uncommittedBytes += appended.RecordLength;
+        }
+        if (_uncommittedBytes != 0)
+            await Commit(true).ConfigureAwait(false);
     }
 
     private async ValueTask<IStorageFile[]> OpenSlotFiles(string[] paths, CancellationToken cancellationToken)
@@ -974,11 +999,17 @@ public sealed class KvasarStore : IAsyncDisposable
         var indexLog = _indexLogs[_indexSlot];
         var generation = _generation + 1;
         await indexLog.WriteCommitMac(generation).ConfigureAwait(false);
+        var dataAuthenticationFloor = _data.ActiveSlot == _committedDataSlot
+            ? _committedDataLength
+            : KvasarConstants.SegmentHeaderSize;
         await _superblock.Write(_superblockFile!, new SuperblockState(
             generation, (byte)_data.ActiveSlot, dataCommitLength,
-            (byte)_indexSlot, indexLog.Length, _data.ActiveLiveBytes, _data.ActiveDeadBytes))
+            (byte)_indexSlot, indexLog.Length, _data.ActiveLiveBytes, _data.ActiveDeadBytes,
+            dataAuthenticationFloor, _nextKeyId))
             .ConfigureAwait(false);
         _generation = generation;
+        _committedDataSlot = _data.ActiveSlot;
+        _committedDataLength = dataCommitLength;
         _uncommittedBytes = 0;
         if (_isSlotSwitchPending) {
             _slotSwitchGeneration = _generation;
@@ -1345,7 +1376,8 @@ public sealed class KvasarStore : IAsyncDisposable
     private async ValueTask Publish(KvasarKey key, ulong h, AppendResult appended)
     {
         var (loc, compactionLoc, recordLength, isTombstone) = appended;
-        var old = await FindIndexed(key, h, loc).ConfigureAwait(false);
+        var old = await FindIndexed(key, h).ConfigureAwait(false);
+        var keyId = old.IsFound ? old.KeyId : MintKeyId();
         if (isTombstone) {
             if (old.IsFound) {
                 _index.Remove(h, old.Locator);
@@ -1353,7 +1385,7 @@ public sealed class KvasarStore : IAsyncDisposable
                 _data.OnSuperseded(old.Locator, old.Length);
             }
             _data.OnSuperseded(loc, recordLength); // the tombstone itself is reclaimable space
-            await AppendDelta(h, old.KeyId, loc, recordLength, true).ConfigureAwait(false);
+            await AppendDelta(h, keyId, loc, recordLength, true).ConfigureAwait(false);
         }
         else {
             if (!compactionLoc.IsNone && _compaction is { } compaction)
@@ -1366,21 +1398,18 @@ public sealed class KvasarStore : IAsyncDisposable
                     throw new InvalidOperationException("The index entry changed while the write lock was held.");
             }
             if (!old.IsFound)
-                _index.Add(h, old.KeyId, loc, recordLength);
-            await AppendDelta(h, old.KeyId, loc, recordLength, false).ConfigureAwait(false);
+                _index.Add(h, keyId, loc, recordLength);
+            await AppendDelta(h, keyId, loc, recordLength, false).ConfigureAwait(false);
         }
     }
 
-    private async ValueTask<IndexedRecord> FindIndexed(KvasarKey key, ulong keyHash, Locator newLoc)
+    private async ValueTask<IndexedRecord> FindIndexed(KvasarKey key, ulong keyHash)
     {
-        var isKeyIdUsed = false;
         IndexedRecord? unreadable = null;
         var cursor = _index.Probe(keyHash);
         while (cursor.MoveNext(out var loc, out var length)) {
             if (cursor.CurrentHash != keyHash)
                 continue;
-            if (cursor.CurrentKeyId == newLoc.Packed)
-                isKeyIdUsed = true;
             try {
                 RecordView view;
                 if (!_data.TryReadRecordCached(loc, out view)) {
@@ -1401,26 +1430,7 @@ public sealed class KvasarStore : IAsyncDisposable
         if (unreadable is { } candidate)
             return candidate;
 
-        var keyId = isKeyIdUsed ? MintKeyId(keyHash, newLoc) : newLoc.Packed;
-        return new IndexedRecord(false, default, 0, keyId);
-    }
-
-    private ulong MintKeyId(ulong keyHash, Locator loc)
-    {
-        var keyId = loc.Packed;
-        while (true) {
-            var isUsed = false;
-            var cursor = _index.Probe(keyHash);
-            while (cursor.MoveNext(out _, out _)) {
-                if (cursor.CurrentHash == keyHash && cursor.CurrentKeyId == keyId) {
-                    isUsed = true;
-                    break;
-                }
-            }
-            if (!isUsed)
-                return keyId;
-            keyId = keyId == ulong.MaxValue ? 1 : keyId + 1;
-        }
+        return default;
     }
 
     private void TrackCompactionSupersession(Locator locator)
@@ -1556,7 +1566,7 @@ public sealed class KvasarStore : IAsyncDisposable
     {
         // The adopted superblock supplies accounting after replay, so recovery does not mutate it here.
         var h = _hasher.Hash(view.Key.Span, _hashKey);
-        var findTask = FindIndexed(new KvasarKey(view.Key), h, loc);
+        var findTask = FindIndexed(new KvasarKey(view.Key), h);
         var old = findTask.IsCompletedSuccessfully
             ? findTask.Result
             : findTask.AsTask().GetAwaiter().GetResult();
@@ -1565,9 +1575,29 @@ public sealed class KvasarStore : IAsyncDisposable
                 _index.Remove(h, old.Locator);
         }
         else if (!old.IsFound)
-            _index.Add(h, old.KeyId, loc, recordLength);
+            _index.Add(h, MintKeyId(), loc, recordLength);
         else if (!_index.Set(h, loc, recordLength, old.Locator))
             throw new InvalidOperationException("The loaded index entry changed during recovery.");
+    }
+
+    private void RestoreNextKeyId(ReadOnlySpan<IndexEntry> entries)
+    {
+        foreach (var entry in entries) {
+            if (entry.KeyId < _nextKeyId)
+                continue;
+            if (entry.KeyId == ulong.MaxValue)
+                throw new KvasarCorruptException("The persisted key identity space is exhausted.");
+
+            _nextKeyId = entry.KeyId + 1;
+        }
+    }
+
+    private ulong MintKeyId()
+    {
+        if (_nextKeyId == ulong.MaxValue)
+            throw new InvalidOperationException("The key identity space is exhausted.");
+
+        return _nextKeyId++;
     }
 
     private void SeedAccounting(SuperblockState state)
@@ -1601,6 +1631,16 @@ public sealed class KvasarStore : IAsyncDisposable
         // plaintext, so the ids come from here instead — the cache is per-process, so a counter does (§3.2).
         => unchecked((uint)Interlocked.Increment(ref _nextCacheId));
 
+    private long GetPageCount(long commitLength)
+    {
+        var bodyLength = commitLength - KvasarConstants.SegmentHeaderSize;
+        var onDiskPageSize = _pageSize + _cipherFactory.Overhead;
+        if (bodyLength < 0 || bodyLength % onDiskPageSize != 0)
+            throw new KvasarCorruptException("Data authentication floor is not page-aligned.");
+
+        return bodyLength / onDiskPageSize;
+    }
+
     private void ThrowIfDisposed()
         => ObjectDisposedException.ThrowIf(Volatile.Read(ref _isDisposed), this);
 
@@ -1615,7 +1655,12 @@ public sealed class KvasarStore : IAsyncDisposable
     }
 
     private static int ResolveInlineCap(KvasarOptions options, int pageSize)
-        => options.MaxInlineValueBytes > 0 ? Math.Min(options.MaxInlineValueBytes, pageSize) : pageSize;
+    {
+        var pagePayloadSize = pageSize - KvasarConstants.DataPageHeaderSize;
+        return options.MaxInlineValueBytes > 0
+            ? Math.Min(options.MaxInlineValueBytes, pagePayloadSize)
+            : pagePayloadSize;
+    }
 
     private static uint ParseFormatVersion(string formatVersion, string? version)
     {

@@ -10,6 +10,7 @@ namespace ActualLab.Kvasar.Tests.Store;
 public sealed class ReviewR2Tests : IDisposable
 {
     private const int PageSize = 4096;
+    private const int PagePayloadSize = PageSize - KvasarConstants.DataPageHeaderSize;
     private const int CompactionKeyCount = 800;
 
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "kvasar-review-r2-" + Guid.NewGuid().ToString("N"));
@@ -273,7 +274,7 @@ public sealed class ReviewR2Tests : IDisposable
     [Fact]
     public async Task IndexLessRebuildRejectsRecordShapedBytesAfterADamagedHeaderPage()
     {
-        const int damagedRecordLength = 4 * PageSize;
+        const int damagedRecordLength = 4 * PagePayloadSize;
         const string damagedKey = "damaged";
         const string phantomKey = "never-written";
         var options = Options(FileStorageBackend.Instance) with {
@@ -292,7 +293,7 @@ public sealed class ReviewR2Tests : IDisposable
             phantomRecord, RecordFlags.None, KvasarValueKind.Raw,
             Encoding.UTF8.GetBytes(phantomKey), phantomValue, false);
         var damagedHeaderLength = damagedRecordLength - damagedValueLength;
-        phantomRecord.CopyTo(damagedValue, (3 * PageSize) - damagedHeaderLength);
+        phantomRecord.CopyTo(damagedValue, (3 * PagePayloadSize) - damagedHeaderLength);
 
         var expected = Enumerable.Range(0, 10)
             .ToDictionary(i => $"after-{i:D2}", i => $"value-{i:D2}", StringComparer.Ordinal);
@@ -318,7 +319,7 @@ public sealed class ReviewR2Tests : IDisposable
     [Fact]
     public async Task IndexLessRebuildResynchronizesAfterACorruptMultiPageRecord()
     {
-        const int damagedRecordLength = 4 * PageSize;
+        const int damagedRecordLength = 4 * PagePayloadSize;
         const string damagedKey = "damaged";
         const string phantomKey = "never-written";
         var options = Options(FileStorageBackend.Instance);
@@ -334,7 +335,7 @@ public sealed class ReviewR2Tests : IDisposable
             phantomRecord, RecordFlags.None, KvasarValueKind.Raw,
             Encoding.UTF8.GetBytes(phantomKey), phantomValue, false);
         var damagedHeaderLength = damagedRecordLength - damagedValueLength;
-        phantomRecord.CopyTo(damagedValue, (3 * PageSize) - damagedHeaderLength);
+        phantomRecord.CopyTo(damagedValue, (3 * PagePayloadSize) - damagedHeaderLength);
 
         var expected = Enumerable.Range(0, 10)
             .ToDictionary(i => $"after-{i:D2}", i => $"value-{i:D2}", StringComparer.Ordinal);
@@ -354,7 +355,7 @@ public sealed class ReviewR2Tests : IDisposable
             File.Delete(path);
         CorruptPage(
             $"{options.BasePath}.{state.DataSlot}.kdat",
-            (damagedEntry.Locator.Offset / PageSize) + 1);
+            (damagedEntry.Locator.Offset / PagePayloadSize) + 1);
 
         await using var reopened = await KvasarStore.Open(options);
         foreach (var (key, value) in expected)
@@ -369,7 +370,7 @@ public sealed class ReviewR2Tests : IDisposable
     }
 
     [Fact]
-    public async Task IndexLessRebuildPrevalidatesResynchronizationCandidates()
+    public async Task IndexLessRebuildOverADamagedHeaderPageCompletesPromptly()
     {
         const int damagedValueLength = 16 * 1024 * 1024;
         const string damagedKey = "damaged";
@@ -381,7 +382,9 @@ public sealed class ReviewR2Tests : IDisposable
         var damagedRecordLength = RecordCodec.GetRecordLength(damagedKey.Length, damagedValueLength, false);
         var damagedHeaderLength = damagedRecordLength - damagedValueLength;
         var damagedValue = new byte[damagedValueLength];
-        for (var recordOffset = PageSize; recordOffset < damagedRecordLength; recordOffset += PageSize) {
+        for (var recordOffset = PagePayloadSize;
+            recordOffset < damagedRecordLength;
+            recordOffset += PagePayloadSize) {
             var valueOffset = recordOffset - damagedHeaderLength;
             var bodyLength = damagedRecordLength - recordOffset - Varint.MaxSize;
             if (valueOffset < 0 || valueOffset + Varint.MaxSize + 2 > damagedValue.Length || bodyLength < 2)
@@ -458,7 +461,7 @@ public sealed class ReviewR2Tests : IDisposable
     private async Task<SuperblockState> ReadSuperblock()
     {
         await using var file = await FileStorageBackend.Instance.Open(Path.Combine(_dir, "store.kvs"));
-        var read = await new Superblock(_encryptionKey, 1).Read(file);
+        var read = await new Superblock(_encryptionKey, KvasarConstants.DataFormatVersion).Read(file);
         read.Status.Should().Be(SuperblockStatus.Ok);
         return read.Newest!.Value;
     }
@@ -470,7 +473,7 @@ public sealed class ReviewR2Tests : IDisposable
             _encryptionKey, [], KvasarConstants.IndexMacKeyInfo, authenticationKey);
         await using var log = await IndexLog.Open(
             await FileStorageBackend.Instance.Open($"{basePath}.{state.IndexSlot}.kidx"),
-            1,
+            KvasarConstants.DataFormatVersion,
             authenticationKey);
         return (await log.Read(state.IndexCommitLength, state.Generation))!.Value;
     }

@@ -24,7 +24,7 @@ independently hit the same P0 from opposite directions, which is what made it wo
 | **C2** | `ScanFrom` resyncs mid-record, then abandons the replay | P2 | X | | **fixed** `5c33b02` |
 | **C4** | An unreadable record reads as "key absent" | P2 | X | | **fixed** `5c33b02` |
 | **X2** | `Scan` uses the 64-bit hash as an identity check | **P3** | | X | **fixed** `567821f` + test |
-| **C3** | Fallback adoption decrypts the whole store at open | P2 | X | | open |
+| **C3** | Fallback adoption decrypts the whole store at open | P2 | X | | **fixed** by data format 2 |
 | **C5 / X4** | Derived keys survive a failed `Open` and the wipe-retry | P3 | X | X | **fixed** `3fb9405` |
 | **C6** | A write racing `DisposeAsync` can start a compaction | P3 | X | | **fixed** `3fb9405` |
 | **C7** | `IndexLog`'s internal `Read` overload writes, and shadows | P3 | X | | **fixed** `3fb9405` |
@@ -34,8 +34,7 @@ independently hit the same P0 from opposite directions, which is what made it wo
 | **X3** | `Recycle` strands the previous page cipher unzeroized | P3 | | X | open — see below |
 | **X6** | `SetByKeyId` sits below its callees | P3 | | X | **fixed** `3fb9405` |
 
-**Status as of 2026-07-27: 11 of 13 fixed.** C3 and X3 are open and described below; both are recorded
-rather than patched because each needs a design decision, not a code change. Suite: 445 passed, 0 skipped,
+**Status as of 2026-07-27: 12 of 13 fixed.** X3 remains open and is described below. Suite: 445 passed, 0 skipped,
 0 failed, on net10.0 and net9.0.
 
 ### Exploitability
@@ -92,20 +91,23 @@ newest is unadoptable and the fallback is genuinely exercised.
 
 ---
 
-## Still open
+## Format-2 closure
 
-### C3 — **this entry was wrong, and the error mattered**
+### C3 — **closed by the coordinated format revision**
 It claimed the fallback "still authenticates the whole extent" and was merely slow. It did not: the C1
 fix replaced `fromOffset = 0` with an unconditional `return default`, so **no page was authenticated at
 all** on four paths — including the first open after a compaction switch, which is exactly the §5.2
 step-3 path the guarantee is for. The cost was reviewed and the semantics were not, and this note then
 recorded the missing check as present. Round 4 caught it (Claude C3, Codex X1, the latter rating it P0).
 
-Fixed in `4bc7336`: the different-slot case authenticates the whole extent again, which is sound because
+The intermediate fix in `4bc7336` made the different-slot case authenticate the whole extent again, which is sound because
 `BeginCompaction` truncated that slot and the pass wrote every page it names. Regression test
 `ReviewRegressionTests.ACorruptPageAfterASlotSwitchIsAuthenticatedNotAdopted` — 118 of 120 keys survived
-before the fix (two lost to the unvalidated page), 120 after. The predecessorless case is still
-unauthenticated and is now stated as such rather than implied.
+before the fix (two lost to the unvalidated page), 120 after. Data format 2 closes the remaining
+predecessorless case by persisting `dataAuthenticationFloor` in each slot and authenticating from it
+when no predecessor survives.
+
+## Still open
 
 ### X3 (P3) — `Recycle` strands the previous page cipher
 `PagedFile.Recycle` replaces `_incarnation` without disposing the old cipher, so its page/nonce key

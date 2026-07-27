@@ -104,10 +104,9 @@ public sealed class HashIndex
             // Entries come straight from the unvalidated .kidx, so a corrupt one can carry a sentinel
             // locator (a zero-filled tail decodes as packed 0); dropping it beats corrupting the table.
             var packed = e.Locator.Packed;
-            if (packed is Empty or Tombstone)
+            if (packed is Empty or Tombstone || e.KeyId == Empty)
                 continue;
-            var keyId = e.KeyId == Empty ? e.KeyHash : e.KeyId;
-            InsertOrUpdate(t, e.KeyHash, keyId, packed, (int)e.Length, ref count, ref used);
+            InsertOrUpdate(t, e.KeyHash, e.KeyId, packed, (int)e.Length, ref count, ref used);
         }
 
         _count = count;

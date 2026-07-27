@@ -15,7 +15,7 @@ public class SuperblockTests
     {
         var superblock = NewSuperblock();
         var file = await NewFile(superblock);
-        var state = new SuperblockState(7, 1, 123456, 0, 654321, 1000, 250);
+        var state = new SuperblockState(7, 1, 123456, 0, 654321, 1000, 250, 87648, 42);
         await superblock.Write(file, state);
 
         var result = await superblock.Read(file);

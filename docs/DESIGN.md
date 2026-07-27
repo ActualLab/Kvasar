@@ -4,7 +4,8 @@ This document freezes the internal architecture so modules can be built independ
 without rework. Read it together with `docs/SPEC.md` (the product spec). Where this doc and SPEC
 disagree on an internal detail, **this doc wins** (SPEC wins on externally-visible behavior).
 
-Target: **net9.0**, pure managed, no native deps. Namespace root `ActualLab.Kvasar`.
+Targets: **net10.0** by default and **net10.0;net9.0** with `UseMultitargeting=true`, pure managed,
+no native deps. Namespace root `ActualLab.Kvasar`.
 Coding style: follow the ActualLab conventions (file-scoped namespaces, `var`, expression-bodied
 members, mixed brace style — Allman for types/methods/ctors, K&R everywhere else, 4-space indent,
 120-col lines, LF, minimal comments, no `Async` suffix). Private fields `_camelCase`; private
@@ -20,13 +21,14 @@ static readonly / const `PascalCase`.
 ## Key invariants / semantics (read carefully)
 
 ### Offsets & the logical page stream
-A segment file `<base>.NNN.klog` on disk = a fixed **64-byte plaintext header**
+A data file `<base>.N.kdat` on disk = a fixed **64-byte plaintext header**
 (`KvasarConstants.SegmentHeaderSize`) followed by a sequence of **encrypted pages**, each
 `PageSize + cipher.Overhead` bytes on disk.
 
-Upper layers (record log, index, locators) work in the **logical plaintext page stream**: a byte
-offset `O` means page `pageId = O / PageSize`, in-page offset `O % PageSize`, counting the first
-page's first byte as `O = 0`. The mapping from `pageId` to a physical file position (past the
+Each decrypted data page begins with the 8-byte authenticated frame described under M3. Upper
+layers work in the logical stream formed by concatenating the remaining
+`PagePayloadSize = PageSize - 8` record-data areas: offset `O` means page
+`pageId = O / PagePayloadSize`, in-page offset `O % PagePayloadSize`. The physical mapping (past the
 header, times `PageSize+Overhead`) is **private to the paging layer**. `Locator.Offset` is such a
 logical offset. This keeps records independent of the on-disk header size and of `Overhead`.
 
@@ -43,7 +45,7 @@ bytes to a sealed/appended page first, then publish the locator with release sem
 
 ### Cancellation (writes are uninterruptible)
 **Read paths take a `CancellationToken`; write paths take none** — `AppendPage`, `SealTail`,
-`Flush`, `RollToNewSegment`, `StartNewSegment`, delta append and checkpoint write all run to
+`Flush`, slot recycling, delta append and checkpoint write all run to
 completion. Cancelling a write is not a safe operation on a self-describing append-only log: a
 half-written multi-page record leaves a header claiming more bytes than exist, so recovery reads
 the records appended after it as that record's tail, and a torn entry in the buffered `.kidx` delta
@@ -81,133 +83,74 @@ Implements the three crypto interfaces + factories + default singletons.
   when `KvasarOptions.DisableEncryption` is set (tests/benchmarks).
 
 ### M2 — Paging / Layer 1 (`Paging/`)
-- `SegmentHeader` — parse/format the 64-byte header: magic (`KLogMagic`), formatVer(uint),
-  pageSize(int), segmentId(uint), fileSalt(16), flags(uint). Provide
-  `static SegmentHeader Read(ReadOnlySpan<byte>)` and `void Write(Span<byte>)` (+ ctor).
-- `PageCache` — shared LRU of decrypted pages keyed by `(uint segmentId, long pageId)`, bounded by a
-  byte budget (`PageCacheBytes`). Thread-safe. API:
-  - `bool TryGet(uint segmentId, long pageId, out byte[] page)`
-  - `void Add(uint segmentId, long pageId, byte[] page)` (page length == PageSize; immutable)
-  - `void DropSegment(uint segmentId)` (on compaction delete)
-  - Approximate LRU is fine (e.g. sharded / CLOCK). Reads must not block behind the writer.
-- `PagedSegment : IDisposable` — one `.klog` segment file. Uses `System.IO.RandomAccess` for
-  positional I/O and an `IPageCipher` (from the factory + this file's salt) and the shared `PageCache`.
-  Handles are opened with `FileOptions.Asynchronous`; all I/O is `RandomAccess.ReadAsync`/`WriteAsync`.
-  - `static ValueTask<PagedSegment> Create(string path, uint segmentId, int pageSize, IPageCipherFactory cipherFactory, uint formatVer, PageCache cache, CancellationToken ct = default)` — writes header with a fresh random salt.
-  - `static ValueTask<PagedSegment> Open(string path, IPageCipherFactory cipherFactory, uint formatVer, PageCache cache, CancellationToken ct = default)` — reads+validates header (throws `KvasarCorruptException` on magic/format/pageSize mismatch).
-  - Props: `uint SegmentId`, `int PageSize`, `long PageCount` (sealed/appended pages on disk).
-  - `ValueTask<ReadOnlyMemory<byte>> GetPage(long pageId, CancellationToken ct = default)` — returns the
-    cached immutable decrypted page (cache hit, else read+decrypt+cache). This is the zero-copy source.
-    **Deliberately not an `async` method**: a cache hit returns an already-completed `ValueTask`, so the
-    hot read path costs no state machine and no allocation; only a miss builds one.
-  - `bool TryGetCachedPage(long pageId, out ReadOnlyMemory<byte> page)` — synchronous, cache-only probe
-    (the building block of the store's zero-I/O fast path). False if the page isn't resident.
-  - `ValueTask ReadPage(long pageId, Memory<byte> payload, CancellationToken ct = default)` — copy variant.
-  - `ValueTask Prefetch(long firstPageId, int maxPages, CancellationToken ct = default)` — **best-effort**
-    readahead: pulls a run of consecutive pages in one I/O, decrypts them, and populates the cache. Bounded
-    by the on-disk page count (staged pages are never read from disk). All failures are swallowed — it only
-    warms the cache, so the normal read path remains the single place that decides what a bad page means,
-    and error/recovery semantics are unchanged.
-  - `ValueTask<long> AppendPage(ReadOnlyMemory<byte> payload)` — append one
-    sealed page (payload length must be PageSize; caller pads). Returns the new pageId. Writer-only.
-    **Write-behind**: the encrypted page is staged in a ~1 MiB buffer and written on the next `Flush` (or
-    when the buffer fills), so a batch of appends costs one `WriteAsync` instead of one per page. Staged
-    plaintext is kept in a side map so a reader that misses the (evictable) page cache is still served —
-    compaction scans the log while appending to it. This is safe for published data because the store's
-    seal-before-publish protocol always calls `SegmentSet.Flush` *before* publishing a locator, so no
-    reachable locator can point at an unwritten page.
-  - `ValueTask Flush(bool fsync)` — writes the staged pages in one I/O;
-    .NET has no async fsync, so that blocking syscall is offloaded off the caller's thread. `Dispose`
-    writes any remaining staged pages synchronously, so forgetting `Flush` degrades durability timing but
-    never silently loses data.
-  - `long FileByteLength` — current on-disk size.
-  Notes: pageId→file position = `SegmentHeaderSize + pageId * (PageSize + Overhead)`.
+- `SegmentHeader` formats and validates the 64-byte plaintext header: magic, data format, page size,
+  file salt, and flags.
+- `PageCache` stores immutable decrypted `PageSize`-byte pages by the store-assigned
+  `(fileId, pageId)` incarnation key.
+- `PagedFile` owns one fixed `.N.kdat` slot. Its physical page mapping is
+  `64 + pageId * (PageSize + cipher.Overhead)`. It uses positional asynchronous I/O, stages encrypted
+  writes, exposes a zero-allocation cache-hit read, and rounds a torn physical tail upward so a nonce
+  can never be reused.
+- Recycling a slot truncates it to the header, chooses a new salt and cache incarnation, and resets
+  its page sequence. No valid superblock candidate may still reference the recycled incarnation.
 
 ### M3 — Record log / Layer 2 (`Log/`)
-Owns the record format and the multi-segment append log with live/dead accounting.
-- Record format (plaintext), see SPEC §5.2:
-  `recordLen: varint (bytes after this field)`, `flags: u8`, `valueKind: u8`, `keyLen: varint`,
-  `key: keyLen bytes`, `value: rest`. Tombstone ⇒ no value.
-- `RecordCodec` (static) — encode/decode a record to/from a span:
-  - `int MaxHeaderSize(int keyLen)`; `int Encode(Span<byte> dst, RecordFlags, KvasarValueKind, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool isTombstone)`.
-  - `bool TryDecode(ReadOnlySpan<byte> src, out RecordView view, out int totalLen)` — false on truncated/torn.
-  - `RecordView` = `{ RecordFlags Flags; KvasarValueKind ValueKind; ReadOnlyMemory<byte> Key; ReadOnlyMemory<byte> Value; bool IsTombstone; }` (memory variant for reads that slice pages).
-- `SegmentSet : IDisposable` — the set of `.klog` segments + the active tail. This is the writer's
-  log. Single-writer for all append/seal; concurrent readers for `Read*`.
-  - Open: `static ValueTask<SegmentSet> Create(string basePath, int pageSize, IPageCipherFactory, uint formatVer, PageCache, long segmentBytes, int maxInlineValueBytes = 0, CancellationToken ct = default)` — an async factory, since discovery does I/O and constructors can't await. Discovers existing `<base>.NNN.klog`, opens them, picks/creates the active segment.
-  - `ValueTask<(Locator Locator, int RecordLength)> Append(RecordFlags, KvasarValueKind, ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, bool isTombstone)` — packs the record into the active tail page(s); buffers the active (unsealed) page in memory; seals+`AppendPage`s full pages; rolls to a new segment past `segmentBytes`. Returns the logical `Locator` of the record start and its on-stream length. Values ≤ `MaxInlineValueBytes` never span a page (pad to next page if needed); larger use a contiguous multi-page run. Enforce single-page inline so reads of small values are zero-copy.
-  - `ValueTask<RecordView> ReadRecord(Locator loc, CancellationToken ct = default)` — locate page(s), decrypt via `PagedSegment.GetPage`, parse header, return a `RecordView` whose `Value` is a **zero-copy** slice of the cached page when single-page (copy into a pooled/heap buffer only for multi-page runs).
-  - `ValueTask<RecordRead> TryReadRecord(Locator loc, CancellationToken ct = default)` — `RecordRead` is
-    `readonly record struct (bool IsFound, RecordView View, int TotalLength)`; `IsFound == false` if
-    torn/out of range (recovery). Replaces the old `out` parameter, which async methods can't have.
-  - `bool TryReadRecordCached(Locator loc, out RecordView view)` — **synchronous zero-I/O fast path**: a
-    single-page record whose page is already decrypted in the cache (the common case). Returns false on a
-    cache miss or a page-spanning record so the caller awaits the general path. It never returns a wrong
-    answer, only "not right now" — this is what keeps `KvasarStore.Get` allocation-free when warm.
-  - `ValueTask Flush(bool fsync)` — seal+write the active tail page (buffered), then flush every segment concurrently (an fsync is a blocking syscall per handle, so sequential flushes cost their sum).
-  - Live/dead accounting: `void OnSuperseded(Locator oldLoc, int oldRecordLength)` decrements the old
-    segment's liveBytes / increments deadBytes. Expose per-segment and totals:
-    `long LiveBytes`, `long DeadBytes`, `long FileBytes`, and enumeration of sealed segments with their
-    `(uint SegmentId, long LiveBytes, long DeadBytes, long SegmentBytes)` for the compactor.
-  - Recovery: `IAsyncEnumerable<(Locator Loc, RecordView View, int RecordLength)> ScanAll(CancellationToken ct = default)`
-    and `ScanFrom(uint fromSegmentId, long fromOffset, CancellationToken ct = default)` — walk every
-    segment page-by-page in write order, yielding records; stop/truncate a torn tail (SPEC §8).
-    Used by index rebuild fallback and the HWM tail scan.
-  - Compaction support: `void RemoveSegment(uint segmentId)`
-    (close handle, delete file, `cache.DropSegment`). Reader-safe deletion: keep a handle refcount or
-    short grace so in-flight reads complete (SPEC §9).
-  - `uint ActiveSegmentId`, `long ActiveLogicalHwm` (logical offset in active segment) — for `.kidx` HWM.
+Owns the record format, authenticated page framing, and two fixed data slots.
+
+Record bytes are unchanged:
+`recordLen: varint (bytes after this field)`, `flags: u8`, `valueKind: u8`, `keyLen: varint`,
+`key: keyLen bytes`, `value: rest`. A tombstone has no value.
+
+Each decrypted `PageSize`-byte data page has this exact format:
+```
+offset  size  field
+0       1     flags: bit 0 = continuation, bit 1 = hasRecordStart
+1       3     reserved, all zero
+4       4     firstRecordOffset: signed little-endian offset in recordData, or -1
+8       P-8   recordData
+```
+No other flag bits are valid. `hasRecordStart` is equivalent to `firstRecordOffset >= 0`.
+A page without `continuation` must have its first record at offset 0. A continuation page may have
+no new record or may name its first new record at an offset greater than zero. Because the frame is
+part of the encrypted plaintext, AES-GCM authenticates it and caller bytes cannot occupy it.
+
+`DataLog` exposes `PagePayloadSize = PageSize - 8`; all locators and record-length arithmetic use
+that logical payload geometry. A single-page record is still returned as a zero-copy slice of a cached
+page. Multi-page records are split only across record-data areas. The mutable tail tracks the same frame
+state that will be sealed with it.
+
+Recovery walks each page once. It yields the known record starts from the frame and, after an unreadable
+header page, resumes only at a later authenticated `firstRecordOffset`. Continuation data is never
+decoded as a possible header. There is no tiling grammar and no candidate probing.
 
 ### M4 — Hash index / Layer 3 (`Index/`)
 In-RAM open-addressing table; lock-free readers, single writer.
-- `HashIndex` — stores per slot: packed 64-bit locator (`ulong`), `int length`, `ushort fingerprint`,
-  in parallel arrays. Empty slot = locator `0`. Publish a slot by writing length+fingerprint then
-  `Volatile.Write` the locator (release). Readers `Volatile.Read` the locator first.
-  - Ctor `HashIndex(int initialCapacity = 1024)`.
-  - `int Count { get; }`
-  - Reader API (thread-safe, lock-free): `bool TryGet(ulong keyHash, out Locator loc, out int length)`
-    — probe by fingerprint (top 16 bits of keyHash) to avoid I/O on mismatch; returns the first slot
-    whose fingerprint matches (the caller does the on-disk full-key verify and continues probing via
-    an overload). Provide an enumerator-style probe:
-    `ProbeCursor Probe(ulong keyHash)` with `bool MoveNext(out Locator loc, out int length)` so the
-    reader can walk fingerprint matches until its full-key verify succeeds or the run ends. Keep it
-    allocation-free (a struct cursor).
-  - Writer API (single-writer only): `void Set(ulong keyHash, Locator loc, int length)` (insert/update,
-    grows via copy-on-write swap of the backing arrays, `Volatile.Write` the new table reference),
-    `bool Remove(ulong keyHash, Locator expectedLoc)` (remove the slot for that key+locator).
-  - `void Clear()`.
-  - Enumeration for checkpoint/scan (writer or quiescent): `IEnumerable<IndexEntry> Snapshot()` —
-    but note the table doesn't hold keyHash→full length/flags beyond locator+length+fingerprint; the
-    fingerprint is the top 16 bits, and `Snapshot` should emit `IndexEntry{ KeyHash (reconstruct from
-    stored full 64-bit hash), SegmentId, Offset, Length, Flags=0 }`. **Therefore store the full 64-bit
-    keyHash per slot too** (add a `ulong[] _hashes`), not just the fingerprint — needed for `.kidx`
-    checkpoint and for correct probing. (Fingerprint is a fast-reject cache of the top bits.)
-  - Load API: `void BulkLoad(ReadOnlySpan<IndexEntry> entries)` — used at startup to populate from a
-    `.kidx` checkpoint (skips tombstones). `void Apply(in IndexEntry entry)` — apply one delta/record
-    (tombstone ⇒ remove, else set). Last-writer-wins by call order.
-  Resize is single-writer; readers keep using the old array snapshot until the swap — both valid.
+
+Each slot stores a full `KeyHash`, a `KeyId`, a packed locator, and record length. `KeyId == 0` is
+invalid. New logical key incarnations receive `_nextKeyId++`; overwrite and compaction relocation
+preserve the existing id. Delete followed by reinsertion mints a new id. The next counter value is
+stored in every superblock state, and recovery also raises it above every id loaded from the adopted
+index. Exhaustion fails instead of wrapping.
+
+Readers probe by hash and use `(KeyHash, KeyId)` plus the full on-disk key where a caller key exists.
+Publication remains a release write of the packed locator; readers take a single table snapshot and
+acquire-read the locator. Resize is copy-on-write.
 
 ### M5 — Index persistence `.kidx` (`Index/`)
-- `IndexFile` (static or instance) — reads/writes `<base>.kidx`:
-  - Layout: header (`KIdxMagic`, formatVer, pageSize or klog identity, checkpoint entry count, and the
-    **klog HWM** = `(uint activeSegmentId, uint activeLogicalHwm)`), then a checkpoint region = a
-    blittable `IndexEntry[]`, then an append-only delta tail of `IndexEntry`.
-  - `ValueTask<IndexCheckpoint?> TryLoad(string path, uint formatVer, CancellationToken ct = default)`
-    where `IndexCheckpoint` is `readonly record struct (IndexEntry[] Entries, uint SegmentId, uint Hwm)`
-    — validate header; load checkpoint via `MemoryMarshal.Cast` (no per-entry parse); replay delta
-    tail in order (last-writer-wins; tombstones kept as tombstone entries so caller can remove).
-    Returns `null` (caller falls back to full klog scan) on any inconsistency. **Entries may contain
-    tombstones**; the caller resolves them. (A nullable result replaces the old `out` parameters, which
-    async methods can't have.)
-  - `ValueTask AppendDelta(string path, IndexEntry entry, CancellationToken ct = default)` and
-    `ValueTask AppendDelta(Stream stream, IndexEntry entry, CancellationToken ct = default)` — append one
-    fixed-size entry (lazy, no fsync required by default). The store keeps the stream open across its
-    life so a delta costs one buffered write rather than a file open; `in` became by-value because
-    async methods can't take `in` parameters (`IndexEntry` is a small blittable struct).
-  - `ValueTask WriteCheckpoint(string path, ReadOnlyMemory<IndexEntry> liveEntries, (uint SegmentId, uint Hwm) hwm, uint formatVer, CancellationToken ct = default)` — rewrite the whole file: header + blittable live table (no tombstones) + empty delta. Atomic via temp file + rename.
-  - Optional encryption: if `IndexEncryption` requires it, encrypt the file with the page cipher; the
-    integrator decides and passes an already-configured cipher or a flag. For Wave 1 you may implement
-    the **unencrypted** path (keyed-hash default) and expose a hook for encryption; integration wires it.
+The index layout version remains independently versioned at **3**. Data format 2 does not change it.
+Each persisted `IndexEntry` is exactly 32 bytes:
+```
+offset  size  field
+0       8     KeyHash
+8       8     PackedLocator
+16      8     KeyId
+24      4     record Length
+28      1     record Flags
+29      3     zero padding
+```
+The 64-byte index header carries magic, data format, index layout version, entry count, data commit
+length, and two generation-parity HMAC slots. A checkpoint is followed by fixed-size deltas.
+Invalid, stale, absent, or unauthenticated index data is discarded and rebuilt from `.kdat`.
 
 ## Integration points (owned by KvasarStore, not these modules)
 - Deriving page key + hash key from the master key via `IKeyDerivation` and the `KvasarConstants`
@@ -223,12 +166,12 @@ and cancellable, and the shape of that conversion is load-bearing:
 
 - **`ValueTask` everywhere, not `Task`.** An `async ValueTask` method that completes without suspending
   never heap-allocates its state machine, so the warm path stays allocation-free.
-- **Genuine sync fast paths.** `KvasarStore.Get` and `PagedSegment.GetPage` are *not* `async` methods:
+- **Genuine sync fast paths.** `KvasarStore.Get` and `PagedFile.GetPage` are *not* `async` methods:
   they resolve a cache-resident, single-page record inline and return an already-completed `ValueTask`
   — no state machine, no allocation, no thread hop. Only a cache miss or a page-spanning record falls
   through to the awaited path (`GetSlow` / `ReadAndCache`). This matters because the cache-hit read is
   Kvasar's headline win over SQLCipher; paying state-machine cost on it would tax the hot path.
-  `SegmentSet.TryReadRecordCached` is the cache-only probe underneath, and it is *conservative*: it
+  `DataLog.TryReadRecordCached` is the cache-only probe underneath, and it is *conservative*: it
   returns false rather than a wrong answer, so the async path is always a correct fallback.
 - **The writer lock is a `SemaphoreSlim(1, 1)`, not `lock`.** A `Monitor` can't be held across `await`,
   and the write path now awaits real I/O. Single-writer semantics are unchanged.

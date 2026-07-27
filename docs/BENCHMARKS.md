@@ -25,6 +25,20 @@ configurations, one table each) and ignores the sweep's sizing args.
 > Run it on a quiesced machine. A concurrent `dotnet test` inflated every engine's numbers by
 > 20–60% in one run — SQLCipher's included, which is how the contamination was spotted.
 
+### Data-format-2 framing spot check
+
+The authenticated page frame consumes 8 bytes of the existing plaintext page: usable record payload is
+4088 B at the 4 KiB default (−0.195%), 16,376 B at 16 KiB (−0.049%), and 504 B at the 512 B test
+minimum (−1.563%). The physical page stride and 16-byte AES-GCM overhead do not change. This is too small
+to change the 4 KiB/16 KiB page-size guidance below; boundary-sized records should use the effective
+payload rather than raw `PageSize` when predicting spill.
+
+A same-session 20k-key/128-byte spot check used 4 KiB pages, 8 lookup threads, 200k lookups, and
+`Flushed` durability. The pre-revision sample was 339.8k Set/s and 9,310.9k Get/s; the median of three
+format-2 samples was 338.4k Set/s and 9,236.7k Get/s (−0.4% and −0.8%). This short run is a regression
+check, not a replacement for the full sweep: individual lookup samples varied enough that only the
+absence of a material hot-path regression is supported.
+
 ## Representative results
 
 Measured 2026-07-27 on an AMD Ryzen 9 9950X3D (32 logical cores), Windows 11 Pro 24H2

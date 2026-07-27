@@ -143,21 +143,21 @@ public readonly struct KvasarValue        // same shape as KvasarKey, minus equa
 
 public sealed record KvasarOptions
 {
-    public required string BasePath { get; init; }                       // -> <base>.klog / .kidx / .lock
+    public required string BasePath { get; init; }                       // -> fixed .kvs/.N.kdat/.N.kidx/.lock set
     public required byte[] EncryptionKey { get; init; }                  // 32 bytes (AES-256)
-    public string FormatVersion { get; init; } = "1";                    // on-disk format; mismatch => wipe & recreate
+    public string FormatVersion { get; init; } = "2";                    // on-disk format; mismatch => migrate/wipe (§11)
     public string Version { get; init; } = "";                           // caller's data version; mismatch => wipe & recreate
     public int  PageSize { get; init; } = 0;                             // 0 => probe FS cluster size (fallback 4 KiB)
     public long PageCacheBytes { get; init; } = 16 * 1024 * 1024;        // decrypted-page LRU budget
     public int  MaxValueBytes { get; init; } = 8 * 1024 * 1024;
-    public int  MaxInlineValueBytes { get; init; } = 0;                 // 0 => PageSize; ≤ this stays single-page (zero-copy, §5.2)
+    public int  MaxInlineValueBytes { get; init; } = 0;                 // 0 => PageSize - 8; ≤ this may stay single-page (§5.2)
     public KvasarDurability Durability { get; init; } = KvasarDurability.Buffered;
     public TimeSpan FlushDelay { get; init; } = TimeSpan.FromSeconds(0.5); // 0 => every Set durable on return
     public long CommitBytes { get; init; } = 8 * 1024 * 1024;
     // Pluggable crypto — secure defaults (§5.3)
     public IKeyHasher      Hasher { get; init; } = KeyHashers.SipHash24;      // keyed PRF (default)
     public IKeyDerivation  Kdf    { get; init; } = KeyDerivations.HkdfSha256; // master key -> subkeys
-    public IndexEncryption IndexEncryption { get; init; } = IndexEncryption.Auto; // encrypt .kidx iff Hasher isn't a keyed PRF
+    public IndexEncryption IndexEncryption { get; init; } = IndexEncryption.Auto; // suppress plaintext entries for non-keyed hashers
     [Obsolete("SegmentBytes is unused; use CommitBytes to bound the commit and recovery window.")]
     public long SegmentBytes { get; init; } = 16 * 1024 * 1024;         // compatibility only; ignored
     public double CompactionDeadRatio { get; init; } = 2.0 / 3.0;
@@ -257,14 +257,15 @@ Encryption is a KV-agnostic hook; the KV logic never sees ciphertext.
   │          IPagedStore + IPageCipher         │  transparent AES-GCM per page
   └───┬───────────────────────────────────────┘
       │  positional file I/O (System.IO.RandomAccess)
-     <base>.klog  (sequence of encrypted pages)
+     <base>.N.kdat  (two fixed encrypted data slots)
 ```
 
 ### Files
 | File | Purpose |
 |------|---------|
-| `<base>.NNN.klog` | append-only **segments** of encrypted pages — source of truth (§9) |
-| `<base>.kidx` | optional index snapshot for fast open (rebuildable; **unencrypted**, §6.5) |
+| `<base>.kvs` | authenticated two-slot superblock |
+| `<base>.0.kdat`, `<base>.1.kdat` | fixed data slots — source of truth (§9) |
+| `<base>.0.kidx`, `<base>.1.kidx` | matching rebuildable index slots (§6.5) |
 | `<base>.lock` | single-writer advisory lock |
 
 ### 5.1 Layer 1 — encrypted paged store  **[core abstraction]**
@@ -284,7 +285,8 @@ public interface IPageCipher {                              // the encryption ho
     void Decrypt(long pageId, ReadOnlySpan<byte> onDisk, Span<byte> plain);
 }
 ```
-- On-disk page = `PageSize + Overhead`. Reads decrypt into a bounded **LRU page cache** of
+- On-disk page = `PageSize + Overhead`. The first 8 plaintext bytes are the authenticated record-page
+  frame (§5.2), leaving `PageSize - 8` bytes for record data. Reads decrypt into a bounded **LRU page cache** of
   *plaintext* pages; upper layers never see ciphertext. A **no-op `IPageCipher`** gives an
   unencrypted store for tests/benchmarks and isolates crypto cost.
 - **Page size** = FS **cluster size** of the store's volume (probed at open; fallback 4 KiB),
@@ -294,7 +296,7 @@ public interface IPageCipher {                              // the encryption ho
   into a fresh buffer). Use positional `System.IO.RandomAccess` (concurrent-read-safe).
 - **Nonce — [DECISION]:** pages are append-only & **immutable once sealed**, so a page's
   bytes never change. ⇒ **deterministic GCM nonce = f(pageId, fileSalt)** (salt random per
-  store, in header), **not stored on disk** (saves 12 B/page). AAD = `pageId || formatVer`.
+  file incarnation, in its header), **not stored on disk** (saves 12 B/page). AAD = `pageId || formatVer`.
   Safe *only* under immutability (nonce reuse breaks GCM) ⇒ sealed pages are never rewritten;
   compaction writes a **new file with a fresh salt**. *Alt:* stored random nonce (+12 B/page).
 
@@ -302,7 +304,19 @@ public interface IPageCipher {                              // the encryption ho
 Records are packed into page payloads; only the **active tail page** is mutable (buffered in
 memory) until sealed & appended, after which it's immutable until compaction.
 
-Record layout (plaintext, inside encrypted pages):
+Every plaintext data page begins with this fixed frame:
+```
+pageFlags         : u8    — bit0: continuation from an earlier page; bit1: page contains a record start
+reserved          : 3 B   — zero
+firstRecordOffset : i32   — offset in the page's record-data area, or -1 when bit1 is clear
+record data       : PageSize - 8 bytes
+```
+The flags/offset combination is validated: a non-continuation page starts its first record at offset
+0; a continuation page either has no record start or names one after offset 0. The frame is inside the
+AES-GCM plaintext, so its existing page tag authenticates it. Caller key/value bytes occupy only the
+record-data area and can never forge page-boundary metadata.
+
+Records form a logical stream over the `PageSize - 8` record-data areas:
 ```
 recordLen : varint   — bytes after this field
 flags     : u8       — bit0: tombstone (delete)
@@ -313,8 +327,9 @@ value     : recordLen - (…) bytes   (absent for tombstone)
 ```
 - An update **appends a new record** and repoints the index; the superseded record becomes
   **dead bytes** (compaction reclaims, §9). A delete appends a tombstone.
-- **Packing (configurable).** Zero-copy requires a value to live within a single decrypted page.
-  Values ≤ **`MaxInlineValueBytes`** (config; default = page size) are kept single-page — **padded** to
+- **Packing (configurable).** Zero-copy requires a value to live within one page's record-data area.
+  Values ≤ **`MaxInlineValueBytes`** (config; default = `PageSize - 8`) are kept single-page when the
+  complete encoded record fits — **padded** to
   the next page when they wouldn't fit the tail page's remainder (wastes ≤ ~1 page each) — and returned
   **zero-copy**. Larger values use a contiguous multi-page **run** returned copied / as
   `ReadOnlySequence<byte>`. The threshold trades padding waste against copy-on-read; the common
@@ -322,9 +337,10 @@ value     : recordLen - (…) bytes   (absent for tombstone)
 
 ### 5.3 File header & key privacy
 File header (plaintext, non-secret): `magic "KVSR"`, `formatVer`, `pageSize`, `fileSalt(16)`,
-`flags`. A magic/version/pageSize/key mismatch on open ⇒ wipe & recreate.
+`flags`. A magic/version/pageSize mismatch on open ⇒ migrate where supported, otherwise wipe and
+recreate. The superblock KCV distinguishes a wrong master key and throws without wiping.
 
-**Key privacy:** keys live inside the encrypted `.klog` pages (§5.2), so nothing about a key is
+**Key privacy:** keys live inside the encrypted `.kdat` pages (§5.2), so nothing about a key is
 exposed at rest. The `.kidx` index (§6.5) stores only a **keyed hash** of each key (§6.1) — not
 brute-forceable without the store key — so `.kidx` is safe **unencrypted**. No separate HMAC
 record scheme is needed.
@@ -332,8 +348,9 @@ record scheme is needed.
 **Configurable crypto.** The page cipher (`IPageCipher`), key hasher (`IKeyHasher`), and key
 derivation (`IKeyDerivation`) are pluggable via `KvasarOptions` with secure defaults —
 **AES-256-GCM**, **SipHash-2-4** (keyed), **HKDF-SHA256** (master key → separate page, hash, index-MAC,
-and superblock keys; per-file random salt). **Safety rule:** `.kidx` may be unencrypted only with a keyed-PRF hasher;
-`IndexEncryption.Auto` enforces it (encrypts `.kidx` for any non-PRF hasher, e.g. xxHash3). The
+and superblock keys; per-file random salt). **Safety rule:** `.kidx` may be persisted only with a keyed-PRF
+hasher until encrypted index files are implemented. `IndexEncryption.Auto` therefore suppresses index-entry
+persistence for any non-PRF hasher, such as xxHash3. The
 plaintext index is still authenticated: a separate HMAC key is derived from the master key with its
 own KDF info label, distinct from the page, keyed-hash, and superblock subkeys.
 
@@ -343,12 +360,9 @@ own KDF info label, distinct from the page, keyed-hash, and superblock subkeys.
 
 ### 6.1 The `hash → location` map
 - In RAM: an **open-addressing hash table** whose entries are fixed-size and
-  **key-length-independent**:
-  `Entry = { uint16 Fingerprint; uint32 SegmentId; uint32 Offset; int Length; }` (~16 B;
-  ~20–24 B effective at a ~0.7 load factor). `(SegmentId, Offset, Length)` locate the record's
-  value in a `.klog` segment (§9).
-- **RAM cost** ≈ 16–24 B × entries, *independent of key size*: ~a few MB for our 25 MB store,
-  ~16 MB per 10⁶ entries. Full keys are **not** in RAM — they're on disk for verification,
+  **key-length-independent**. Each slot carries the full 64-bit hash, 64-bit `KeyId`, packed
+  `(fileId, logicalOffset)` locator, and record length; the fingerprint is derived from the hash.
+- RAM cost stays *independent of key size*. Full keys are **not** in RAM — they're on disk for verification,
   `Scan`/`ListAllEntries`, and rebuild.
 - A point update/delete repoints/removes the entry; the old on-disk record becomes dead bytes.
 - **Publication is the linearization point:** the entry is updated only after the record's
@@ -356,7 +370,8 @@ own KDF info label, distinct from the page, keyed-hash, and superblock subkeys.
 - **Hash = keyed hash** (default **SipHash-2-4**, subkey from the KDF; pluggable via
   `KvasarOptions.Hasher`): a keyed PRF isn't computable without the store key ⇒ `.kidx` is safe
   **unencrypted** (§6.5) and the index resists hash-flooding. A non-PRF hasher (e.g. xxHash3) is
-  allowed but forces `.kidx` encryption (§5.3). The in-RAM `Fingerprint` is its top 16 bits.
+  supported on a best-effort basis; `IndexEncryption.Auto` disables index-entry persistence for it
+  because encrypted `.kidx` is not implemented. The in-RAM `Fingerprint` is its top 16 bits.
 
 ### 6.2 Lookup & collision handling
 `Get(key)`: compute `h = hash(key)` → probe the table.
@@ -365,12 +380,17 @@ own KDF info label, distinct from the page, keyed-hash, and superblock subkeys.
    astronomically-rare 64-bit hash collision correctly).
 3. Continue open-addressing probes until match or empty slot (= miss).
 
-Reads fan out across colliding keys; **writes don't** (see TODO C1). Two distinct keys sharing a full
-64-bit hash collapse onto one index slot, and the later write shadows the earlier key — a lookup still
-never returns another key's value, but the shadowed key is lost until it's written again. Keys must
-therefore hash distinctly under the configured `Hasher`. With the default keyed SipHash-2-4 that is
-≈ n²/2⁶⁵ (~3·10⁻⁸ at 10⁶ keys) and unaimable without the store key; the unkeyed `XxHash3` lets
-attacker-chosen keys collide on purpose, so use it only for trusted key sets.
+Reads and writes fan out across full-hash collisions and verify the complete key. Each logical key
+incarnation receives a store-monotonic 64-bit `KeyId`; overwrite and compaction preserve it, while
+delete followed by re-insertion receives a larger id. The next id is persisted in the superblock and
+restored above every id in an adopted index, so a physical locator reused by compaction can never reuse
+key identity.
+
+The tested and guaranteed configuration is the default keyed `SipHash24` hasher. Custom non-keyed or
+collision-prone `IKeyHasher` implementations remain supported on a best-effort basis: full-key
+verification and never-reused `KeyId` prevent value misattribution and identity aliasing, but
+hash-flood resistance, collision probability, and persistent-index guarantees are weakened. Use such
+hashers only for trusted key sets.
 
 ### 6.3 Zero-copy read path  ← core to "fastest"
 Decrypted pages are **immutable `byte[]` buffers**. On a hit, the value is returned as a
@@ -384,7 +404,7 @@ co-located values — amortized decryption + cache locality across the batch.
 
 ### 6.5 Index persistence & startup (`.kidx`) — the startup-cost path
 Rebuild the index by reading the **index**, not the data. Under page encryption a header-only
-scan of `.klog` still decrypts every value page, so we keep a dedicated **dense, unencrypted**
+scan of `.kdat` still decrypts every value page, so we keep a dedicated **dense, unencrypted**
 index file `.kidx` holding only fixed-size `{keyed-hash, location}` entries (~a few MB, not the
 value log). It's safe in the clear because the hashes are keyed (§6.1) and reveal nothing about
 keys without the store key; the only residual exposure is metadata (entry count, value sizes).
@@ -392,12 +412,12 @@ keys without the store key; the only residual exposure is metadata (entry count,
 **`.kidx` layout** = a **checkpoint** (the live table) followed by an append-only **delta tail**,
 both one homogeneous array of blittable entries:
 ```
-IndexEntry (fixed, [StructLayout(Sequential)], ~24 B):
-  keyHash   : u64  — keyed hash of the key (§6.1); fingerprint = its top bits
-  segmentId : u32  — .klog segment (§9)
-  offset    : u32  — offset within the segment
-  length    : u32  — value/record length
-  flags     : u8   — tombstone, etc.
+IndexEntry (fixed 32 B, [StructLayout(Sequential, Pack=8, Size=32)]):
+  keyHash       : u64  — keyed hash of the key (§6.1); fingerprint = its top bits
+  packedLocator : u64  — data slot + 48-bit logical record-stream offset
+  keyId         : u64  — never-reused logical key-incarnation identity
+  length        : u32  — encoded record length
+  flags         : u8   — tombstone, etc.; remaining 3 bytes are padding
 ```
 The `.kidx` v3 header records `magic/formatVer`, entry-layout version, the **data high-water-mark
 (HWM)** the file is consistent up to, and two generation-parity HMAC-SHA256/128 tags. Each tag commits
@@ -412,16 +432,16 @@ superblock generation.
    parsing** — near-memcpy; `mmap`-able if we ever want it. *Fastest path.*
 3. **Replay the delta tail** — fixed-size entries since the checkpoint, in order, last-writer-wins,
    tombstones remove.
-4. **Scan `.klog` from HWM to end** — tiny gap of records written after the last `.kidx` update;
+4. **Scan `.kdat` from HWM to end** — tiny gap of records written after the last `.kidx` update;
    apply them and truncate a torn tail.
-5. **Fallback** — `.kidx` missing/invalid ⇒ full `.klog` scan once, then write a checkpoint.
+5. **Fallback** — `.kidx` missing/invalid ⇒ full `.kdat` scan once, then write a checkpoint.
 
 Cost ≈ read the index (~few MB, **no decryption**) + near-memcpy + tiny tail scan ⇒ **single-digit
-ms, scaling with index size not data size** (vs. ~15–30 ms to decrypt-scan a 25 MB `.klog`).
+ms, scaling with index size not data size** (vs. ~15–30 ms to decrypt-scan a 25 MB `.kdat`).
 
 **Update strategy (cheap writes, fast reads):**
-- **Per write:** append one fixed-size delta to `.kidx` (sequential, mirrors the `.klog` append;
-  ~20 B regardless of value size) — **no whole-index rewrite per flush**.
+- **Per write:** append one 32-byte delta to `.kidx` (sequential, mirrors the `.kdat` append)
+  — **no whole-index rewrite per flush**.
 - **Periodic checkpoint** (rewrite compact/blittable live table) bounds the delta tail. Triggers:
   graceful `DisposeAsync` (always), tail > ~50 % of live entries, and after data compaction
   (offsets change ⇒ index rewritten anyway).
@@ -474,11 +494,13 @@ ms, scaling with index size not data size** (vs. ~15–30 ms to decrypt-scan a 2
 - Relaxed by design (regenerable cache). `Flush(false)` = bytes to OS cache (survives app
   crash); `fsync` on graceful `DisposeAsync`/compaction.
 - **Recovery scan:** adoption strictly authenticates the candidate generation's newly committed page
-  window and falls back to the older superblock on failure. A cache rebuild is separately best-effort:
-  it skips a page that fails GCM authentication and continues reconstructing later records.
-- **Corruption** (bad magic/version/key, global auth failure, unreadable index) ⇒ the adapter
-  (§13) deletes the file set and recreates — today's behavior. **Kvasar never throws an
-  unrecoverable error to the app.** *Isolated* single-record issue ⇒ drop that key, keep the store.
+  window and falls back to the older superblock on failure. Each slot persists its own authentication
+  floor, so the same bounded check applies when no older slot survives. A cache rebuild is separately
+  best-effort: it skips a page that fails GCM authentication, then resumes only at record starts named
+  by authenticated page frames. It never probes continuation bytes.
+- **Corruption** (bad magic/version, global auth failure, unreadable index) ⇒ the adapter
+  (§13) deletes the file set and recreates. A wrong master key is distinct and throws without
+  touching the files. *Isolated* single-record issue ⇒ drop that key, keep the store.
 
 ## 9. Compaction (segment GC — *not* LSM leveling)
 
@@ -530,17 +552,24 @@ Overwrites and deletes leave dead records; we reclaim them with **Bitcask-style 
 
 ## 10. Open / lifecycle
 1. Acquire `<base>.lock` (advisory; single-process ⇒ fail-fast on contention).
-2. Missing `.klog` ⇒ create with fresh header. Validate header; mismatch ⇒ wipe & recreate.
+2. Missing `.kvs` ⇒ create the fixed five-file store. Validate the superblock and data headers.
 3. Load `.kidx` fast path, else scan-rebuild (§6.5). Compact if triggered.
 `DisposeAsync`: `Flush(fsync:true)`, write `.kidx`, release lock/handles.
 
 ## 11. Versioning
+Data format **2** adds authenticated page framing plus the superblock authentication floor and
+never-reused key-id counter. A format-1 store is opened only by the dedicated read-only importer:
+recoverable live entries are rewritten into a new format-2 file set, while an unknowable damaged
+legacy boundary stops migration rather than being guessed. Format 1 cannot be selected for new writes.
+Other format mismatches still wipe and recreate the regenerable cache.
+
 `FormatVersion` (the on-disk format) and `Version` (the caller's own data version — schema,
 serializer, cache generation) fold into the single on-disk `formatVer` tag stamped into every
 segment header; that plus `pageSize`, any mismatch ⇒ wipe & recreate (safe: cache). This mirrors
 what the SQLite backend did with its `(version)` row, minus the reserved key.
-This is also the migration story **from SQLite** — first launch finds no `.klog`, starts empty,
-caches repopulate. `.kidx` is always rebuildable and may be discarded across versions.
+This is also the migration story **from SQLite** — first launch finds no `.kvs`, starts empty,
+caches repopulate. `.kidx` has its own **layout version 3**, distinct from data format 2; it is always
+rebuildable and may be discarded across either version boundary.
 
 ## 12. Error model
 - Misses ⇒ `null`, never exceptions.
@@ -568,8 +597,14 @@ caches repopulate. `.kidx` is always rebuildable and may be discarded across ver
 - **Unit:** get/set/remove/overwrite/list/clear; positional `GetMany`; duplicate-in-batch; miss
   semantics; oversized value; hash-collision path (inject colliding keys).
 - **Encryption:** wrong key ⇒ corrupt (no plaintext leak); tamper a byte ⇒ GCM auth fails.
-- **Crash/torn-tail:** truncate `.klog` mid-record ⇒ recovery drops the tail, earlier data intact;
+- **Crash/torn-tail:** truncate `.kdat` mid-record ⇒ recovery drops the tail, earlier data intact;
   interrupted compaction (`.tmp`) recovered on open.
+- **Framed replay:** damage a multi-page record's header page and plant record-shaped continuation
+  bytes, including a complete record followed by zero padding to the page end; replay recovers later
+  framed starts and never indexes the planted key.
+- **Identity/floor migration:** delete/reinsert under an all-colliding hasher never reuses `KeyId`;
+  predecessorless adoption authenticates from its persisted floor; format-1 fixtures import when
+  readable and degrade safely when not.
 - **Concurrency:** N readers + 1 writer ⇒ no torn reads, no lost committed writes.
 - **Property-based:** random op sequences vs. an in-memory `Dictionary` oracle; reopen & re-verify.
 - **Benchmark vs SQLCipher** on the real value-size distribution: open time, `Get` p50/p99,

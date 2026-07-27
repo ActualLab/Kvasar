@@ -15,7 +15,7 @@ public sealed record KvasarOptions
     // 32-byte AES-256 master key.
     public required byte[] EncryptionKey { get; init; }
     // On-disk format version; a mismatch on open ⇒ wipe & recreate.
-    public string FormatVersion { get; init; } = "1";
+    public string FormatVersion { get; init; } = "2";
     // The caller's own data version (schema, serializer, cache generation, ...): bump it and the next
     // open wipes & recreates the store. Empty ⇒ unversioned.
     public string Version { get; init; } = "";
@@ -23,7 +23,7 @@ public sealed record KvasarOptions
     public int PageSize { get; init; } = 0;
     public long PageCacheBytes { get; init; } = 16 * 1024 * 1024;
     public int MaxValueBytes { get; init; } = 8 * 1024 * 1024;
-    // Values ≤ this stay single-page (zero-copy). 0 ⇒ use the page size.
+    // Values ≤ this stay single-page (zero-copy). 0 ⇒ use the page's record-payload capacity.
     public int MaxInlineValueBytes { get; init; } = 0;
 
     // Pluggable crypto — null selects the secure default (§5.3).

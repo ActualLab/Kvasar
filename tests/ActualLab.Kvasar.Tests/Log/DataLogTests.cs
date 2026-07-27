@@ -9,6 +9,7 @@ namespace ActualLab.Kvasar.Tests.Log;
 public class DataLogTests
 {
     private const int PageSize = 512;
+    private const int PagePayloadSize = PageSize - KvasarConstants.DataPageHeaderSize;
     private const uint FormatVer = 7;
     private const int HeaderSize = 64;
     private const int Overhead = 16;
@@ -262,8 +263,8 @@ public class DataLogTests
         var commitLength = await log.MarkCommitted();
         commitLength.Should().Be(HeaderSize + OnDiskPageSize, "the partial tail page is sealed and padded");
         log.ActiveCommitLength.Should().Be(commitLength);
-        log.ActiveCommittedOffset.Should().Be(PageSize);
-        log.ActiveHwm.Should().Be(PageSize);
+        log.ActiveCommittedOffset.Should().Be(PagePayloadSize);
+        log.ActiveHwm.Should().Be(PagePayloadSize);
         ctx.Files[0].Length.Should().Be(commitLength);
 
         // Committing again with nothing appended is a no-op, not a new page.
@@ -331,14 +332,14 @@ public class DataLogTests
         await ctx.Files[0].Write(commitLength, new byte[OnDiskPageSize / 2]);
 
         await using var reopened = await ctx.Open(0, commitLength);
-        reopened.ActiveCommittedOffset.Should().Be(3 * PageSize);
-        reopened.ActiveResumeOffset.Should().Be(4 * PageSize);
-        reopened.BurnedBytes.Should().Be(PageSize);
+        reopened.ActiveCommittedOffset.Should().Be(3 * PagePayloadSize);
+        reopened.ActiveResumeOffset.Should().Be(4 * PagePayloadSize);
+        reopened.BurnedBytes.Should().Be(PagePayloadSize);
 
         // Appending resumes above the burned page, so its id is never re-issued.
         var value = Value(99, 100);
         var (loc, _) = await reopened.Append(RecordFlags.None, KvasarValueKind.Raw, Key(99), value, false);
-        loc.Offset.Should().Be(4 * PageSize);
+        loc.Offset.Should().Be(4 * PagePayloadSize);
         (await reopened.ReadRecord(loc)).Value.ToArray().Should().Equal(value);
 
         // A scan bounded by the committed extent never walks into the gap.
@@ -375,7 +376,16 @@ public class DataLogTests
         var files = ctx.Files;
         await using (var pf = await PagedFile.Create(
             files[0], 7, PageSize, ctx.CipherFactory, FormatVer, ctx.Cache)) {
-            await pf.AppendPage(new byte[PageSize]);
+            var page = new byte[PageSize];
+            DataPageFraming.Write(page, isContinuation: false, firstRecordOffset: 0);
+            RecordCodec.Encode(
+                page.AsSpan(KvasarConstants.DataPageHeaderSize),
+                RecordFlags.None,
+                KvasarValueKind.Raw,
+                Key(0),
+                Value(0, 10),
+                false);
+            await pf.AppendPage(page);
             await pf.Flush();
         }
         await using (var pf = await PagedFile.Create(
@@ -458,7 +468,9 @@ public class DataLogTests
 
         var value = Value(1, 200); // fits a page, but exceeds the inline limit
         var (large, _) = await log.Append(RecordFlags.None, KvasarValueKind.Raw, Key(1), value, false);
-        (large.Offset % PageSize).Should().Be(0, "a non-inline value starts at a page boundary");
+        (large.Offset % PagePayloadSize).Should().Be(
+            0,
+            "a non-inline value starts at a record-payload boundary");
         (await log.ReadRecord(large)).Value.ToArray().Should().Equal(value);
     }
 

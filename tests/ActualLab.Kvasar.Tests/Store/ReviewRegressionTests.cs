@@ -15,7 +15,7 @@ namespace ActualLab.Kvasar.Tests.Store;
 /// </summary>
 public sealed class ReviewRegressionTests : IDisposable
 {
-    private const uint FormatVer = 1; // KvasarOptions.FormatVersion "1" parses straight through
+    private const uint FormatVer = KvasarConstants.DataFormatVersion;
     private const int PageSize = 512;
 
     private static readonly string[] ClosedFileSet =

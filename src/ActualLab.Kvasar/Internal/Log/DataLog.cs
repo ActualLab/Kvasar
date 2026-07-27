@@ -7,7 +7,7 @@ namespace ActualLab.Kvasar.Internal;
 /// The two-slot <c>.kdat</c> record log (DESIGN-Durability.md §3.2, §4): two fixed data files, exactly one
 /// active, the other free or a compaction target. Nothing is ever created or deleted — slots are recycled
 /// in place. Single-writer for append/seal, concurrent readers for the <c>*Read*</c> methods. Offsets are
-/// logical: <c>pageId = offset / PageSize</c>, in-page = <c>offset % PageSize</c>.
+/// logical: <c>pageId = offset / PagePayloadSize</c>, in-page = <c>offset % PagePayloadSize</c>.
 /// </summary>
 public sealed class DataLog : IAsyncDisposable
 {
@@ -18,7 +18,12 @@ public sealed class DataLog : IAsyncDisposable
     // concurrent seal swap the buffer between them, and the reader then slices the fresh empty one and
     // reports a miss for a key that exists. Bytes below Fill are never rewritten, and SealTail installs a new
     // buffer rather than reusing this one, so a snapshot stays valid for as long as anyone holds it.
-    private sealed record TailSnapshot(byte[] Buffer, int Fill, long PageId);
+    private sealed record TailSnapshot(
+        byte[] Buffer,
+        int Fill,
+        long PageId,
+        bool IsContinuation,
+        int FirstRecordOffset);
 
     private sealed class SlotState
     {
@@ -29,10 +34,13 @@ public sealed class DataLog : IAsyncDisposable
         // Writer-only; Tail is their published view.
         public byte[] TailBuffer = [];
         public int TailFill;
+        public bool TailIsContinuation;
+        public int TailFirstRecordOffset = -1;
         public volatile TailSnapshot? Tail; // non-null only while this slot is an append target
     }
 
     private readonly int _pageSize;
+    private readonly int _pagePayloadSize;
     private readonly int _maxInlineValueBytes;
     private readonly Func<uint> _mintCacheId;
     private readonly SlotState[] _slots;
@@ -44,6 +52,7 @@ public sealed class DataLog : IAsyncDisposable
     public uint ActiveFileId => FileIdOf(_active.Slot);
     public int CompactionTargetSlot => _target?.Slot ?? -1;
     public int PageSize => _pageSize;
+    public int PagePayloadSize => _pagePayloadSize;
     // ~1 MiB of readahead per I/O: enough to amortize the per-operation cost of async I/O over a
     // sequential walk without pinning much of the page-cache budget.
     public int PrefetchPages => Math.Max(1, (1 << 20) / _pageSize);
@@ -52,9 +61,9 @@ public sealed class DataLog : IAsyncDisposable
     public long ActiveHwm => LogicalLength(_active);
     // Physical extent, the currency of the superblock and of PagedFile.Open — not a logical offset.
     public long ActiveCommitLength => _active.File.CommitLength;
-    public long ActiveCommittedOffset => _active.File.CommittedPageCount * _pageSize;
+    public long ActiveCommittedOffset => _active.File.CommittedPageCount * _pagePayloadSize;
     // Where appending resumes: at or above the physical end, so a torn tail's page id is never re-issued.
-    public long ActiveResumeOffset => _active.File.ResumePageId * _pageSize;
+    public long ActiveResumeOffset => _active.File.ResumePageId * _pagePayloadSize;
     // The [committedEnd, resumeOffset) gap burned by a torn tail, measured once at open (§5.2.1).
     // Recovery adds it to the restored dead-byte counter.
     public long BurnedBytes { get; private set; }
@@ -125,7 +134,8 @@ public sealed class DataLog : IAsyncDisposable
 
         var result = new DataLog(pageSize, maxInlineValueBytes, mintCacheId, slots, activeSlot);
         var active = slots[activeSlot].File;
-        result.BurnedBytes = Math.Max(0, active.ResumePageId - active.CommittedPageCount) * pageSize;
+        result.BurnedBytes =
+            Math.Max(0, active.ResumePageId - active.CommittedPageCount) * result._pagePayloadSize;
         return result;
     }
 
@@ -134,11 +144,14 @@ public sealed class DataLog : IAsyncDisposable
         SlotState[] slots, int activeSlot)
     {
         _pageSize = pageSize;
-        _maxInlineValueBytes = maxInlineValueBytes <= 0 ? pageSize : maxInlineValueBytes;
+        _pagePayloadSize = pageSize - KvasarConstants.DataPageHeaderSize;
+        if (_pagePayloadSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(pageSize));
+        _maxInlineValueBytes = maxInlineValueBytes <= 0 ? _pagePayloadSize : maxInlineValueBytes;
         _mintCacheId = mintCacheId;
         _slots = slots;
         _active = slots[activeSlot];
-        _active.TailBuffer = new byte[pageSize];
+        _active.TailBuffer = new byte[_pagePayloadSize];
         PublishTail(_active);
     }
 
@@ -207,8 +220,8 @@ public sealed class DataLog : IAsyncDisposable
         if (offset < 0 || offset >= len)
             return false;
 
-        var pageId = offset / _pageSize;
-        var inPage = (int)(offset % _pageSize);
+        var pageId = offset / _pagePayloadSize;
+        var inPage = (int)(offset % _pagePayloadSize);
         if (!TryGetLogicalPageCached(st, tail, pageId, out var firstPage))
             return false;
 
@@ -223,19 +236,16 @@ public sealed class DataLog : IAsyncDisposable
     }
 
     public async ValueTask Authenticate(
-        int slot, long fromOffset, long toOffset, CancellationToken cancellationToken = default)
+        int slot, long fromPageId, long toPageId, CancellationToken cancellationToken = default)
     {
         if ((uint)slot >= SlotCount)
             throw new ArgumentOutOfRangeException(nameof(slot));
-        if (fromOffset < 0 || toOffset < fromOffset || toOffset > _slots[slot].File.CommittedPageCount * _pageSize)
-            throw new ArgumentOutOfRangeException(nameof(toOffset));
-        if (fromOffset % _pageSize != 0 || toOffset % _pageSize != 0)
-            throw new ArgumentException("Authentication range must be page-aligned.");
+        if (fromPageId < 0 || toPageId < fromPageId || toPageId > _slots[slot].File.CommittedPageCount)
+            throw new ArgumentOutOfRangeException(nameof(toPageId));
 
         var file = _slots[slot].File;
-        var endPageId = toOffset / _pageSize;
-        var nextPrefetchPageId = fromOffset / _pageSize;
-        for (var pageId = nextPrefetchPageId; pageId < endPageId; pageId++) {
+        var nextPrefetchPageId = fromPageId;
+        for (var pageId = fromPageId; pageId < toPageId; pageId++) {
             if (pageId >= nextPrefetchPageId) {
                 await file.Prefetch(pageId, PrefetchPages, cancellationToken).ConfigureAwait(false);
                 nextPrefetchPageId = pageId + PrefetchPages;
@@ -244,8 +254,8 @@ public sealed class DataLog : IAsyncDisposable
         }
     }
 
-    // Walks records in write order over one slot. A readable header pins the record's full span before its
-    // pages are decoded, so a broken interior page cannot turn continuation bytes into record candidates.
+    // Walks records in write order over one slot. Every page authenticates its continuation state and exact
+    // first record start, so recovery never probes caller bytes for a plausible boundary.
     public async IAsyncEnumerable<(Locator Loc, RecordView View, int RecordLength)> ScanFrom(
         int slot, long fromOffset, long toOffset,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
@@ -260,59 +270,63 @@ public sealed class DataLog : IAsyncDisposable
             len = Math.Min(len, toOffset);
         var p = Math.Max(0, fromOffset);
         var prefetchPages = PrefetchPages;
-        var nextPrefetchPage = p / _pageSize;
+        var nextPrefetchPage = p / _pagePayloadSize;
         var mustResynchronize = false;
         while (p < len) {
-            var pageId = p / _pageSize;
+            var pageId = p / _pagePayloadSize;
+            var pageStart = pageId * _pagePayloadSize;
+            var nextPage = pageStart + _pagePayloadSize;
             if (pageId >= nextPrefetchPage) {
                 await st.File.Prefetch(pageId, prefetchPages, cancellationToken).ConfigureAwait(false);
                 nextPrefetchPage = pageId + prefetchPages;
             }
 
-            RecordRead read;
-            if (!mustResynchronize) {
-                int recordLength;
-                try {
-                    recordLength = await ReadRecordLengthAt(st, p, len, cancellationToken).ConfigureAwait(false);
-                }
-                catch (KvasarCorruptException) {
-                    p = (pageId + 1) * _pageSize;
-                    mustResynchronize = true;
-                    continue;
-                }
-                if (recordLength == 0) {
-                    mustResynchronize = p % _pageSize == 0;
-                    p = (pageId + 1) * _pageSize;
-                    continue;
-                }
-
-                try {
-                    read = await TryReadAt(st, p, cancellationToken).ConfigureAwait(false);
-                }
-                catch (KvasarCorruptException) {
-                    read = default;
-                }
-                if (read.IsFound)
-                    yield return (new Locator(fileId, p), read.View, read.TotalLength);
-
-                p += recordLength;
+            DataPageFrame frame;
+            try {
+                (_, frame) = await GetFramedLogicalPage(st, st.Tail, pageId, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (KvasarCorruptException) {
+                p = nextPage;
+                mustResynchronize = true;
                 continue;
             }
 
+            if (mustResynchronize || p == pageStart && frame.IsContinuation) {
+                if (!frame.HasRecordStart) {
+                    p = nextPage;
+                    mustResynchronize = true;
+                    continue;
+                }
+                p = pageStart + frame.FirstRecordOffset;
+                mustResynchronize = false;
+            }
+
+            int recordLength;
             try {
-                read = await TryReadTiledPageAt(st, p, len, cancellationToken).ConfigureAwait(false);
+                recordLength = await ReadRecordLengthAt(st, p, len, cancellationToken).ConfigureAwait(false);
+            }
+            catch (KvasarCorruptException) {
+                p = nextPage;
+                mustResynchronize = true;
+                continue;
+            }
+            if (recordLength == 0) {
+                p = nextPage;
+                continue;
+            }
+
+            RecordRead read;
+            try {
+                read = await TryReadAt(st, p, cancellationToken).ConfigureAwait(false);
             }
             catch (KvasarCorruptException) {
                 read = default;
             }
-            if (read.IsFound) {
-                mustResynchronize = false;
+            if (read.IsFound)
                 yield return (new Locator(fileId, p), read.View, read.TotalLength);
 
-                p += read.TotalLength;
-            }
-            else
-                p = (pageId + 1) * _pageSize;
+            p += recordLength;
         }
     }
 
@@ -423,8 +437,10 @@ public sealed class DataLog : IAsyncDisposable
         await st.File.Recycle(MintFreeCacheId()).ConfigureAwait(false);
         st.LiveBytes = 0;
         st.DeadBytes = 0;
-        st.TailBuffer = new byte[_pageSize];
+        st.TailBuffer = new byte[_pagePayloadSize];
         st.TailFill = 0;
+        st.TailIsContinuation = false;
+        st.TailFirstRecordOffset = -1;
         PublishTail(st);
         _target = st;
         return st.Slot;
@@ -489,7 +505,8 @@ public sealed class DataLog : IAsyncDisposable
         if (LogicalLength(st) + recordLength > Locator.MaxOffset)
             throw new InvalidOperationException("The data file is full.");
 
-        var isSinglePage = recordLength <= _pageSize && (isTombstone || value.Length <= _maxInlineValueBytes);
+        var isSinglePage = recordLength <= _pagePayloadSize
+            && (isTombstone || value.Length <= _maxInlineValueBytes);
         var locator = isSinglePage
             ? await AppendSinglePage(st, flags, valueKind, key, value, isTombstone, recordLength)
                 .ConfigureAwait(false)
@@ -502,9 +519,11 @@ public sealed class DataLog : IAsyncDisposable
         SlotState st, RecordFlags flags, KvasarValueKind valueKind,
         ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, bool isTombstone, int recordLength)
     {
-        if (st.TailFill + recordLength > _pageSize)
+        if (st.TailFill + recordLength > _pagePayloadSize)
             await SealTail(st).ConfigureAwait(false);
-        var offset = st.File.PageCount * _pageSize + st.TailFill;
+        var offset = st.File.PageCount * _pagePayloadSize + st.TailFill;
+        if (st.TailFirstRecordOffset < 0)
+            st.TailFirstRecordOffset = st.TailFill;
         RecordCodec.Encode(st.TailBuffer.AsSpan(st.TailFill), flags, valueKind, key.Span, value.Span, isTombstone);
         st.TailFill += recordLength;
         PublishTail(st);
@@ -519,22 +538,32 @@ public sealed class DataLog : IAsyncDisposable
         // Multi-page runs start at a page boundary and occupy whole pages (§5.2).
         if (st.TailFill > 0)
             await SealTail(st).ConfigureAwait(false);
-        var offset = st.File.PageCount * _pageSize;
+        var offset = st.File.PageCount * _pagePayloadSize;
         var buf = ArrayPool<byte>.Shared.Rent(recordLength);
         try {
             RecordCodec.Encode(buf, flags, valueKind, key.Span, value.Span, isTombstone);
             var pos = 0;
-            while (recordLength - pos >= _pageSize) {
-                await st.File.AppendPage(buf.AsMemory(pos, _pageSize)).ConfigureAwait(false);
-                pos += _pageSize;
+            while (recordLength - pos >= _pagePayloadSize) {
+                await AppendFramedPage(
+                        st,
+                        buf.AsMemory(pos, _pagePayloadSize),
+                        isContinuation: pos > 0,
+                        firstRecordOffset: pos == 0 ? 0 : -1)
+                    .ConfigureAwait(false);
+                pos += _pagePayloadSize;
             }
             var rem = recordLength - pos;
             if (rem > 0) {
                 buf.AsSpan(pos, rem).CopyTo(st.TailBuffer);
                 st.TailFill = rem;
+                st.TailIsContinuation = pos > 0;
+                st.TailFirstRecordOffset = pos == 0 ? 0 : -1;
             }
-            else
+            else {
                 st.TailFill = 0;
+                st.TailIsContinuation = false;
+                st.TailFirstRecordOffset = -1;
+            }
             PublishTail(st);
         }
         finally {
@@ -549,36 +578,37 @@ public sealed class DataLog : IAsyncDisposable
         if (st.TailFill == 0)
             return;
 
-        st.TailBuffer.AsSpan(st.TailFill).Clear(); // pad the remainder with zeros
-        await st.File.AppendPage(st.TailBuffer).ConfigureAwait(false);
-        st.TailBuffer = new byte[_pageSize]; // fresh buffer so any handed-out zero-copy slice stays immutable
+        st.TailBuffer.AsSpan(st.TailFill).Clear();
+        await AppendFramedPage(
+                st,
+                st.TailBuffer,
+                st.TailIsContinuation,
+                st.TailFirstRecordOffset)
+            .ConfigureAwait(false);
+        st.TailBuffer = new byte[_pagePayloadSize];
         st.TailFill = 0;
+        st.TailIsContinuation = false;
+        st.TailFirstRecordOffset = -1;
         PublishTail(st);
     }
 
-    private async ValueTask<RecordRead> TryReadTiledPageAt(
-        SlotState st, long offset, long len, CancellationToken cancellationToken)
+    private async ValueTask AppendFramedPage(
+        SlotState st,
+        ReadOnlyMemory<byte> payload,
+        bool isContinuation,
+        int firstRecordOffset)
     {
-        var first = await TryReadAt(st, offset, len, cancellationToken).ConfigureAwait(false);
-        if (!first.IsFound)
-            return default;
-
-        var p = offset + first.TotalLength;
-        while (p < len && p % _pageSize != 0) {
-            var tail = st.Tail;
-            var pageId = p / _pageSize;
-            var inPage = (int)(p % _pageSize);
-            var page = await GetLogicalPage(st, tail, pageId, cancellationToken).ConfigureAwait(false);
-            if (page.Span[inPage..].IndexOfAnyExcept((byte)0) < 0)
-                return first;
-
-            var next = await TryReadAt(st, p, len, cancellationToken).ConfigureAwait(false);
-            if (!next.IsFound)
-                return default;
-
-            p += next.TotalLength;
+        var page = ArrayPool<byte>.Shared.Rent(_pageSize);
+        try {
+            var framed = page.AsMemory(0, _pageSize);
+            framed.Span.Clear();
+            DataPageFraming.Write(framed.Span, isContinuation, firstRecordOffset);
+            payload.CopyTo(framed[KvasarConstants.DataPageHeaderSize..]);
+            await st.File.AppendPage(framed).ConfigureAwait(false);
         }
-        return p <= len ? first : default;
+        finally {
+            ArrayPool<byte>.Shared.Return(page, clearArray: true);
+        }
     }
 
     private async ValueTask<RecordRead> TryReadWithLease(
@@ -612,8 +642,8 @@ public sealed class DataLog : IAsyncDisposable
         if (offset < 0 || offset >= len)
             return default;
 
-        var pageId = offset / _pageSize;
-        var inPage = (int)(offset % _pageSize);
+        var pageId = offset / _pagePayloadSize;
+        var inPage = (int)(offset % _pagePayloadSize);
         var firstPage = await GetLogicalPage(st, tail, pageId, cancellationToken).ConfigureAwait(false);
         int totalLen;
         {
@@ -656,8 +686,8 @@ public sealed class DataLog : IAsyncDisposable
         SlotState st, long offset, long len, CancellationToken cancellationToken)
     {
         var tail = st.Tail;
-        var pageId = offset / _pageSize;
-        var inPage = (int)(offset % _pageSize);
+        var pageId = offset / _pagePayloadSize;
+        var inPage = (int)(offset % _pagePayloadSize);
         var page = await GetLogicalPage(st, tail, pageId, cancellationToken).ConfigureAwait(false);
         return TryReadRecordLength(page.Span, offset, len, inPage, out var totalLen) ? totalLen : 0;
     }
@@ -689,27 +719,56 @@ public sealed class DataLog : IAsyncDisposable
     private long LogicalLength(SlotState st) => LogicalLength(st, st.Tail);
 
     private long LogicalLength(SlotState st, TailSnapshot? tail)
-        => tail is { } t ? t.PageId * _pageSize + t.Fill : st.File.PageCount * _pageSize;
+        => tail is { } t
+            ? t.PageId * _pagePayloadSize + t.Fill
+            : st.File.PageCount * _pagePayloadSize;
 
-    private static ValueTask<ReadOnlyMemory<byte>> GetLogicalPage(
+    private async ValueTask<ReadOnlyMemory<byte>> GetLogicalPage(
         SlotState st, TailSnapshot? tail, long pageId, CancellationToken cancellationToken)
-        => tail is { } t && t.PageId == pageId
-            ? new ValueTask<ReadOnlyMemory<byte>>(t.Buffer.AsMemory(0, t.Fill))
-            : st.File.GetPage(pageId, cancellationToken);
+    {
+        var (payload, _) = await GetFramedLogicalPage(st, tail, pageId, cancellationToken)
+            .ConfigureAwait(false);
+        return payload;
+    }
 
-    private static bool TryGetLogicalPageCached(
+    private async ValueTask<(ReadOnlyMemory<byte> Payload, DataPageFrame Frame)> GetFramedLogicalPage(
+        SlotState st, TailSnapshot? tail, long pageId, CancellationToken cancellationToken)
+    {
+        if (tail is { } t && t.PageId == pageId)
+            return (
+                t.Buffer.AsMemory(0, t.Fill),
+                new DataPageFrame(t.IsContinuation, t.FirstRecordOffset));
+
+        var page = await st.File.GetPage(pageId, cancellationToken).ConfigureAwait(false);
+        if (!DataPageFraming.TryRead(page.Span, _pagePayloadSize, out var frame))
+            throw new KvasarCorruptException($"Invalid data-page framing at page {pageId}.");
+        return (page[KvasarConstants.DataPageHeaderSize..], frame);
+    }
+
+    private bool TryGetLogicalPageCached(
         SlotState st, TailSnapshot? tail, long pageId, out ReadOnlyMemory<byte> page)
     {
         if (tail is { } t && t.PageId == pageId) {
             page = t.Buffer.AsMemory(0, t.Fill);
             return true;
         }
-        return st.File.TryGetCachedPage(pageId, out page);
+        if (!st.File.TryGetCachedPage(pageId, out var framed)
+            || !DataPageFraming.TryRead(framed.Span, _pagePayloadSize, out _)) {
+            page = default;
+            return false;
+        }
+        page = framed[KvasarConstants.DataPageHeaderSize..];
+        return true;
     }
 
     // Writer-only: republishes the tail so readers pick up the newly appended bytes.
     private static void PublishTail(SlotState st)
-        => st.Tail = new TailSnapshot(st.TailBuffer, st.TailFill, st.File.PageCount);
+        => st.Tail = new TailSnapshot(
+            st.TailBuffer,
+            st.TailFill,
+            st.File.PageCount,
+            st.TailIsContinuation,
+            st.TailFirstRecordOffset);
 
     private static int CopyPart(ReadOnlyMemory<byte> page, int start, byte[] destination, int copied, int totalLen)
     {
