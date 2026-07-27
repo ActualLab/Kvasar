@@ -29,12 +29,11 @@ public sealed class RecoveryTests : IDisposable
 
     private string BasePath => Path.Combine(_dir, "store");
 
-    private KvasarOptions Options(bool encrypt = false, int pageSize = 512, long segmentBytes = 8 * 1024) => new() {
+    private KvasarOptions Options(bool encrypt = false, int pageSize = 512) => new() {
         BasePath = BasePath,
         EncryptionKey = _key,
         DisableEncryption = !encrypt,
         PageSize = pageSize,
-        SegmentBytes = segmentBytes,
     };
 
     private static byte[] K(int i) => Encoding.UTF8.GetBytes($"k{i:D6}");
@@ -114,7 +113,7 @@ public sealed class RecoveryTests : IDisposable
             oracle["dupe"] = V(2, 20);
             oracle["emptyval"] = [];
 
-            await store.Flush(true);
+            await store.Flush();
             await AssertMatches(store, oracle); // sanity before close
         }
 
@@ -146,7 +145,7 @@ public sealed class RecoveryTests : IDisposable
                 await store.Set(K(i), v);
                 oracle[Encoding.UTF8.GetString(K(i))] = v;
             }
-            await store.Flush(true);
+            await store.Flush();
         }
 
         // Append a partial page of garbage: what a process killed mid-append leaves above the extent.
@@ -165,7 +164,7 @@ public sealed class RecoveryTests : IDisposable
             await AssertMatches(store, oracle); // nothing below the committed extent was lost
             await store.Set(K("after-recovery"), V(7, 123));
             (await store.Get(K("after-recovery")))!.Value.ToArray().Should().Equal(V(7, 123));
-            await store.Flush(true);
+            await store.Flush();
         }
         // The garbage was never overwritten — its page ids are burned, so the file only grew.
         new FileInfo(ActiveDataFile()).Length.Should().BeGreaterThan(committedLength + pageSize + 100);
@@ -186,7 +185,7 @@ public sealed class RecoveryTests : IDisposable
         await using (var store = await KvasarStore.Open(options)) {
             for (var i = 0; i < 200; i++)
                 await store.Set(K(i), V(i, 80));
-            await store.Flush(true);
+            await store.Flush();
         }
 
         using (var fs = new FileStream(ActiveDataFile(), FileMode.Open, FileAccess.Write, FileShare.None))
@@ -212,7 +211,7 @@ public sealed class RecoveryTests : IDisposable
             for (var i = 0; i < 200; i++)
                 await store.Set(K(i), V(i + round * 1000, 90));
             await store.Compact();
-            await store.Flush(true);
+            await store.Flush();
 
             DataFiles().Should().HaveCount(2);
             IndexFiles().Should().HaveCount(2);
@@ -237,7 +236,7 @@ public sealed class RecoveryTests : IDisposable
                 await store.Set(K(i), null);
                 oracle.Remove(Encoding.UTF8.GetString(K(i)));
             }
-            await store.Flush(true);
+            await store.Flush();
         }
 
         IndexFiles().Should().Contain(x => new FileInfo(x).Length > 0, "a keyed hasher persists the index");
@@ -263,7 +262,7 @@ public sealed class RecoveryTests : IDisposable
                 await store.Set(K(i), v);
                 oracle[Encoding.UTF8.GetString(K(i))] = v;
             }
-            await store.Flush(true);
+            await store.Flush();
         }
 
         var kidxPath = BasePath + ".0.kidx";
@@ -280,7 +279,7 @@ public sealed class RecoveryTests : IDisposable
             var overwrite = V(999999, 90);
             await store.Set(K(5), overwrite); // supersedes an A key
             oracle[Encoding.UTF8.GetString(K(5))] = overwrite;
-            await store.Flush(true);
+            await store.Flush();
         }
 
         // Simulate the index lagging behind the data: restore the pre-B image. The commit named a longer
@@ -307,7 +306,7 @@ public sealed class RecoveryTests : IDisposable
                 await store.Set(K(i), v);
                 oracle[Encoding.UTF8.GetString(K(i))] = v;
             }
-            await store.Flush(true);
+            await store.Flush();
         }
 
         var leftovers = new[] { BasePath + ".001.klog", BasePath + ".kidx", BasePath + ".kidx.tmp", BasePath + ".clean" };
@@ -331,11 +330,11 @@ public sealed class RecoveryTests : IDisposable
         await using (var store = await KvasarStore.Open(Options())) {
             for (var i = 0; i < 100; i++)
                 await store.Set(K(i), V(i, 120));
-            await store.Flush(true);
+            await store.Flush();
             await store.Clear();
             (await ScanToMap(store)).Should().BeEmpty();
             await store.Set(K("survivor"), V(1, 10)); // still usable after Clear
-            await store.Flush(true);
+            await store.Flush();
         }
 
         await using (var store = await KvasarStore.Open(Options())) {

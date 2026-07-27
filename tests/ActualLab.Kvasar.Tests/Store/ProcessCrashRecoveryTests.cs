@@ -174,7 +174,6 @@ public class ProcessCrashRecoveryTests : IDisposable
             EncryptionKey = _key,
             PageSize = pageSize,
             PageCacheBytes = 4L * 1024 * 1024,
-            SegmentBytes = 8 * 1024 * 1024,
         };
 
     private static KvasarKey Key(int index) => Encoding.UTF8.GetBytes($"key-{index:D8}");

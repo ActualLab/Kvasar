@@ -36,6 +36,8 @@ public sealed record KvasarOptions
 
     // Unused. There is one active data file and compaction is total, so nothing rolls at a size
     // threshold (§4). Kept so existing callers still compile.
+    [Obsolete(
+        "SegmentBytes is unused; use CommitBytes to bound the commit and recovery window.")]
     public long SegmentBytes { get; init; } = 16 * 1024 * 1024;
 
     // What a commit does about durability. Atomicity holds under either value — recovery authenticates

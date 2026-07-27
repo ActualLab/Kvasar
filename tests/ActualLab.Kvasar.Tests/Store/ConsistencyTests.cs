@@ -42,7 +42,6 @@ public sealed class ConsistencyTests : IDisposable
         EncryptionKey = _key,
         DisableEncryption = !encrypt,
         PageSize = PageSize,
-        SegmentBytes = 128 * 1024,
         CompactionMinBytes = 8 * 1024,
         CompactionDeadRatio = 0.5,
     };
@@ -235,7 +234,7 @@ public sealed class ConsistencyTests : IDisposable
                         var value = MakeValue(globalId, 1, PickLength(rnd));
                         await store.Set(key, value);
                         if (flushBeforeHandoff)
-                            await store.Flush(false);
+                            await store.Flush();
                         await handoff.Writer.WriteAsync((key, value));
                     }
                 }

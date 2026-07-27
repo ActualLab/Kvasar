@@ -80,17 +80,15 @@ unprofiled — treat these as hypotheses, not findings.**
 > and file sizes are stable to a few percent; **lookup and startup are worth about one significant
 > figure.** Directions in the table above are real; the exact percentages are not.
 
-> ### ⚠ These numbers are not durability-comparable
+> ### ⚠ The durability-matched numbers need re-measuring
 >
-> `KvasarOptions.Durability` now defaults to `Buffered`, and `Flush(fsync: true)` **ignores the flag**
-> (durability is a store-level property in v2, see `DESIGN-Durability.md` §2). So Kvasar no longer
-> fsyncs at the end of a run while SQLite still runs `wal_checkpoint(TRUNCATE)`.
+> The harness now configures `KvasarDurability.Flushed` and ends a run with `Flush()`, matching the
+> SQLite WAL checkpoint's durability intent. The tables in this document were measured before that
+> correction, when Kvasar used the `Buffered` default and `Flush(fsync: true)` ignored its flag.
 >
-> That breaks this file's own rule — *"Both stacks end fully durable… Neither side is credited for
-> work it merely deferred."* It shows up most in the chat scenario, where Kvasar's flush went
-> 2.8 ms → 0.2 ms, which is most of that scenario's apparent gain. **The harness needs a
-> `--durability` switch and a re-run at `Flushed` before the comparison is fair again.** Tracked in
-> `TODO.md` § P5.
+> **Do not treat the published write/flush totals as durability-matched until the corrected harness
+> is re-run.** The old mismatch shows up most in the chat scenario, where Kvasar's flush went
+> 2.8 ms → 0.2 ms and accounts for most of the apparent gain.
 
 \* Startup ms = open + full `ListAllEntries`/`Scan` (the client cache's launch-time hydration).
 Open ms = just reopening the store (Kvasar: load `.kidx` + seed accounting; SQLite: open connection).
@@ -170,11 +168,9 @@ split evenly across the threads), 10% of reads also `Set` a fresh same-size valu
 Nothing is deliberately re-read: an app start renders distinct UI, and Fusion's compute cache dedupes
 repeats upstream.
 
-**No longer true in v2 — see the durability warning above; Kvasar's `Buffered` default does not
-fsync, so only the SQLite side still ends durable.** As originally specified:
-Both stacks end **fully durable** — the harness `LazyWriter` is drained and `wal_checkpoint(TRUNCATE)`
-runs for SQLite; plain Kvasar ends on `store.Flush(fsync: true)`, which force-seals the tail rather
-than waiting out the 500 ms debounce. Neither side is credited for work it merely deferred. Every
+The current harness drains its `LazyWriter`, configures Kvasar with `KvasarDurability.Flushed`, calls
+`store.Flush()`, and runs `wal_checkpoint(TRUNCATE)` for SQLite. The rows below predate that correction
+and must be re-measured before their flush and total columns are compared as durability-matched. Every
 row is the median of 5 cold starts; `min–max` spans all 5.
 
 Machine: 32 logical cores, .NET 10, Windows. Lower is better everywhere.

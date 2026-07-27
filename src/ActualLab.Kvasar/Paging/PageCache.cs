@@ -102,6 +102,17 @@ public sealed class PageCache
         }
     }
 
+    internal void Clear()
+    {
+        foreach (var shard in _shards) {
+            lock (shard.Lock) {
+                shard.Map.Clear();
+                shard.Lru.Clear();
+                shard.Bytes = 0;
+            }
+        }
+    }
+
     internal long ByteCount {
         get {
             var total = 0L;

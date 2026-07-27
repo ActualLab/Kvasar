@@ -33,7 +33,7 @@ public class LockTests : IDisposable
     {
         await using var first = await KvasarStore.Open(Options());
         await first.Set(K("keep"), K("me"));
-        await first.Flush(true);
+        await first.Flush();
 
         // A second opener must fail with a lock exception — NOT wipe the live store's data.
         Func<Task> open = async () => await KvasarStore.Open(Options());

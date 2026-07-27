@@ -25,7 +25,6 @@ public class SmokeTests : IDisposable
         EncryptionKey = _key,
         DisableEncryption = !encrypt,
         PageSize = 4096,
-        SegmentBytes = 64 * 1024,
     };
 
     private static byte[] K(string s) => Encoding.UTF8.GetBytes(s);
@@ -109,7 +108,7 @@ public class SmokeTests : IDisposable
         new Random(42).NextBytes(big);
         await store.Set(K("big"), big);
         (await store.Get(K("big")))!.Value.ToArray().Should().Equal(big);
-        await store.Flush(true);
+        await store.Flush();
         (await store.Get(K("big")))!.Value.ToArray().Should().Equal(big);
     }
 
@@ -118,7 +117,7 @@ public class SmokeTests : IDisposable
     {
         await using (var store = await KvasarStore.Open(Options())) {
             await store.Set(K("a"), K("secret"));
-            await store.Flush(true);
+            await store.Flush();
         }
         // Open with a different key ⇒ throw, never wipe: an intact store must survive a bad key (§3.1).
         var wrong = (byte[])_key.Clone();

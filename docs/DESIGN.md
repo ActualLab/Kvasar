@@ -15,7 +15,7 @@ static readonly / const `PascalCase`.
 - `KvasarKey`, `KvasarValue` (+ `KvasarKeyExt`/`KvasarValueExt`) — the public key/value structs;
   they wrap `ReadOnlyMemory<byte>` and carry the conversions, so the internals below stay on raw memory
 - `Crypto/IKeyHasher`, `Crypto/IKeyDerivation`, `Crypto/IPageCipher` (+ `IPageCipherFactory`)
-- `Internal/Locator`, `Internal/IndexEntry`, `Internal/RecordFlags`, `Internal/KvasarConstants`, `Internal/Varint`
+- `KvasarConstants`, `Internal/Locator`, `Internal/IndexEntry`, `Internal/RecordFlags`, `Internal/Varint`
 
 ## Key invariants / semantics (read carefully)
 
@@ -422,7 +422,7 @@ Other deliberate deviations from SPEC's open decisions:
 - Crypto subkeys are derived from the master key with an **empty HKDF salt** (distinct info labels
   per subkey); per-page nonce uniqueness comes from each segment's own random salt. The master key is
   already a uniformly-random 256-bit secret, so a store-level KDF salt adds nothing (§5.3).
-- Encrypted `.kidx` (`IndexEncryption.On`, or `Auto` with a non-keyed hasher) is not implemented; the
-  store simply **does not persist `.kidx`** in that case and rebuilds the index from the log on open.
+- Encrypted `.kidx` is not implemented. `IndexEncryption.On` is rejected at `Open`; `Auto` with a
+  non-keyed hasher does not persist `.kidx` and rebuilds the index from the log on open.
 - Lock contention raises `KvasarLockException` (distinct from `KvasarCorruptException`) so a second
   opener never triggers wipe-and-recreate on a live store.

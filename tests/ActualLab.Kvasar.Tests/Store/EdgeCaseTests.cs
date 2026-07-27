@@ -31,7 +31,6 @@ public class EdgeCaseTests : IDisposable
         BasePath = Path.Combine(_dir, "store"),
         EncryptionKey = _key,
         PageSize = 512,
-        SegmentBytes = 4 * 1024,
     };
 
     private static byte[] K(string s) => Encoding.UTF8.GetBytes(s);
@@ -54,6 +53,20 @@ public class EdgeCaseTests : IDisposable
         public int SecretSize => 16;
         public ulong Hash(ReadOnlySpan<byte> key, ReadOnlySpan<byte> secret)
             => key.Length == 0 ? 7UL : key[^1];
+    }
+    private sealed class CountingHasher : IKeyHasher
+    {
+        public bool IsKeyed => true;
+        public int SecretSize => 16;
+        public int HashCount { get; private set; }
+
+        public ulong Hash(ReadOnlySpan<byte> key, ReadOnlySpan<byte> secret)
+        {
+            HashCount++;
+            return KeyHashers.SipHash24.Hash(key, secret);
+        }
+
+        public void Reset() => HashCount = 0;
     }
 
     // --- Hash-collision path ------------------------------------------------
@@ -182,7 +195,7 @@ public class EdgeCaseTests : IDisposable
         (await store.Get(K("b"))).Should().BeNull();
 
         // ... and the delete is durable, not just an in-memory index edit.
-        await store.Flush(true);
+        await store.Flush();
         (await store.Get(K("b"))).Should().BeNull();
 
         // Exactly at the limit ⇒ accepted.
@@ -270,7 +283,7 @@ public class EdgeCaseTests : IDisposable
                 keys.Add(k);
             }
             await store.Set(K("key7"), null); // delete
-            await store.Flush(true);
+            await store.Flush();
         }
 
         keys.Add(K("absent"));
@@ -288,6 +301,29 @@ public class EdgeCaseTests : IDisposable
             else
                 batch[i]!.Value.ToArray().Should().Equal(single.Value.ToArray());
         }
+    }
+
+    [Fact]
+    public async Task GetManyHashesEachKeyOnce()
+    {
+        var hasher = new CountingHasher();
+        await using var store = await KvasarStore.Open(Options() with { Hasher = hasher });
+        (KvasarKey, KvasarValue?)[] updates = [
+            (K("a"), K("alpha")),
+            (K("b"), K("bravo")),
+            (K("c"), K("charlie")),
+        ];
+        await store.SetMany(updates);
+        hasher.Reset();
+
+        KvasarKey[] keys = [K("c"), K("missing"), K("a"), K("b")];
+        var results = await store.GetMany(keys);
+
+        hasher.HashCount.Should().Be(keys.Length);
+        results[0]!.Value.ToArray().Should().Equal(K("charlie"));
+        results[1].Should().BeNull();
+        results[2]!.Value.ToArray().Should().Equal(K("alpha"));
+        results[3]!.Value.ToArray().Should().Equal(K("bravo"));
     }
 
     // --- Stats sanity + compaction reclaim ----------------------------------
@@ -359,7 +395,7 @@ public class EdgeCaseTests : IDisposable
         await using (var store = await KvasarStore.Open(v1)) {
             await store.Set(K("a"), K("alpha"));
             await store.Set(K("b"), K("bravo"));
-            await store.Flush(true);
+            await store.Flush();
         }
 
         // Reopen with a different FormatVersion ⇒ store is wiped & regenerated (empty), no throw.
@@ -390,6 +426,28 @@ public class EdgeCaseTests : IDisposable
     }
 
     [Fact]
+    public async Task DisposedStoreRejectsEveryPublicOperation()
+    {
+        var store = await KvasarStore.Open(Options());
+        await store.Set(K("a"), K("alpha"));
+        await store.DisposeAsync();
+
+        Action getStats = () => _ = store.Stats;
+        getStats.Should().Throw<ObjectDisposedException>();
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => store.Get(K("a")).AsTask());
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => store.GetMany([K("a")]).AsTask());
+        await Assert.ThrowsAsync<ObjectDisposedException>(async () => {
+            await foreach (var _ in store.Scan()) { }
+        });
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => store.Set(K("a"), K("beta")).AsTask());
+        await Assert.ThrowsAsync<ObjectDisposedException>(
+            () => store.SetMany([(new KvasarKey(K("a")), new KvasarValue(K("beta")))]).AsTask());
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => store.Clear().AsTask());
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => store.Flush().AsTask());
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => store.Compact().AsTask());
+    }
+
+    [Fact]
     public async Task WipeLeavesNeighbouringFilesAlone()
     {
         // I31: the wipe glob accepted any "<base>.*" ending in .klog, so wiping `store` also deleted
@@ -397,7 +455,7 @@ public class EdgeCaseTests : IDisposable
         var v1 = Options() with { FormatVersion = "1" };
         await using (var store = await KvasarStore.Open(v1)) {
             await store.Set(K("a"), K("alpha"));
-            await store.Flush(true);
+            await store.Flush();
         }
 
         var neighbour = Path.Combine(_dir, "store.backup.klog");
@@ -414,6 +472,54 @@ public class EdgeCaseTests : IDisposable
         (await store2.Get(K("a"))).Should().BeNull();
     }
 
+    [Fact]
+    public async Task WipeLeavesUnownedNumericSlotFilesAlone()
+    {
+        var v1 = Options() with { FormatVersion = "1" };
+        await using (var store = await KvasarStore.Open(v1)) {
+            await store.Set(K("a"), K("alpha"));
+            await store.Flush();
+        }
+
+        var dataNeighbour = Path.Combine(_dir, "store.2.kdat");
+        var indexNeighbour = Path.Combine(_dir, "store.123.kidx");
+        await File.WriteAllTextAsync(dataNeighbour, "not kvasar's");
+        await File.WriteAllTextAsync(indexNeighbour, "also not kvasar's");
+
+        await using var store2 = await KvasarStore.Open(Options() with { FormatVersion = "2" });
+
+        (await File.ReadAllTextAsync(dataNeighbour)).Should().Be("not kvasar's");
+        (await File.ReadAllTextAsync(indexNeighbour)).Should().Be("also not kvasar's");
+        (await store2.Get(K("a"))).Should().BeNull();
+    }
+
+    [Fact]
+    public async Task InvalidNumericOptionsAndOversizedKeysAreRejectedAtTheApiBoundary()
+    {
+        await AssertOpenFails(Options() with { MaxValueBytes = -1 });
+        await AssertOpenFails(Options() with { MaxInlineValueBytes = -1 });
+        await AssertOpenFails(Options() with { CommitBytes = 0 });
+        await AssertOpenFails(Options() with { CompactionDeadRatio = double.NaN });
+        await AssertOpenFails(Options() with { CompactionMinBytes = -1 });
+        await AssertOpenFails(Options() with { PageCacheBytes = 0 });
+
+        await using var store = await KvasarStore.Open(Options());
+        var oversizedKey = new byte[KvasarConstants.MaxKeyBytes + 1];
+        var setError = await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => store.Set(oversizedKey, K("value")).AsTask());
+        setError.ParamName.Should().Be("key");
+        var setManyError = await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => store.SetMany([(new KvasarKey(oversizedKey), new KvasarValue(K("value")))]).AsTask());
+        setManyError.ParamName.Should().Be("updates");
+    }
+
+    [Fact]
+    public async Task IndexEncryptionOnIsRejected()
+    {
+        await Assert.ThrowsAsync<NotSupportedException>(
+            () => OpenAndDispose(Options() with { IndexEncryption = IndexEncryption.On }));
+    }
+
     // --- Version (the caller's own data version) mismatch ⇒ wipe ------------
 
     [Fact]
@@ -422,7 +528,7 @@ public class EdgeCaseTests : IDisposable
         var v1 = Options() with { Version = "1.0" };
         await using (var store = await KvasarStore.Open(v1)) {
             await store.Set(K("a"), K("alpha"));
-            await store.Flush(true);
+            await store.Flush();
         }
 
         // Same Version ⇒ the store survives.
@@ -433,12 +539,23 @@ public class EdgeCaseTests : IDisposable
         await using (var store = await KvasarStore.Open(Options() with { Version = "1.1" })) {
             (await ScanAll(store)).Should().BeEmpty();
             await store.Set(K("b"), K("bravo"));
-            await store.Flush(true);
+            await store.Flush();
         }
 
         // Dropping Version entirely is a change too ⇒ another wipe.
         await using (var store = await KvasarStore.Open(Options())) {
             (await ScanAll(store)).Should().BeEmpty();
         }
+    }
+
+    private static async Task AssertOpenFails(KvasarOptions options)
+    {
+        var error = await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => OpenAndDispose(options));
+        error.ParamName.Should().Be("options");
+    }
+
+    private static async Task OpenAndDispose(KvasarOptions options)
+    {
+        await using var store = await KvasarStore.Open(options);
     }
 }

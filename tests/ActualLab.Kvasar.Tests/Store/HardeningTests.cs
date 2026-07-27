@@ -111,7 +111,7 @@ public class HardeningTests : IDisposable
         await using (var store = await KvasarStore.Open(Options(basePath))) {
             for (var i = 0; i < 64; i++)
                 await store.Set(Key($"k{i}"), Val($"v{i}"));
-            await store.Flush(true);
+            await store.Flush();
         }
 
         var dataPath = $"{basePath}.0.kdat";
@@ -126,7 +126,7 @@ public class HardeningTests : IDisposable
         await using (var store = await KvasarStore.Open(Options(basePath))) {
             await store.Set(Key("after"), Val("recovered"));
             (await store.Get(Key("after")))!.Value.ToArray().Should().Equal(Val("recovered").ToArray());
-            await store.Flush(true);
+            await store.Flush();
         }
 
         new FileInfo(dataPath).Length.Should().BeGreaterThan(tornLength,
@@ -145,7 +145,6 @@ public class HardeningTests : IDisposable
             EncryptionKey = _key,
             PageSize = 4096,
             PageCacheBytes = 1 << 20,
-            SegmentBytes = 64 * 1024 * 1024,
         };
 
     private static IndexEntry NewEntry(ulong keyHash, uint segmentId, uint offset, uint length)

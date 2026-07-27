@@ -34,12 +34,11 @@ public sealed class ConcurrencyTests : IDisposable
         catch { /* best effort */ }
     }
 
-    private KvasarOptions Options(bool encrypt, long segmentBytes) => new() {
+    private KvasarOptions Options(bool encrypt) => new() {
         BasePath = Path.Combine(_dir, "store"),
         EncryptionKey = _key,
         DisableEncryption = !encrypt,
         PageSize = PageSize,
-        SegmentBytes = segmentBytes,
         CompactionMinBytes = 8 * 1024,
         CompactionDeadRatio = 0.5,
     };
@@ -98,7 +97,7 @@ public sealed class ConcurrencyTests : IDisposable
     public async Task ReadersAndWriter_NoTornReads_NoLostWrites(bool encrypt)
     {
         var errors = new ConcurrentQueue<string>();
-        await using var store = await KvasarStore.Open(Options(encrypt, segmentBytes: 128 * 1024));
+        await using var store = await KvasarStore.Open(Options(encrypt));
 
         // Writer-owned state (read by the test thread only after the writer is joined).
         var lastVer = new int[KeyCount];
@@ -141,7 +140,7 @@ public sealed class ConcurrencyTests : IDisposable
                         }
                     }
                     if ((++ops & 63) == 0)
-                        await store.Flush(false);
+                        await store.Flush();
                 }
             }
             catch (Exception ex) {
@@ -155,7 +154,7 @@ public sealed class ConcurrencyTests : IDisposable
         errors.Should().BeEmpty();
 
         // No lost committed writes: quiesce, flush durably, then read every key back.
-        await store.Flush(true);
+        await store.Flush();
         for (var k = 0; k < KeyCount; k++) {
             var got = await store.Get(Key(k));
             if (present[k]) {
@@ -179,7 +178,7 @@ public sealed class ConcurrencyTests : IDisposable
         var errors = new ConcurrentQueue<string>();
         // A low dead-ratio threshold ⇒ the writer compacts (and switches data slots) constantly while
         // readers run, so every read races a slot switch.
-        await using var store = await KvasarStore.Open(Options(encrypt, segmentBytes: 24 * 1024));
+        await using var store = await KvasarStore.Open(Options(encrypt));
 
         var deadline = Environment.TickCount64 + DurationMs;
         var readers = StartReaders(store, errors, deadline);
@@ -192,7 +191,7 @@ public sealed class ConcurrencyTests : IDisposable
                     var k = rnd.Next(KeyCount);
                     await store.Set(Key(k), MakeValue(k, rnd.Next(1, 1 << 20)));
                     if ((++ops & 31) == 0)
-                        await store.Flush(false);
+                        await store.Flush();
                     if ((ops & 511) == 0)
                         await store.Compact(); // slot switch concurrent with lock-free reads (§4)
                 }
@@ -209,7 +208,7 @@ public sealed class ConcurrencyTests : IDisposable
 
         // Compaction recycles slots in place: the file set is the same two data files it started with.
         Directory.GetFiles(_dir, "store.*.kdat").Should().HaveCount(2);
-        await store.Flush(true);
+        await store.Flush();
         for (var k = 0; k < KeyCount; k++)
             (await store.Get(Key(k))).Should().NotBeNull($"key {k} must survive every compaction");
     }
@@ -222,12 +221,12 @@ public sealed class ConcurrencyTests : IDisposable
     public async Task ScanDuringWrites(bool encrypt)
     {
         var errors = new ConcurrentQueue<string>();
-        await using var store = await KvasarStore.Open(Options(encrypt, segmentBytes: 48 * 1024));
+        await using var store = await KvasarStore.Open(Options(encrypt));
 
         // Seed so Scan has something to enumerate from the start.
         for (var k = 0; k < KeyCount; k++)
             await store.Set(Key(k), MakeValue(k, 1));
-        await store.Flush(false);
+        await store.Flush();
 
         var deadline = Environment.TickCount64 + DurationMs;
 
@@ -264,7 +263,7 @@ public sealed class ConcurrencyTests : IDisposable
                     var k = rnd.Next(KeyCount);
                     await store.Set(Key(k), MakeValue(k, rnd.Next(2, 1 << 20)));
                     if ((++ops & 63) == 0)
-                        await store.Flush(false);
+                        await store.Flush();
                 }
             }
             catch (Exception ex) {

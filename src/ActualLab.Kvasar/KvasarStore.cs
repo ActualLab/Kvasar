@@ -17,6 +17,9 @@ public sealed class KvasarStore : IAsyncDisposable
     // Below this, a GetMany batch cannot consume the ~1 MiB run a prefetch pulls, so it costs more
     // than it saves. See the note in GetMany.
     private const int MinPrefetchBatchSize = 8;
+    private static readonly IComparer<(ulong Packed, int Index, ulong Hash)> GetManyOrderComparer =
+        Comparer<(ulong Packed, int Index, ulong Hash)>.Create(
+            static (a, b) => a.Packed.CompareTo(b.Packed));
 
     private readonly KvasarOptions _options;
     private readonly uint _formatVer;
@@ -61,10 +64,14 @@ public sealed class KvasarStore : IAsyncDisposable
     private int _isDisposeStarted;
     private bool _isDisposed;
 
-    public KvasarStats Stats
-        // Best-effort snapshot: read without taking the write lock, so a concurrent writer may shift
-        // the numbers mid-read. They're advisory (compaction/diagnostics), never used for correctness.
-        => new(_index.Count, _data.LiveBytes, _data.DeadBytes, _data.FileBytes);
+    public KvasarStats Stats {
+        get {
+            // Best-effort snapshot: read without taking the write lock, so a concurrent writer may shift
+            // the numbers mid-read. They're advisory (compaction/diagnostics), never used for correctness.
+            ThrowIfDisposed();
+            return new(_index.Count, _data.LiveBytes, _data.DeadBytes, _data.FileBytes);
+        }
+    }
 
     public static async ValueTask<KvasarStore> Open(
         KvasarOptions options, CancellationToken cancellationToken = default)
@@ -73,6 +80,31 @@ public sealed class KvasarStore : IAsyncDisposable
             throw new ArgumentException($"EncryptionKey must be {KvasarConstants.MasterKeySize} bytes.", nameof(options));
         if (string.IsNullOrEmpty(options.BasePath))
             throw new ArgumentException("BasePath is required.", nameof(options));
+        if (options.MaxValueBytes is <= 0 or > KvasarConstants.MaxRecordValueBytes)
+            throw new ArgumentOutOfRangeException(
+                nameof(options), options.MaxValueBytes,
+                $"MaxValueBytes must be in [1, {KvasarConstants.MaxRecordValueBytes}].");
+        if (options.MaxInlineValueBytes < 0 || options.MaxInlineValueBytes > options.MaxValueBytes)
+            throw new ArgumentOutOfRangeException(
+                nameof(options), options.MaxInlineValueBytes,
+                "MaxInlineValueBytes must be zero or no greater than MaxValueBytes.");
+        if (options.CommitBytes <= 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(options), options.CommitBytes, "CommitBytes must be positive.");
+        if (double.IsNaN(options.CompactionDeadRatio)
+            || options.CompactionDeadRatio <= 0 || options.CompactionDeadRatio > 1)
+            throw new ArgumentOutOfRangeException(
+                nameof(options), options.CompactionDeadRatio,
+                "CompactionDeadRatio must be in (0, 1].");
+        if (options.CompactionMinBytes < 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(options), options.CompactionMinBytes,
+                "CompactionMinBytes must be non-negative.");
+        if (options.PageCacheBytes <= 0)
+            throw new ArgumentOutOfRangeException(
+                nameof(options), options.PageCacheBytes, "PageCacheBytes must be positive.");
+        if (options.IndexEncryption == IndexEncryption.On)
+            throw new NotSupportedException("Encrypted index persistence is not supported.");
 
         // The lock is taken here and held across wipe-and-recreate. Releasing it around the wipe would let
         // another process open a fresh store that we then delete out from under it — on Unix the unlink
@@ -211,6 +243,7 @@ public sealed class KvasarStore : IAsyncDisposable
     public ValueTask<KvasarValue?> Get(
         KvasarKey key, CancellationToken cancellationToken = default)
     {
+        ThrowIfDisposed();
         // Not an async method: when the record's page is already decrypted in the cache — the common
         // case — this returns an already-completed ValueTask with no state machine and no allocation.
         var h = _hasher.Hash(key.Span, _hashKey);
@@ -231,6 +264,7 @@ public sealed class KvasarStore : IAsyncDisposable
     public async ValueTask<KvasarValue?[]> GetMany(
         IReadOnlyList<KvasarKey> keys, CancellationToken cancellationToken = default)
     {
+        ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(keys);
         var results = new KvasarValue?[keys.Count];
         if (keys.Count <= 1) {
@@ -241,9 +275,9 @@ public sealed class KvasarStore : IAsyncDisposable
 
         // §6.4: resolve locators from the in-RAM index first, then read in locator order with run
         // readahead, so a cold batch walks the log forward instead of paying one random I/O per key.
-        // Get() still does the candidate walk and the on-disk full-key verify, so hash-collision
-        // handling is unchanged — this decides only the order and the prefetching.
-        var order = new (ulong Packed, int Index)[keys.Count];
+        // The resolved hash and first locator are carried into the read pass, which still performs
+        // full-key verification and walks any further collision candidates.
+        var order = new (ulong Packed, int Index, ulong Hash)[keys.Count];
         for (var i = 0; i < keys.Count; i++) {
             var h = _hasher.Hash(keys[i].Span, _hashKey);
             var cursor = _index.Probe(h);
@@ -254,9 +288,9 @@ public sealed class KvasarStore : IAsyncDisposable
                 packed = loc.Packed;
                 break;
             }
-            order[i] = (packed, i);
+            order[i] = (packed, i, h);
         }
-        Array.Sort(order, static (a, b) => a.Packed.CompareTo(b.Packed));
+        Array.Sort(order, GetManyOrderComparer);
 
         // Readahead only pays when the batch is big enough to consume the run it pulls. A run is
         // PrefetchPages (~1 MiB), so issuing one for a 2-key batch reads a megabyte to serve two
@@ -265,7 +299,7 @@ public sealed class KvasarStore : IAsyncDisposable
         var prefetchPages = keys.Count >= MinPrefetchBatchSize ? _data.PrefetchPages : 0;
         var prefetchedFile = uint.MaxValue;
         var nextPrefetchPage = 0L;
-        foreach (var (packed, index) in order) {
+        foreach (var (packed, index, hash) in order) {
             if (packed != ulong.MaxValue && prefetchPages > 0) {
                 var loc = Locator.FromPacked(packed);
                 var pageId = loc.Offset / _pageSize;
@@ -276,7 +310,9 @@ public sealed class KvasarStore : IAsyncDisposable
                     nextPrefetchPage = pageId + prefetchPages;
                 }
             }
-            results[index] = await Get(keys[index], cancellationToken).ConfigureAwait(false);
+            if (packed != ulong.MaxValue)
+                results[index] = await GetManyValue(
+                    keys[index], hash, Locator.FromPacked(packed), cancellationToken).ConfigureAwait(false);
         }
         return results;
     }
@@ -284,6 +320,7 @@ public sealed class KvasarStore : IAsyncDisposable
     public async IAsyncEnumerable<(KvasarKey Key, KvasarValue Value)> Scan(
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
+        ThrowIfDisposed();
         IndexEntry[] entries;
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try {
@@ -342,6 +379,10 @@ public sealed class KvasarStore : IAsyncDisposable
     public async ValueTask Set(
         KvasarKey key, KvasarValue? value, CancellationToken cancellationToken = default)
     {
+        ThrowIfDisposed();
+        if (key.Length > KvasarConstants.MaxKeyBytes)
+            throw new ArgumentOutOfRangeException(
+                nameof(key), key.Length, $"Key length must not exceed {KvasarConstants.MaxKeyBytes} bytes.");
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         await SetLocked(key, value).WaitAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -350,7 +391,13 @@ public sealed class KvasarStore : IAsyncDisposable
         IReadOnlyList<(KvasarKey Key, KvasarValue? Value)> updates,
         CancellationToken cancellationToken = default)
     {
+        ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(updates);
+        for (var i = 0; i < updates.Count; i++)
+            if (updates[i].Key.Length > KvasarConstants.MaxKeyBytes)
+                throw new ArgumentOutOfRangeException(
+                    nameof(updates), updates[i].Key.Length,
+                    $"Key length must not exceed {KvasarConstants.MaxKeyBytes} bytes.");
         if (updates.Count == 0)
             return;
         // Last write wins for duplicate keys: keep only the last occurrence per key hash. Hashing is
@@ -370,21 +417,28 @@ public sealed class KvasarStore : IAsyncDisposable
 
     public async ValueTask Clear(CancellationToken cancellationToken = default)
     {
+        ThrowIfDisposed();
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         await ClearLocked().WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    // The fsync argument is ignored: durability is a property of the store (KvasarOptions.Durability),
-    // not of a call site, and this protocol has exactly one durability call (§2, §5.1). The overload is
-    // kept only so existing callers still compile; Flush() means "commit".
-    public async ValueTask Flush(bool fsync, CancellationToken cancellationToken = default)
+    public ValueTask Flush()
     {
-        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-        await FlushLocked().WaitAsync(cancellationToken).ConfigureAwait(false);
+        ThrowIfDisposed();
+        return FlushCore(CancellationToken.None);
+    }
+
+    [Obsolete(
+        "Use Flush(); configure durability through KvasarOptions.Durability.")]
+    public ValueTask Flush(bool fsync, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        return FlushCore(cancellationToken);
     }
 
     public async ValueTask Compact(CancellationToken cancellationToken = default)
     {
+        ThrowIfDisposed();
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         // The only write with a genuinely cancellable interior: the token stops the copy pass at a record
         // boundary (see CompactCore), and the pass in flight still leaves the store consistent.
@@ -398,6 +452,12 @@ public sealed class KvasarStore : IAsyncDisposable
     // --- Private: write-lock bodies ----------------------------------------
     // Each of these is entered with the write lock already held and releases it; they return Task (not
     // ValueTask) because the public wrapper awaits them through Task.WaitAsync.
+
+    private async ValueTask FlushCore(CancellationToken cancellationToken)
+    {
+        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await FlushLocked().WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
 
     private async Task SetLocked(KvasarKey key, KvasarValue? value)
     {
@@ -458,8 +518,7 @@ public sealed class KvasarStore : IAsyncDisposable
     private async Task FlushLocked()
     {
         try {
-            if (_isDisposed)
-                return;
+            ThrowIfDisposed();
             await Commit(false).ConfigureAwait(false);
             await MaybeCompact().ConfigureAwait(false);
         }
@@ -690,8 +749,6 @@ public sealed class KvasarStore : IAsyncDisposable
 
     private async ValueTask CloseLogs()
     {
-        // _data keeps its (disposed) reference rather than going null: lock-free readers dereference it
-        // without a null check, and a disposed log answers a read with a miss instead of an NRE.
         if (_data is { } data) {
             try {
                 await data.DisposeAsync().ConfigureAwait(false);
@@ -709,6 +766,8 @@ public sealed class KvasarStore : IAsyncDisposable
             }
         }
         _indexLogs = [];
+        if (_cache is { } cache)
+            cache.Clear();
     }
 
     private void WipeFiles()
@@ -736,14 +795,14 @@ public sealed class KvasarStore : IAsyncDisposable
         var suffix = fileName.AsSpan(baseName.Length);
         if (suffix is ".kvs")
             return true;
-        if (IsSlotSuffix(suffix, ".kdat") || IsSlotSuffix(suffix, ".kidx"))
+        if (suffix is ".0.kdat" or ".1.kdat" or ".0.kidx" or ".1.kidx")
             return true;
 
         // Pre-superblock leftovers, so the first open on the new layout doesn't strand a v1 file set.
-        return suffix is ".kidx" or ".clean" or ".kidx.tmp" || IsSlotSuffix(suffix, ".klog");
+        return suffix is ".kidx" or ".clean" or ".kidx.tmp" || IsNumericSuffix(suffix, ".klog");
     }
 
-    private static bool IsSlotSuffix(ReadOnlySpan<char> suffix, string extension)
+    private static bool IsNumericSuffix(ReadOnlySpan<char> suffix, string extension)
     {
         if (suffix.Length < extension.Length + 2 || suffix[0] != '.'
             || !suffix.EndsWith(extension, StringComparison.Ordinal))
@@ -874,7 +933,7 @@ public sealed class KvasarStore : IAsyncDisposable
                 if (Interlocked.Exchange(ref _isDirty, 0) == 0)
                     continue;
                 try {
-                    await Flush(false, _disposeCts.Token).ConfigureAwait(false);
+                    await FlushCore(_disposeCts.Token).ConfigureAwait(false);
                 }
                 catch (Exception e) when (e is not OperationCanceledException) {
                     // Best-effort: a failed background commit costs durability, never consistency, so the
@@ -1040,6 +1099,24 @@ public sealed class KvasarStore : IAsyncDisposable
         return null;
     }
 
+    private async ValueTask<KvasarValue?> GetManyValue(
+        KvasarKey key, ulong keyHash, Locator firstLoc, CancellationToken cancellationToken)
+    {
+        var value = await TryReadValue(firstLoc, key, cancellationToken).ConfigureAwait(false);
+        if (value is not null)
+            return value;
+
+        var cursor = _index.Probe(keyHash);
+        while (cursor.MoveNext(out var loc, out _)) {
+            if (cursor.CurrentHash != keyHash || loc == firstLoc)
+                continue;
+            value = await TryReadValue(loc, key, cancellationToken).ConfigureAwait(false);
+            if (value is not null)
+                return value;
+        }
+        return null;
+    }
+
     private async ValueTask<KvasarValue?> TryReadValue(
         Locator loc, KvasarKey key, CancellationToken cancellationToken)
     {
@@ -1089,6 +1166,9 @@ public sealed class KvasarStore : IAsyncDisposable
         // PageCache keys *decrypted* pages by (fileId, pageId) and the .kdat header's id is unauthenticated
         // plaintext, so the ids come from here instead — the cache is per-process, so a counter does (§3.2).
         => unchecked((uint)Interlocked.Increment(ref _nextCacheId));
+
+    private void ThrowIfDisposed()
+        => ObjectDisposedException.ThrowIf(Volatile.Read(ref _isDisposed), this);
 
     private static int ResolveFreshPageSize(KvasarOptions options)
     {

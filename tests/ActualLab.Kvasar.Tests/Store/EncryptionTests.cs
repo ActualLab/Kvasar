@@ -27,7 +27,6 @@ public class EncryptionTests : IDisposable
         EncryptionKey = key ?? _key,
         DisableEncryption = !encrypt,
         PageSize = 4096,
-        SegmentBytes = 64 * 1024,
     };
 
     private static byte[] K(string s) => Encoding.UTF8.GetBytes(s);
@@ -56,7 +55,7 @@ public class EncryptionTests : IDisposable
 
         await using (var store = await KvasarStore.Open(Options())) {
             await store.Set(K("marker-key"), value);
-            await store.Flush(true);
+            await store.Flush();
         }
 
         var raw = await File.ReadAllBytesAsync(LogPath());
@@ -75,7 +74,7 @@ public class EncryptionTests : IDisposable
 
         await using (var store = await KvasarStore.Open(Options(encrypt: false))) {
             await store.Set(K("marker-key"), value);
-            await store.Flush(true);
+            await store.Flush();
         }
 
         var raw = await File.ReadAllBytesAsync(LogPath());
@@ -94,7 +93,7 @@ public class EncryptionTests : IDisposable
         await using (var store = await KvasarStore.Open(Options())) {
             await store.Set(K("a"), K("secret"));
             await store.Set(K("b"), K("more-secret"));
-            await store.Flush(true);
+            await store.Flush();
         }
 
         var wrong = new byte[32];
@@ -132,7 +131,7 @@ public class EncryptionTests : IDisposable
         await using (var store = await KvasarStore.Open(Options())) {
             for (var i = 0; i < 8; i++)
                 await store.Set(K("key-" + i), K("payload-value-" + i));
-            await store.Flush(true);
+            await store.Flush();
         }
 
         var logPath = LogPath();
@@ -167,7 +166,7 @@ public class EncryptionTests : IDisposable
         await using (var store = await KvasarStore.Open(Options())) {
             await store.Set(K("k1"), K("v1"));
             await store.Set(K("blob"), payload);
-            await store.Flush(true);
+            await store.Flush();
         }
         await using (var store = await KvasarStore.Open(Options())) {
             (await store.Get(K("k1")))!.Value.ToArray().Should().Equal(K("v1"));

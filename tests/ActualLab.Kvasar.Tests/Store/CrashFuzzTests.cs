@@ -17,7 +17,6 @@ public sealed class CrashFuzzTests : IDisposable
     private const string StoreName = "store";
     private const string ProbeKey = "probe-after-recovery";
     private const int PageSize = 4096;
-    private const long SegmentBytes = 96 * 1024;
     private const int KeyPoolSize = 80;
     private const int OpsPerRound = 45;
     private const int RoundsPerSeed = 4;
@@ -168,7 +167,7 @@ public sealed class CrashFuzzTests : IDisposable
             probeRead.Should().NotBeNull(because);
             probeRead!.Value.ToArray().Should().Equal(probeValue, because);
             contents[ProbeKey] = probeValue;
-            await store.Flush(true);
+            await store.Flush();
         }
 
         // Recovery must converge: reopening what recovery produced yields exactly the same store.
@@ -351,7 +350,7 @@ public sealed class CrashFuzzTests : IDisposable
         for (var i = 0; i < count; i++) {
             var roll = rnd.Next(100);
             if (roll < 10) {
-                await store.Flush(rnd.Next(3) == 0);
+                await store.Flush();
                 model.OnFlush();
                 continue;
             }
@@ -432,7 +431,6 @@ public sealed class CrashFuzzTests : IDisposable
         EncryptionKey = _key,
         DisableEncryption = !encrypt,
         PageSize = PageSize,
-        SegmentBytes = SegmentBytes,
         // Durable mode: these tests assert that flushed writes survive an abort, which is only a guarantee
         // when Set is durable before it returns. Deferred flushing has its own suite in FlushDelayTests.
         FlushDelay = TimeSpan.Zero,
