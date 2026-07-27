@@ -7,12 +7,13 @@ namespace ActualLab.Kvasar.Tests.Index;
 public sealed class IndexLogTests
 {
     private const uint FormatVer = 7;
+    private static readonly byte[] MacKey = Enumerable.Range(0, KvasarConstants.IndexMacKeySize).Select(i => (byte)(i * 7 + 1)).ToArray();
 
     [Fact]
     public async Task CheckpointRoundTrip()
     {
         var file = new IndexLogTestFile();
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
         var entries = new[] {
             Entry(0x1111_0000_0000_0001, 1, 100, 10),
             Entry(0x2222_0000_0000_0002, 1, 200, 20),
@@ -33,7 +34,7 @@ public sealed class IndexLogTests
     public async Task EmptyCheckpointRoundTrips()
     {
         var file = new IndexLogTestFile();
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
 
         await log.WriteCheckpoint(Array.Empty<IndexEntry>(), 12345);
 
@@ -47,7 +48,7 @@ public sealed class IndexLogTests
     public async Task DeltasResolveLastWriterWins()
     {
         var file = new IndexLogTestFile();
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
         await log.WriteCheckpoint(new[] { Entry(10, 1, 100, 10) }, 100);
 
         // Later delta for the same key overrides the checkpoint entry.
@@ -75,7 +76,7 @@ public sealed class IndexLogTests
     public async Task DeltasPreserveSameHashFanOut()
     {
         var file = new IndexLogTestFile();
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
         await log.WriteCheckpoint(new[] {
             Entry(10, 1, 100, 10, keyId: 1001),
             Entry(10, 1, 200, 20, keyId: 1002),
@@ -95,7 +96,7 @@ public sealed class IndexLogTests
     public async Task TombstoneDeltaSurvivesIntoEntries()
     {
         var file = new IndexLogTestFile();
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
         await log.WriteCheckpoint(new[] { Entry(10, 1, 100, 10) }, 0);
         await log.AppendDelta(Entry(10, 1, 100, 10, isTombstone: true));
 
@@ -111,7 +112,7 @@ public sealed class IndexLogTests
     public async Task CheckpointDropsTombstonesAndResetsDeltaTail()
     {
         var file = new IndexLogTestFile();
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
         await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 0);
         for (var i = 0; i < 8; i++)
             await log.AppendDelta(Entry(100 + (ulong)i, 1, 1000 + i, 10));
@@ -138,7 +139,7 @@ public sealed class IndexLogTests
     public async Task TornTrailingDeltaIsDropped()
     {
         var file = new IndexLogTestFile();
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
         await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 0);
         await log.AppendDelta(Entry(2, 1, 200, 20));
         await log.Flush();
@@ -157,7 +158,7 @@ public sealed class IndexLogTests
         // I3: v1 read the delta tail to raw EOF, so a torn delta misaligned every later delta and admitted
         // fabricated locators. validLength is authoritative here — bytes past it are never read.
         var file = new IndexLogTestFile();
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
         await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 0);
 
         await log.AppendDelta(Entry(2, 1, 200, 20));
@@ -181,7 +182,7 @@ public sealed class IndexLogTests
     public async Task GarbagePastValidLengthIsIgnored()
     {
         var file = new IndexLogTestFile();
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
         await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 0);
         await log.AppendDelta(Entry(2, 1, 200, 20));
         await log.Flush();
@@ -202,7 +203,7 @@ public sealed class IndexLogTests
     public async Task AbsentFileReturnsNull()
     {
         var file = new IndexLogTestFile();
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
 
         (await log.Read()).Should().BeNull();
         log.Length.Should().Be(0);
@@ -213,7 +214,7 @@ public sealed class IndexLogTests
     {
         var file = new IndexLogTestFile();
         await file.Write(0, new byte[8]);
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
 
         (await log.Read()).Should().BeNull();
     }
@@ -222,7 +223,7 @@ public sealed class IndexLogTests
     public async Task BadMagicReturnsNull()
     {
         var file = new IndexLogTestFile();
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
         await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 0);
         await file.Write(0, "XIDX"u8.ToArray());
 
@@ -233,10 +234,10 @@ public sealed class IndexLogTests
     public async Task WrongFormatVerReturnsNull()
     {
         var file = new IndexLogTestFile();
-        await using (var log = await IndexLog.Open(file, FormatVer))
+        await using (var log = await IndexLog.Open(file, FormatVer, MacKey))
             await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 0);
 
-        await using var other = await IndexLog.Open(file, FormatVer + 1);
+        await using var other = await IndexLog.Open(file, FormatVer + 1, MacKey);
         (await other.Read()).Should().BeNull();
     }
 
@@ -244,7 +245,7 @@ public sealed class IndexLogTests
     public async Task WrongEntrySizeReturnsNull()
     {
         var file = new IndexLogTestFile();
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
         await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 0);
         await PatchUInt32(file, 8, (uint)IndexLog.EntrySize + 1);
 
@@ -255,7 +256,7 @@ public sealed class IndexLogTests
     public async Task WrongLayoutVersionReturnsNull()
     {
         var file = new IndexLogTestFile();
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
         await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 0);
         await PatchUInt32(file, 12, 1);
 
@@ -266,7 +267,7 @@ public sealed class IndexLogTests
     public async Task NegativeDataCommitLengthReturnsNull()
     {
         var file = new IndexLogTestFile();
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
         await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 0);
         await PatchInt64(file, 24, -1);
 
@@ -282,7 +283,7 @@ public sealed class IndexLogTests
     public async Task HostileCheckpointCountReturnsNull(long checkpointCount)
     {
         var file = new IndexLogTestFile();
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
         await log.WriteCheckpoint(
             new[] { Entry(1, 1, 100, 10), Entry(2, 1, 200, 20), Entry(3, 1, 300, 30) }, 0);
         await PatchInt64(file, 16, checkpointCount);
@@ -296,7 +297,7 @@ public sealed class IndexLogTests
     {
         const int deltaCount = 1000;
         var file = new IndexLogTestFile();
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
         await log.WriteCheckpoint(Array.Empty<IndexEntry>(), 0);
 
         file.WriteCount = 0;
@@ -316,7 +317,7 @@ public sealed class IndexLogTests
     public async Task ReopenAppendsAfterTheTornTail()
     {
         var file = new IndexLogTestFile();
-        await using (var log = await IndexLog.Open(file, FormatVer)) {
+        await using (var log = await IndexLog.Open(file, FormatVer, MacKey)) {
             await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 555);
             await log.AppendDelta(Entry(2, 1, 200, 20));
             await log.WriteCommitMac(0);
@@ -325,7 +326,7 @@ public sealed class IndexLogTests
         // past it, so no later delta is ever misaligned by it.
         await file.Write(file.Length, new byte[IndexLog.EntrySize - 3]);
 
-        await using var reopened = await IndexLog.Open(file, FormatVer);
+        await using var reopened = await IndexLog.Open(file, FormatVer, MacKey);
         reopened.Length.Should().Be(IndexLog.HeaderSize + (2 * IndexLog.EntrySize));
         (await reopened.Read(reopened.Length, 0)).Should().NotBeNull();
         await reopened.AppendDelta(Entry(3, 1, 300, 30));

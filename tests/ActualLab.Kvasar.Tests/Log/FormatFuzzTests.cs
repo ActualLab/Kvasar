@@ -11,6 +11,7 @@ namespace ActualLab.Kvasar.Tests.Log;
 public class FormatFuzzTests
 {
     private const uint FormatVer = 1;
+    private static readonly byte[] MacKey = Enumerable.Range(0, KvasarConstants.IndexMacKeySize).Select(i => (byte)(i * 7 + 1)).ToArray();
     private const int Seed = 20260724;
 
     // --- Record round-trip fidelity ----------------------------------------
@@ -410,7 +411,7 @@ public class FormatFuzzTests
     {
         TryDelete(path);
         var file = await FileStorageBackend.Instance.Open(path);
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
         await log.WriteCheckpoint(checkpoint, dataCommitLength);
         for (var i = 0; i < deltaCount; i++)
             await log.AppendDelta(Entry(DeltaHash(i), 2, (uint)(i * 8), 8));
@@ -420,7 +421,7 @@ public class FormatFuzzTests
     private static async Task<IndexSnapshot?> ReadIndexLog(string path)
     {
         var file = await FileStorageBackend.Instance.Open(path);
-        await using var log = await IndexLog.Open(file, FormatVer);
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
         return await log.Read(log.Length, 0);
     }
 

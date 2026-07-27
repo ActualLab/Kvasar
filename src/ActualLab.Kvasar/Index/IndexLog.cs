@@ -48,8 +48,6 @@ public sealed class IndexLog : IAsyncDisposable
     // the memcpy, which is why v1 kept a FileStream open for the whole store's life.
     private const int MaxPendingBytes = 1 << 16;
 
-    private static readonly byte[] TestAuthenticationKey = new byte[KvasarConstants.IndexMacKeySize];
-
     private readonly IStorageFile _file;
     private readonly uint _formatVer;
     private readonly byte[] _authenticationKey;
@@ -63,11 +61,6 @@ public sealed class IndexLog : IAsyncDisposable
 
     // Where the next delta lands: the adopted content end, staged deltas included.
     public long Length => _flushedLength + (_pendingCount * (long)EntrySize);
-
-    internal static ValueTask<IndexLog> Open(
-        IStorageFile file, uint formatVer, long committedLength = long.MaxValue,
-        CancellationToken cancellationToken = default)
-        => Open(file, formatVer, TestAuthenticationKey, committedLength, cancellationToken);
 
     public static async ValueTask<IndexLog> Open(
         IStorageFile file, uint formatVer, ReadOnlyMemory<byte> authenticationKey,
