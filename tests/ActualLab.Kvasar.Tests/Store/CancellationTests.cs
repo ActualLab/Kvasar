@@ -116,11 +116,9 @@ public class CancellationTests : IDisposable
     // --- Deterministic injection (no timers) --------------------------------
 
     [Fact]
-    public async Task CancelInsideAMultiPageAppendStillWritesItWhole()
+    public async Task CancelInsideSynchronousCopyChangesNothing()
     {
-        // The value's bytes are served by a gate, so the writer parks inside SegmentSet.Append (which
-        // reads value.Span to encode the record) with the multi-page write half-done. Cancelling there
-        // is the case the timer-based tests can only hope to hit.
+        // The value's bytes are served by a gate, so cancellation lands while Set is taking ownership.
         var value = Value(4000, 0x11);
         using var gate = new Gate();
         using var gatedValue = new GatedMemory(gate, value);
@@ -136,14 +134,13 @@ public class CancellationTests : IDisposable
             gate.Resume();
 
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => setTask);
-            // Flush queues on the write lock, so it returns only once the cancelled body has released it.
             await store.Flush(true);
-            (await store.Get(K("gated")))!.Value.ToArray().Should().Equal(value);
+            (await store.Get(K("gated"))).Should().BeNull();
         }
 
         await using (var store = await KvasarStore.Open(Options())) {
-            (await store.Get(K("gated")))!.Value.ToArray().Should().Equal(value);
-            (await ScanCount(store)).Should().Be(1);
+            (await store.Get(K("gated"))).Should().BeNull();
+            (await ScanCount(store)).Should().Be(0);
         }
     }
 

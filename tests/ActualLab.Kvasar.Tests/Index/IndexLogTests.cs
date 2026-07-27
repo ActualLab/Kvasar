@@ -72,6 +72,26 @@ public sealed class IndexLogTests
     }
 
     [Fact]
+    public async Task DeltasPreserveSameHashFanOut()
+    {
+        var file = new IndexLogTestFile();
+        await using var log = await IndexLog.Open(file, FormatVer);
+        await log.WriteCheckpoint(new[] {
+            Entry(10, 1, 100, 10, keyId: 1001),
+            Entry(10, 1, 200, 20, keyId: 1002),
+        }, 100);
+        await log.AppendDelta(Entry(10, 1, 300, 30, keyId: 1001));
+        await log.AppendDelta(Entry(10, 1, 400, 40, isTombstone: true, keyId: 1002));
+
+        var snapshot = await log.Read();
+
+        snapshot.Should().NotBeNull();
+        snapshot!.Value.Entries.Should().HaveCount(2);
+        snapshot.Value.Entries.Single(e => e.KeyId == 1001).Locator.Offset.Should().Be(300);
+        snapshot.Value.Entries.Single(e => e.KeyId == 1002).IsTombstone.Should().BeTrue();
+    }
+
+    [Fact]
     public async Task TombstoneDeltaSurvivesIntoEntries()
     {
         var file = new IndexLogTestFile();
@@ -233,6 +253,17 @@ public sealed class IndexLogTests
     }
 
     [Fact]
+    public async Task WrongLayoutVersionReturnsNull()
+    {
+        var file = new IndexLogTestFile();
+        await using var log = await IndexLog.Open(file, FormatVer);
+        await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 0);
+        await PatchUInt32(file, 12, 1);
+
+        (await log.Read()).Should().BeNull();
+    }
+
+    [Fact]
     public async Task NegativeDataCommitLengthReturnsNull()
     {
         var file = new IndexLogTestFile();
@@ -306,9 +337,11 @@ public sealed class IndexLogTests
 
     // Private methods
 
-    private static IndexEntry Entry(ulong keyHash, uint fileId, long offset, uint length, bool isTombstone = false)
+    private static IndexEntry Entry(
+        ulong keyHash, uint fileId, long offset, uint length,
+        bool isTombstone = false, ulong keyId = 0)
         => new() {
-            KeyHash = keyHash, PackedLocator = new Locator(fileId, offset).Packed, Length = length,
+            KeyHash = keyHash, PackedLocator = new Locator(fileId, offset).Packed, KeyId = keyId, Length = length,
             Flags = isTombstone ? (byte)RecordFlags.Tombstone : (byte)RecordFlags.None,
         };
 

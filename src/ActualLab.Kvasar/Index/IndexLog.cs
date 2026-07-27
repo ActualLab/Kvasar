@@ -14,7 +14,7 @@ public readonly record struct IndexSnapshot(IndexEntry[] Entries, long DataCommi
 //    0    4  Magic             "KIDX" (KvasarConstants.KIdxMagic)
 //    4    4  FormatVer         uint  — must match the caller's formatVer
 //    8    4  EntrySize         uint  — sizeof(IndexEntry); structural sanity/identity check
-//   12    4  Reserved0         uint  — 0
+//   12    4  LayoutVersion     uint  — .kidx entry-layout version
 //   16    8  CheckpointCount   long  — # of IndexEntry in the checkpoint region
 //   24    8  DataCommitLength  long  — the .kdat extent this index is consistent up to
 //   32   32  Reserved          zero  — pad to 64
@@ -35,11 +35,13 @@ public sealed class IndexLog : IAsyncDisposable
     private const int MagicOffset = 0;
     private const int FormatVerOffset = 4;
     private const int EntrySizeOffset = 8;
+    private const int LayoutVersionOffset = 12;
     private const int CheckpointCountOffset = 16;
     private const int DataCommitLengthOffset = 24;
+    private const uint LayoutVersion = 2;
 
-    // Deltas are staged here and written in one I/O: at 24 bytes an entry, a Write per entry costs orders
-    // of magnitude more than the memcpy, which is why v1 kept a FileStream open for the whole store's life.
+    // Deltas are staged here and written in one I/O: a Write per entry costs orders of magnitude more than
+    // the memcpy, which is why v1 kept a FileStream open for the whole store's life.
     private const int MaxPendingBytes = 1 << 16;
 
     private readonly IStorageFile _file;
@@ -166,12 +168,12 @@ public sealed class IndexLog : IAsyncDisposable
         var deltaCount = (bytes.Length - checkpointEnd) / entrySize;
         var deltas = MemoryMarshal.Cast<byte, IndexEntry>(bytes.AsSpan(checkpointEnd, deltaCount * entrySize));
 
-        // Resolve last-writer-wins by KeyHash. Checkpoint first, then deltas in file order; tombstones kept.
-        var resolved = new Dictionary<ulong, IndexEntry>(checkpoint.Length + deltas.Length);
+        var resolved = new Dictionary<(ulong KeyHash, ulong KeyId), IndexEntry>(
+            checkpoint.Length + deltas.Length);
         foreach (var e in checkpoint)
-            resolved[e.KeyHash] = e;
+            resolved[(e.KeyHash, e.KeyId)] = e;
         foreach (var e in deltas)
-            resolved[e.KeyHash] = e;
+            resolved[(e.KeyHash, e.KeyId)] = e;
 
         var entries = new IndexEntry[resolved.Count];
         resolved.Values.CopyTo(entries, 0);
@@ -193,6 +195,8 @@ public sealed class IndexLog : IAsyncDisposable
         if (BinaryPrimitives.ReadUInt32LittleEndian(header[FormatVerOffset..]) != formatVer)
             return false;
         if (BinaryPrimitives.ReadUInt32LittleEndian(header[EntrySizeOffset..]) != (uint)EntrySize)
+            return false;
+        if (BinaryPrimitives.ReadUInt32LittleEndian(header[LayoutVersionOffset..]) != LayoutVersion)
             return false;
 
         var count = BinaryPrimitives.ReadInt64LittleEndian(header[CheckpointCountOffset..]);
@@ -241,6 +245,7 @@ public sealed class IndexLog : IAsyncDisposable
         KvasarConstants.KIdxMagic.CopyTo(header[MagicOffset..]);
         BinaryPrimitives.WriteUInt32LittleEndian(header[FormatVerOffset..], formatVer);
         BinaryPrimitives.WriteUInt32LittleEndian(header[EntrySizeOffset..], (uint)EntrySize);
+        BinaryPrimitives.WriteUInt32LittleEndian(header[LayoutVersionOffset..], LayoutVersion);
         BinaryPrimitives.WriteInt64LittleEndian(header[CheckpointCountOffset..], checkpointCount);
         BinaryPrimitives.WriteInt64LittleEndian(header[DataCommitLengthOffset..], dataCommitLength);
     }
