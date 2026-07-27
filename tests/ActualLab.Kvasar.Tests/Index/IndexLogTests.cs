@@ -24,7 +24,7 @@ public sealed class IndexLogTests
         length.Should().Be(IndexLog.HeaderSize + (3 * IndexLog.EntrySize));
         log.Length.Should().Be(length);
 
-        var snapshot = await log.Read();
+        var snapshot = await log.CommitAndRead();
         snapshot.Should().NotBeNull();
         snapshot!.Value.DataCommitLength.Should().Be(4096);
         snapshot.Value.Entries.Should().BeEquivalentTo(entries, o => o.WithoutStrictOrdering());
@@ -38,7 +38,7 @@ public sealed class IndexLogTests
 
         await log.WriteCheckpoint(Array.Empty<IndexEntry>(), 12345);
 
-        var snapshot = await log.Read();
+        var snapshot = await log.CommitAndRead();
         snapshot.Should().NotBeNull();
         snapshot!.Value.Entries.Should().BeEmpty();
         snapshot.Value.DataCommitLength.Should().Be(12345);
@@ -60,7 +60,7 @@ public sealed class IndexLogTests
         await log.AppendDelta(Entry(30, 2, 800, 80));
         await log.Flush();
 
-        var snapshot = await log.Read();
+        var snapshot = await log.CommitAndRead();
         snapshot.Should().NotBeNull();
 
         var map = snapshot!.Value.Entries.ToDictionary(e => e.KeyHash);
@@ -84,7 +84,7 @@ public sealed class IndexLogTests
         await log.AppendDelta(Entry(10, 1, 300, 30, keyId: 1001));
         await log.AppendDelta(Entry(10, 1, 400, 40, isTombstone: true, keyId: 1002));
 
-        var snapshot = await log.Read();
+        var snapshot = await log.CommitAndRead();
 
         snapshot.Should().NotBeNull();
         snapshot!.Value.Entries.Should().HaveCount(2);
@@ -100,7 +100,7 @@ public sealed class IndexLogTests
         await log.WriteCheckpoint(new[] { Entry(10, 1, 100, 10) }, 0);
         await log.AppendDelta(Entry(10, 1, 100, 10, isTombstone: true));
 
-        var snapshot = await log.Read();
+        var snapshot = await log.CommitAndRead();
         snapshot.Should().NotBeNull();
 
         snapshot!.Value.Entries.Should().HaveCount(1);
@@ -117,7 +117,7 @@ public sealed class IndexLogTests
         for (var i = 0; i < 8; i++)
             await log.AppendDelta(Entry(100 + (ulong)i, 1, 1000 + i, 10));
         await log.Flush();
-        (await log.Read())!.Value.Entries.Should().HaveCount(9);
+        (await log.CommitAndRead())!.Value.Entries.Should().HaveCount(9);
 
         var live = new[] {
             Entry(1, 1, 100, 10),
@@ -129,7 +129,7 @@ public sealed class IndexLogTests
         length.Should().Be(IndexLog.HeaderSize + (2 * IndexLog.EntrySize));
         file.Length.Should().Be(length);
 
-        var snapshot = await log.Read();
+        var snapshot = await log.CommitAndRead();
         snapshot.Should().NotBeNull();
         snapshot!.Value.DataCommitLength.Should().Be(8192);
         snapshot.Value.Entries.Select(e => e.KeyHash).Should().BeEquivalentTo([1UL, 3UL]);
@@ -147,7 +147,7 @@ public sealed class IndexLogTests
         // A partial trailing entry, exactly what a crash leaves behind in an un-flushed delta tail.
         await file.Write(log.Length, new byte[IndexLog.EntrySize - 1]);
 
-        var snapshot = await log.Read();
+        var snapshot = await log.CommitAndRead();
         snapshot.Should().NotBeNull();
         snapshot!.Value.Entries.Select(e => e.KeyHash).Should().BeEquivalentTo([1UL, 2UL]);
     }
@@ -192,7 +192,7 @@ public sealed class IndexLogTests
         new Random(42).NextBytes(garbage);
         await file.Write(validLength, garbage);
 
-        var snapshot = await log.Read(validLength);
+        var snapshot = await log.CommitAndRead(validLength);
         snapshot.Should().NotBeNull();
         snapshot!.Value.Entries.Select(e => e.KeyHash).Should().BeEquivalentTo([1UL, 2UL]);
         (await log.Read(file.Length, 0)).Should().BeNull(
@@ -205,7 +205,7 @@ public sealed class IndexLogTests
         var file = new IndexLogTestFile();
         await using var log = await IndexLog.Open(file, FormatVer, MacKey);
 
-        (await log.Read()).Should().BeNull();
+        (await log.CommitAndRead()).Should().BeNull();
         log.Length.Should().Be(0);
     }
 
@@ -216,7 +216,7 @@ public sealed class IndexLogTests
         await file.Write(0, new byte[8]);
         await using var log = await IndexLog.Open(file, FormatVer, MacKey);
 
-        (await log.Read()).Should().BeNull();
+        (await log.CommitAndRead()).Should().BeNull();
     }
 
     [Fact]
@@ -227,7 +227,7 @@ public sealed class IndexLogTests
         await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 0);
         await file.Write(0, "XIDX"u8.ToArray());
 
-        (await log.Read()).Should().BeNull();
+        (await log.CommitAndRead()).Should().BeNull();
     }
 
     [Fact]
@@ -238,7 +238,7 @@ public sealed class IndexLogTests
             await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 0);
 
         await using var other = await IndexLog.Open(file, FormatVer + 1, MacKey);
-        (await other.Read()).Should().BeNull();
+        (await other.CommitAndRead()).Should().BeNull();
     }
 
     [Fact]
@@ -249,7 +249,7 @@ public sealed class IndexLogTests
         await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 0);
         await PatchUInt32(file, 8, (uint)IndexLog.EntrySize + 1);
 
-        (await log.Read()).Should().BeNull();
+        (await log.CommitAndRead()).Should().BeNull();
     }
 
     [Fact]
@@ -260,7 +260,7 @@ public sealed class IndexLogTests
         await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 0);
         await PatchUInt32(file, 12, 1);
 
-        (await log.Read()).Should().BeNull();
+        (await log.CommitAndRead()).Should().BeNull();
     }
 
     [Fact]
@@ -271,7 +271,7 @@ public sealed class IndexLogTests
         await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 0);
         await PatchInt64(file, 24, -1);
 
-        (await log.Read()).Should().BeNull();
+        (await log.CommitAndRead()).Should().BeNull();
     }
 
     [Theory]
@@ -288,8 +288,8 @@ public sealed class IndexLogTests
             new[] { Entry(1, 1, 100, 10), Entry(2, 1, 200, 20), Entry(3, 1, 300, 30) }, 0);
         await PatchInt64(file, 16, checkpointCount);
 
-        (await log.Read()).Should().BeNull();
-        (await log.Read(file.Length)).Should().BeNull();
+        (await log.CommitAndRead()).Should().BeNull();
+        (await log.CommitAndRead(file.Length)).Should().BeNull();
     }
 
     [Fact]
@@ -308,7 +308,7 @@ public sealed class IndexLogTests
         file.WriteCount.Should().BeLessThan(deltaCount / 10);
         file.WriteCount.Should().BeGreaterThan(0);
 
-        var snapshot = await log.Read();
+        var snapshot = await log.CommitAndRead();
         snapshot.Should().NotBeNull();
         snapshot!.Value.Entries.Should().HaveCount(deltaCount);
     }
@@ -331,7 +331,7 @@ public sealed class IndexLogTests
         (await reopened.Read(reopened.Length, 0)).Should().NotBeNull();
         await reopened.AppendDelta(Entry(3, 1, 300, 30));
 
-        var snapshot = await reopened.Read();
+        var snapshot = await reopened.CommitAndRead();
         snapshot.Should().NotBeNull();
         snapshot!.Value.DataCommitLength.Should().Be(555);
         snapshot.Value.Entries.Select(e => e.KeyHash).Should().BeEquivalentTo([1UL, 2UL, 3UL]);

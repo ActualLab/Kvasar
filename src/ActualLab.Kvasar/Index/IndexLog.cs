@@ -125,7 +125,7 @@ public sealed class IndexLog : IAsyncDisposable
         ulong generation, CancellationToken cancellationToken = default)
         => Read(Length, generation, cancellationToken);
 
-    internal async ValueTask<IndexSnapshot?> Read(
+    internal async ValueTask<IndexSnapshot?> CommitAndRead(
         long validLength = -1, CancellationToken cancellationToken = default)
     {
         if (_mac is not null)

@@ -145,7 +145,12 @@ public sealed class KvasarStore : IAsyncDisposable
         catch {
             // Release what this attempt opened, but leave the lock to Open — it stays held across the
             // wipe-and-retry, and a throw here must not strand it.
-            await store.CloseFiles().ConfigureAwait(false);
+            try {
+                await store.CloseFiles().ConfigureAwait(false);
+            }
+            finally {
+                store.DisposeKeyMaterial();
+            }
             throw;
         }
     }
@@ -166,22 +171,34 @@ public sealed class KvasarStore : IAsyncDisposable
         // file's own random salt, so a store-level KDF salt isn't needed (the master key is already
         // a uniformly-random 256-bit secret); subkeys are separated by info label.
         var pageKey = new byte[KvasarConstants.PageKeySize];
-        _indexMacKey = new byte[KvasarConstants.IndexMacKeySize];
-        _hashKey = new byte[_hasher.IsKeyed ? Math.Max(1, _hasher.SecretSize) : 0];
-        kdf.Derive(options.EncryptionKey, [], KvasarConstants.PageKeyInfo, pageKey);
-        kdf.Derive(options.EncryptionKey, [], KvasarConstants.IndexMacKeyInfo, _indexMacKey);
-        if (_hashKey.Length != 0)
-            kdf.Derive(options.EncryptionKey, [], KvasarConstants.HashKeyInfo, _hashKey);
-
+        var indexMacKey = new byte[KvasarConstants.IndexMacKeySize];
+        var hashKey = new byte[_hasher.IsKeyed ? Math.Max(1, _hasher.SecretSize) : 0];
+        IPageCipherFactory? cipherFactory = null;
+        Superblock? superblock = null;
         try {
-            _cipherFactory = options.DisableEncryption
+            kdf.Derive(options.EncryptionKey, [], KvasarConstants.PageKeyInfo, pageKey);
+            kdf.Derive(options.EncryptionKey, [], KvasarConstants.IndexMacKeyInfo, indexMacKey);
+            if (hashKey.Length != 0)
+                kdf.Derive(options.EncryptionKey, [], KvasarConstants.HashKeyInfo, hashKey);
+            cipherFactory = options.DisableEncryption
                 ? NoopPageCipherFactory.Instance
                 : new AesGcmPageCipherFactory(pageKey, _formatVer);
+            superblock = new Superblock(options.EncryptionKey, _formatVer, kdf);
+            _hashKey = hashKey;
+            _indexMacKey = indexMacKey;
+            _cipherFactory = cipherFactory;
+            _superblock = superblock;
+        }
+        catch {
+            CryptographicOperations.ZeroMemory(hashKey);
+            CryptographicOperations.ZeroMemory(indexMacKey);
+            (cipherFactory as IDisposable)?.Dispose();
+            superblock?.Dispose();
+            throw;
         }
         finally {
             CryptographicOperations.ZeroMemory(pageKey);
         }
-        _superblock = new Superblock(options.EncryptionKey, _formatVer, kdf);
 
         // The .kidx may live unencrypted only under a keyed-PRF hasher; otherwise we persist only its
         // header (no entries at all) rather than leaking key-derived metadata.
@@ -222,6 +239,16 @@ public sealed class KvasarStore : IAsyncDisposable
         }
 
         await _writeLock.WaitAsync().ConfigureAwait(false);
+        if (_compactionTask is { } racedCompactionTask) {
+            _writeLock.Release();
+            try {
+                await racedCompactionTask.ConfigureAwait(false);
+            }
+            catch {
+                // The pass has already rolled back or reached a switch; disposal still has to run.
+            }
+            await _writeLock.WaitAsync().ConfigureAwait(false);
+        }
         try {
             _isDisposed = true;
             try {
@@ -239,10 +266,7 @@ public sealed class KvasarStore : IAsyncDisposable
                 // Must run even if the commit throws (a full disk can fail it): _isDisposed is already
                 // set, so a retry would no-op and the store lock would leak for the rest of the process.
                 await CloseFiles().ConfigureAwait(false);
-                CryptographicOperations.ZeroMemory(_hashKey);
-                CryptographicOperations.ZeroMemory(_indexMacKey);
-                (_cipherFactory as IDisposable)?.Dispose();
-                _superblock.Dispose();
+                DisposeKeyMaterial();
                 _lock.Dispose();
             }
         }
@@ -373,11 +397,7 @@ public sealed class KvasarStore : IAsyncDisposable
             }
             if (!read.IsFound || read.View.IsTombstone)
                 continue;
-            // Verify the record is the one the entry named. A compaction recycles the drained file in
-            // place, so a locator from this snapshot can end up resolving inside the *new* contents of
-            // that slot and decoding as a different — entirely valid — record. Get is covered by its
-            // full-key compare against the caller's bytes; a scan has no key to compare, so it re-hashes.
-            if (_hasher.Hash(read.View.Key.Span, _hashKey) != e.KeyHash)
+            if (!IsLiveIndexEntry(e))
                 continue;
             yield return (new KvasarKey(read.View.Key), new KvasarValue(read.View.Value, read.View.ValueKind));
         }
@@ -841,6 +861,14 @@ public sealed class KvasarStore : IAsyncDisposable
             cache.Clear();
     }
 
+    private void DisposeKeyMaterial()
+    {
+        CryptographicOperations.ZeroMemory(_hashKey);
+        CryptographicOperations.ZeroMemory(_indexMacKey);
+        (_cipherFactory as IDisposable)?.Dispose();
+        _superblock.Dispose();
+    }
+
     private void WipeFiles()
     {
         var name = Path.GetFileName(_options.BasePath);
@@ -969,7 +997,7 @@ public sealed class KvasarStore : IAsyncDisposable
     private async ValueTask MaybeCompact()
     {
         // §4: one trigger, checked at commit, over the store as a whole rather than per file.
-        if (_isCompacting)
+        if (_isCompacting || Volatile.Read(ref _isDisposeStarted) != 0)
             return;
 
         var dead = _data.DeadBytes;
@@ -1040,6 +1068,8 @@ public sealed class KvasarStore : IAsyncDisposable
     {
         if (_isCompacting)
             return _compactionTask;
+        if (Volatile.Read(ref _isDisposeStarted) != 0)
+            return null;
 
         // A data file may be recycled only once no valid superblock slot names it, which with two slots
         // means the switch commit and one further commit both have to pass (§3.2).
@@ -1432,6 +1462,17 @@ public sealed class KvasarStore : IAsyncDisposable
             // same goes for a slot recycled under a locator a reader was already holding.
             return null;
         }
+    }
+
+    private bool IsLiveIndexEntry(IndexEntry entry)
+    {
+        var cursor = _index.Probe(entry.KeyHash);
+        while (cursor.MoveNext(out var locator, out _))
+            if (cursor.CurrentHash == entry.KeyHash
+                && cursor.CurrentKeyId == entry.KeyId
+                && locator == entry.Locator)
+                return true;
+        return false;
     }
 
     private void ApplyLoaded(Locator loc, in RecordView view, int recordLength)
