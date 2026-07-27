@@ -168,8 +168,9 @@ public sealed class Superblock : IDisposable
     {
         if (state.DataSlot >= SlotCount || state.IndexSlot >= SlotCount)
             throw new ArgumentOutOfRangeException(nameof(state), "Data and index slot indexes must be 0 or 1.");
-        if (state.DataCommitLength < 0 || state.IndexCommitLength < 0)
-            throw new ArgumentOutOfRangeException(nameof(state), "Commit lengths must be non-negative.");
+        if (state.DataCommitLength < 0 || state.IndexCommitLength < 0
+            || state.LiveBytes < 0 || state.DeadBytes < 0)
+            throw new ArgumentOutOfRangeException(nameof(state), "Commit lengths and accounting must be non-negative.");
 
         var slot = (int)(state.Generation % SlotCount);
         var buffer = new byte[SlotSize];
@@ -269,14 +270,19 @@ public sealed class Superblock : IDisposable
         if (dataCommitLength < 0 || indexCommitLength < 0)
             return null;
 
+        var liveBytes = BinaryPrimitives.ReadInt64LittleEndian(plain.Slice(LiveBytesOffset, 8));
+        var deadBytes = BinaryPrimitives.ReadInt64LittleEndian(plain.Slice(DeadBytesOffset, 8));
+        if (liveBytes < 0 || deadBytes < 0)
+            return null;
+
         return new SuperblockState(
             generation,
             dataSlot,
             dataCommitLength,
             indexSlot,
             indexCommitLength,
-            BinaryPrimitives.ReadInt64LittleEndian(plain.Slice(LiveBytesOffset, 8)),
-            BinaryPrimitives.ReadInt64LittleEndian(plain.Slice(DeadBytesOffset, 8)));
+            liveBytes,
+            deadBytes);
     }
 
     private void FormatSlot(Span<byte> slot, SuperblockState state)

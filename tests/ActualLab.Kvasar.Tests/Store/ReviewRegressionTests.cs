@@ -9,9 +9,8 @@ using ActualLab.Kvasar.Tests.Storage;
 namespace ActualLab.Kvasar.Tests.Store;
 
 /// <summary>
-/// One test per defect from <c>docs/REVIEW-Overlap.md</c>, against the v2 (superblock) store. Where the
-/// redesign made a defect unrepresentable, the test pins the <em>structural</em> property that makes it
-/// so, so a future regression re-arms the test rather than silently reintroducing the bug.
+/// Regression tests for review findings against the v2 (superblock) store. Where the redesign made a
+/// defect unrepresentable, the test pins the structural property that prevents it.
 /// </summary>
 public sealed class ReviewRegressionTests : IDisposable
 {
@@ -171,13 +170,8 @@ public sealed class ReviewRegressionTests : IDisposable
     // --- I3 KidxDeltaTailMisalignment (P0) ---------------------------------
 
     [Fact]
-    public async Task AFabricatedIndexDeltaNeverReachesScan()
+    public async Task AnUncommittedFabricatedIndexDeltaNeverReachesScan()
     {
-        // I3: v1 appended deltas at raw EOF, so a torn delta misaligned every later one and fed random
-        // (hash, locator) pairs into the index — the only path in the review that could serve a
-        // fabricated (key, value). Here the fabricated entry is handed to the store directly: it does
-        // enter the index (the .kidx is never trusted, only replayed), but the read paths re-derive the
-        // key's hash from the record they decoded and drop anything the entry misnamed (§14.2).
         const int total = 60;
         var options = Options();
         var oracle = new Dictionary<string, byte[]>(StringComparer.Ordinal);
@@ -198,7 +192,6 @@ public sealed class ReviewRegressionTests : IDisposable
         fabricated.KeyHash ^= 0xA5A5_A5A5_A5A5_A5A5;
         AppendBytes(indexPath, MemoryMarshal.AsBytes<IndexEntry>([fabricated]).ToArray());
 
-        // A commit must name the fabricated entry for the next open to adopt it, so write once more.
         await using (var store = await KvasarStore.Open(options)) {
             await store.Set(K("late"), V(7, 40));
             oracle["late"] = V(7, 40);
@@ -206,8 +199,7 @@ public sealed class ReviewRegressionTests : IDisposable
         }
 
         await using (var store = await KvasarStore.Open(options)) {
-            store.Stats.Entries.Should().Be(oracle.Count + 1,
-                "the fabricated entry is in the index — filtering it at read time is what the test checks");
+            store.Stats.Entries.Should().Be(oracle.Count);
             var scanned = new List<string>();
             await foreach (var (key, value) in store.Scan()) {
                 var name = key.AsString;
@@ -646,6 +638,140 @@ public sealed class ReviewRegressionTests : IDisposable
         for (var i = 0; i < keyCount; i++)
             (await reopened.Get(K(i)))!.Value.ToArray().Should().Equal(V(i, 200));
         new FileInfo(inactivePath).Length.Should().BeGreaterThanOrEqualTo(KvasarConstants.SegmentHeaderSize);
+    }
+
+    [Fact]
+    public async Task RolledBackIndexDeltasAreOverwrittenAtTheCommittedExtent()
+    {
+        const int indexBufferBytes = 1 << 16;
+        var keyCount = indexBufferBytes / IndexLog.EntrySize;
+        await CrashHarness.RunCase<int>(
+            async run => {
+                var options = Options(encrypt: false) with {
+                    StorageBackend = run.Storage,
+                    FlushDelay = TimeSpan.FromHours(1),
+                    CommitBytes = long.MaxValue,
+                    CompactionMinBytes = long.MaxValue,
+                };
+                await using var store = await KvasarStore.Open(options);
+                for (var i = 0; i < keyCount; i++)
+                    await store.Set(K(i), V(i, 8));
+                await store.Flush(true);
+
+                run.ArmCrashPoints();
+                for (var i = 0; i < keyCount; i++)
+                    await store.Set(K(i), V(i + keyCount, 8));
+            },
+            async outcome => {
+                var state = await ReadSuperblock(outcome.Backend);
+                outcome.Backend.GetBytes(IndexPath(state.IndexSlot)).LongLength.Should()
+                    .BeGreaterThan(state.IndexCommitLength);
+                var options = Options(encrypt: false) with {
+                    StorageBackend = outcome.Backend,
+                    CompactionMinBytes = long.MaxValue,
+                };
+                await using (var recovered = await KvasarStore.Open(options)) {
+                    for (var i = 0; i < keyCount; i++)
+                        (await recovered.Get(K(i)))!.Value.ToArray().Should().Equal(V(i, 8));
+                    await recovered.Set(K("next-generation"), V(1, 8));
+                }
+
+                await using var reopened = await KvasarStore.Open(options);
+                for (var i = 0; i < keyCount; i++)
+                    (await reopened.Get(K(i)))!.Value.ToArray().Should().Equal(V(i, 8));
+                (await reopened.Get(K("next-generation")))!.Value.ToArray().Should().Equal(V(1, 8));
+            },
+            1,
+            null,
+            0);
+    }
+
+    [Fact]
+    public async Task ReopeningACompactedStoreDoesNotRearmCompaction()
+    {
+        const int keyCount = 200;
+        var setupOptions = Options() with { CompactionMinBytes = long.MaxValue };
+        await using (var store = await KvasarStore.Open(setupOptions)) {
+            for (var i = 0; i < keyCount; i++)
+                await store.Set(K(i), V(i, 512));
+            for (var round = 0; round < 6; round++)
+                for (var i = 0; i < keyCount; i++)
+                    await store.Set(K(i), V(i + round + 1, 512));
+            await store.Compact();
+            for (var i = 0; i < keyCount; i++)
+                await store.Set(K(i), V(i + 100, 512));
+            await store.Flush(true);
+        }
+
+        var options = setupOptions with {
+            CompactionMinBytes = 1,
+            CompactionDeadRatio = 2.0 / 3.0,
+        };
+        var before = await ReadSuperblock();
+        KvasarStats reopenedStats;
+        await using (var reopened = await KvasarStore.Open(options)) {
+            reopenedStats = reopened.Stats;
+            await reopened.Set(K(0), V(1000, 512));
+        }
+        var after = await ReadSuperblock();
+
+        var reopenedTotal = reopenedStats.LiveBytes + reopenedStats.DeadBytes;
+        reopenedStats.DeadBytes.Should().BePositive();
+        ((double)reopenedStats.DeadBytes / reopenedTotal).Should().BeLessThan(options.CompactionDeadRatio);
+        after.DataSlot.Should().Be(before.DataSlot, "the first write after reopen must not rewrite the live set");
+    }
+
+    [Fact]
+    public async Task RecoveryConsumesPersistedAccounting()
+    {
+        const int keyCount = 25;
+        var options = Options() with { CompactionMinBytes = long.MaxValue };
+        await using (var store = await KvasarStore.Open(options)) {
+            for (var i = 0; i < keyCount; i++)
+                await store.Set(K(i), V(i, 200));
+            for (var i = 0; i < keyCount; i++)
+                await store.Set(K(i), V(i + 1, 200));
+            await store.Flush(true);
+        }
+
+        var persisted = await ReadSuperblock();
+        persisted.LiveBytes.Should().BePositive();
+        persisted.DeadBytes.Should().BePositive();
+
+        await using var reopened = await KvasarStore.Open(options);
+        reopened.Stats.LiveBytes.Should().Be(persisted.LiveBytes);
+        reopened.Stats.DeadBytes.Should().Be(persisted.DeadBytes);
+    }
+
+    [Fact]
+    public async Task AccountingThatCannotDescribeTheExtentDoesNotWipeTheStore()
+    {
+        // Every store written before the counters were consumed persisted DataLog.DeadBytes, which sums
+        // *both* slots — so any store that had compacted carries a DeadBytes far above the active slot's
+        // extent. Adoption must degrade to deriving the accounting rather than reject the generation.
+        const int keyCount = 25;
+        var options = Options() with { CompactionMinBytes = long.MaxValue };
+        await using (var store = await KvasarStore.Open(options)) {
+            for (var i = 0; i < keyCount; i++)
+                await store.Set(K(i), V(i, 200));
+            await store.Flush(true);
+        }
+
+        // Both slots, because a legacy store persisted the inflated value on *every* commit — one bad
+        // slot alone would just fall back to the other and prove nothing.
+        var persisted = await ReadSuperblock();
+        await using (var file = await FileStorageBackend.Instance.Open(KvsPath)) {
+            var superblock = new Superblock(_key, FormatVer);
+            for (var i = 1ul; i <= 2ul; i++)
+                await superblock.Write(file, persisted with {
+                    Generation = persisted.Generation + i,
+                    DeadBytes = persisted.DeadBytes + (100L * 1024 * 1024),
+                });
+        }
+
+        await using var reopened = await KvasarStore.Open(options);
+        for (var i = 0; i < keyCount; i++)
+            (await reopened.Get(K(i))).Should().NotBeNull($"key {i} must survive an unusable accounting pair");
     }
 
     // Private methods
