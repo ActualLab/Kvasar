@@ -445,7 +445,7 @@ public sealed class DataLog : IAsyncDisposable
             PublishTail(st);
         }
         finally {
-            ArrayPool<byte>.Shared.Return(buf);
+            ArrayPool<byte>.Shared.Return(buf, clearArray: true);
         }
         st.LiveBytes += recordLength;
         return new Locator(FileIdOf(st.Slot), offset);

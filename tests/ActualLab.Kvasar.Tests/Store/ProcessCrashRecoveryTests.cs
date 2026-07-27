@@ -115,27 +115,38 @@ public class ProcessCrashRecoveryTests : IDisposable
 
         using var process = Process.Start(startInfo)!;
         var acknowledged = -1;
-        process.OutputDataReceived += (_, e) => {
-            if (e.Data is { } line && line.StartsWith("w:", StringComparison.Ordinal)
-                && int.TryParse(line.AsSpan(2), out var index))
-                Interlocked.Exchange(ref acknowledged, index);
-        };
-        process.BeginOutputReadLine();
+        try {
+            process.OutputDataReceived += (_, e) => {
+                if (e.Data is { } line && line.StartsWith("w:", StringComparison.Ordinal)
+                    && int.TryParse(line.AsSpan(2), out var index))
+                    Interlocked.Exchange(ref acknowledged, index);
+            };
+            process.BeginOutputReadLine();
 
-        // Wait for real progress, then kill after a randomized extra delay so the abort lands at an
-        // arbitrary point in the write path rather than always at the same place.
-        var rnd = new Random(seed);
-        var deadline = DateTime.UtcNow.AddSeconds(30);
-        while (Volatile.Read(ref acknowledged) < 5 && DateTime.UtcNow < deadline && !process.HasExited)
-            await Task.Delay(10);
-        await Task.Delay(rnd.Next(20, 400));
+            // Wait for real progress, then kill after a randomized extra delay so the abort lands at an
+            // arbitrary point in the write path rather than always at the same place.
+            var rnd = new Random(seed);
+            var deadline = DateTime.UtcNow.AddSeconds(30);
+            while (Volatile.Read(ref acknowledged) < 5 && DateTime.UtcNow < deadline && !process.HasExited)
+                await Task.Delay(10);
+            await Task.Delay(rnd.Next(20, 400));
 
-        var survived = Volatile.Read(ref acknowledged);
-        process.HasExited.Should().BeFalse("the worker writes forever; it must still be running when killed");
-        process.Kill(entireProcessTree: true);
-        // WaitForExit also guarantees the OS has released the store's file handles and the .lock.
-        await process.WaitForExitAsync();
-        return survived;
+            var survived = Volatile.Read(ref acknowledged);
+            process.HasExited.Should().BeFalse("the worker writes forever; it must still be running when killed");
+            return survived;
+        }
+        finally {
+            if (!process.HasExited) {
+                process.Kill(entireProcessTree: true);
+                using var cleanupCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                try {
+                    // WaitForExit also guarantees the OS has released the store's file handles and the .lock.
+                    await process.WaitForExitAsync(cleanupCts.Token);
+                }
+                catch (OperationCanceledException) {
+                }
+            }
+        }
     }
 
     private static string FindCrashWorker()

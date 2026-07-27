@@ -10,7 +10,7 @@ namespace ActualLab.Kvasar.Crypto;
 /// because sealed pages are immutable (a rewritten page would reuse a nonce and break GCM).
 /// AAD = <c>pageId(8 LE) || formatVer(4 LE)</c> binds each page to its position and format version.
 /// </summary>
-public sealed class AesGcmPageCipher : IPageCipher
+public sealed class AesGcmPageCipher : IPageCipher, IDisposable
 {
     private const int NonceSize = KvasarConstants.GcmNonceSize; // 12
     private const int TagSize = KvasarConstants.GcmTagSize;     // 16
@@ -22,11 +22,17 @@ public sealed class AesGcmPageCipher : IPageCipher
 
     public int Overhead => TagSize;
 
-    internal AesGcmPageCipher(byte[] pageKey, uint formatVer, byte[] nonceKey)
+    internal AesGcmPageCipher(ReadOnlySpan<byte> pageKey, uint formatVer, byte[] nonceKey)
     {
-        _pageKey = pageKey;
+        _pageKey = pageKey.ToArray();
         _formatVer = formatVer;
         _nonceKey = nonceKey;
+    }
+
+    public void Dispose()
+    {
+        CryptographicOperations.ZeroMemory(_pageKey);
+        CryptographicOperations.ZeroMemory(_nonceKey);
     }
 
     // Writer-only (single-threaded).

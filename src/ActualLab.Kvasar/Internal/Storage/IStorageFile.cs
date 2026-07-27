@@ -23,12 +23,21 @@ public static class StorageFileExt
         this IStorageFile file, long offset, Memory<byte> buffer,
         CancellationToken cancellationToken = default)
     {
+        if (!await file.TryReadExact(offset, buffer, cancellationToken).ConfigureAwait(false))
+            throw new KvasarCorruptException("Unexpected end of file.");
+    }
+
+    public static async ValueTask<bool> TryReadExact(
+        this IStorageFile file, long offset, Memory<byte> buffer,
+        CancellationToken cancellationToken = default)
+    {
         var total = 0;
         while (total < buffer.Length) {
             var read = await file.Read(offset + total, buffer[total..], cancellationToken).ConfigureAwait(false);
             if (read == 0)
-                throw new KvasarCorruptException("Unexpected end of file.");
+                return false;
             total += read;
         }
+        return true;
     }
 }

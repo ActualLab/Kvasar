@@ -7,7 +7,7 @@ namespace ActualLab.Kvasar.Crypto;
 /// Builds <see cref="AesGcmPageCipher"/> instances bound to a segment file's salt. Holds the
 /// store-wide 32-byte AES-256 page key and the format version (part of the per-page AAD).
 /// </summary>
-public sealed class AesGcmPageCipherFactory : IPageCipherFactory
+public sealed class AesGcmPageCipherFactory : IPageCipherFactory, IDisposable
 {
     private readonly byte[] _pageKey;
     private readonly uint _formatVer;
@@ -22,6 +22,9 @@ public sealed class AesGcmPageCipherFactory : IPageCipherFactory
         _pageKey = pageKey.ToArray();
         _formatVer = formatVer;
     }
+
+    public void Dispose()
+        => CryptographicOperations.ZeroMemory(_pageKey);
 
     public IPageCipher Create(ReadOnlySpan<byte> fileSalt)
     {

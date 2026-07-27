@@ -153,7 +153,12 @@ public sealed class PagedFile : IAsyncDisposable
             // Ignored: a tail lost here is below no committed extent, so it is exactly the dead space
             // that the never-rewind rule already accounts for.
         }
-        await _file.DisposeAsync().ConfigureAwait(false);
+        try {
+            await _file.DisposeAsync().ConfigureAwait(false);
+        }
+        finally {
+            (_incarnation.Cipher as IDisposable)?.Dispose();
+        }
     }
 
     public bool TryGetCachedPage(long pageId, out ReadOnlyMemory<byte> page)
