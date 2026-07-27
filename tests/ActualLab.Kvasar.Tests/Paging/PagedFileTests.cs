@@ -1,3 +1,4 @@
+using ActualLab.Kvasar.Crypto;
 using ActualLab.Kvasar.Internal;
 using ActualLab.Kvasar.Internal.Storage;
 
@@ -248,6 +249,33 @@ public class PagedFileTests
     }
 
     [Fact]
+    public async Task PrefetchDoesNotCachePreviousIncarnationAfterRecycle()
+    {
+        var file = new PagedFileTestFile();
+        var cache = new PageCache(1 << 20);
+        var pages = MakePages(2);
+
+        await using var pf = await PagedFile.Create(
+            file, 4, PageSize, NoopPageCipherFactory.Instance, FormatVer, cache);
+        await pf.AppendPage(pages[0]);
+        await pf.Flush();
+
+        var whenReadBlocked = file.BlockNextRead();
+        var prefetchTask = pf.Prefetch(0, 1).AsTask();
+        try {
+            await whenReadBlocked.WaitAsync(TimeSpan.FromSeconds(30));
+            await pf.Recycle(5);
+        }
+        finally {
+            file.ReleaseBlockedRead();
+        }
+        await prefetchTask;
+
+        await pf.AppendPage(pages[1]);
+        (await pf.GetPage(0)).ToArray().Should().Equal(pages[1]);
+    }
+
+    [Fact]
     public async Task CommittedExtentIsIndependentOfPhysicalLength()
     {
         const int onDiskPageSize = PageSize + 16;
@@ -462,6 +490,8 @@ public class PagedFileTests
         private readonly Lock _lock = new();
         private byte[] _bytes = [];
         private int _length;
+        private TaskCompletionSource? _whenReadBlocked;
+        private TaskCompletionSource? _whenReadReleased;
 
         public long Length {
             get { lock (_lock) return _length; }
@@ -472,6 +502,7 @@ public class PagedFileTests
 
         public ValueTask<int> Read(long offset, Memory<byte> buffer, CancellationToken cancellationToken = default)
         {
+            Task? whenReadReleased = null;
             lock (_lock) {
                 ReadCount++;
                 if (offset >= _length)
@@ -479,7 +510,14 @@ public class PagedFileTests
 
                 var count = (int)Math.Min(buffer.Length, _length - offset);
                 _bytes.AsSpan((int)offset, count).CopyTo(buffer.Span);
-                return new ValueTask<int>(count);
+                if (_whenReadBlocked is { } whenReadBlocked) {
+                    _whenReadBlocked = null;
+                    whenReadReleased = _whenReadReleased!.Task;
+                    whenReadBlocked.SetResult();
+                }
+                if (whenReadReleased is null)
+                    return new ValueTask<int>(count);
+                return CompleteRead(count, whenReadReleased);
             }
         }
 
@@ -515,10 +553,38 @@ public class PagedFileTests
 
         public ValueTask DisposeAsync() => default;
 
+        public Task BlockNextRead()
+        {
+            lock (_lock) {
+                if (_whenReadBlocked is not null || _whenReadReleased is not null)
+                    throw new InvalidOperationException("A read is already blocked.");
+                _whenReadBlocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _whenReadReleased = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                return _whenReadBlocked.Task;
+            }
+        }
+
+        public void ReleaseBlockedRead()
+        {
+            TaskCompletionSource? whenReadReleased;
+            lock (_lock) {
+                _whenReadBlocked = null;
+                whenReadReleased = _whenReadReleased;
+                _whenReadReleased = null;
+            }
+            whenReadReleased?.TrySetResult();
+        }
+
         public byte[] Snapshot()
         {
             lock (_lock)
                 return _bytes.AsSpan(0, _length).ToArray();
+        }
+
+        private static async ValueTask<int> CompleteRead(int count, Task whenReadReleased)
+        {
+            await whenReadReleased.ConfigureAwait(false);
+            return count;
         }
 
         private void Grow(int minLength)
