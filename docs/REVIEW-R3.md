@@ -23,7 +23,7 @@ what made it worth chasing.
 | **C1 / X1** | A burned page makes the store unadoptable → full wipe | **P0** | X | X | **fixed** `099ed50` |
 | **C2** | `ScanFrom` resyncs mid-record, then abandons the replay | P2 | X | | **fixed** `5c33b02` |
 | **C4** | An unreadable record reads as "key absent" | P2 | X | | **fixed** `5c33b02` |
-| **X2** | `Scan` uses the 64-bit hash as an identity check | P2 | | X | **fixed** — *no regression test, see below* |
+| **X2** | `Scan` uses the 64-bit hash as an identity check | **P3** | | X | **fixed** + regression test |
 | **C3** | Fallback adoption decrypts the whole store at open | P2 | X | | open |
 | **C5 / X4** | Derived keys survive a failed `Open` and the wipe-retry | P3 | X | X | **fixed** |
 | **C6** | A write racing `DisposeAsync` can start a compaction | P3 | X | | **fixed** |
@@ -92,13 +92,28 @@ lock-free reader still being able to decrypt with the incarnation it captured, a
 dispose at that point was rejected during the round-2 merge for exactly this reason. Closing it properly
 needs reference counting or quiescence tracking, which is why it is recorded rather than patched.
 
-### X2 has no regression test
-The `Scan` identity check is fixed (it now compares `(KeyHash, KeyId, Locator)` against the live index
-instead of the hash alone). The accompanying test was left unfinished by a failed agent run: it needs a
-paused scan, a compaction that recycles the scan snapshot's slot, *and* a deliberate hash collision, and
-its compaction gate never armed. The incomplete test was removed rather than left hanging in the suite.
-**Follow-up: build that test.** The fix is a strict tightening — checking more identity fields cannot be
-less correct than checking fewer — but it is currently verified by inspection only.
+### X2 — regression test added, and the finding's severity corrected down
+Covered by `ScanIdentityTests.ARecycledSnapshotLocatorIsNotIdentifiedByItsHash`, which drives compaction
+between `MoveNextAsync` calls rather than gating on storage I/O (the original agent-written test hung
+because its compaction gate never armed).
+
+**The reported impact was wrong and is corrected here.** X2 claimed a scan could "yield that key twice".
+It cannot: each pending snapshot locator names a distinct offset, so distinct entries always resolve to
+distinct records — a duplicate is unreachable by this mechanism. What actually happens, measured against
+the pre-fix check with an all-colliding hasher, is that the recycled slot shifts every record down by
+one, so each stale entry resolves onto its *neighbour*:
+
+```
+pre-fix  scan yields: k00, k02, k03, k04, k05, k06, k07   (k01 silently omitted)
+```
+
+So the harm is **omission plus mis-attribution**, not duplication — and because the yielded pair is
+decoded wholesale from whatever record the locator lands on, the caller receives a self-consistent,
+currently-live `(key, value)`. It just isn't the entry the snapshot named, and one live key vanishes from
+a full scan. That is a real identity bug, but it is P3, not P2: no caller ever sees fabricated bytes.
+
+The caller-observable discriminator the test asserts is that a snapshot-based scan must never return a
+record written *after* the snapshot was taken. Pre-fix it returns one; post-fix it does not.
 
 ### A coverage gap worth naming
 A P0 shipped through a green 440-test suite. What the suite did not have, and still should, is a crash

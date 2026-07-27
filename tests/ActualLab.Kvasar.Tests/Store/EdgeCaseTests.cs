@@ -2,6 +2,7 @@ using System.Globalization;
 using System.IO;
 using System.Text;
 using ActualLab.Kvasar.Crypto;
+using ActualLab.Kvasar.Internal;
 
 namespace ActualLab.Kvasar.Tests.Store;
 
