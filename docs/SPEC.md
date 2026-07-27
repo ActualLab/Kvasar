@@ -458,6 +458,11 @@ ms, scaling with index size not data size** (vs. ~15–30 ms to decrypt-scan a 2
 - **Record-before-index ordering.** The writer writes the record's bytes into a page **first**, then
   publishes the locator — so a reader either doesn't see the key yet or sees a locator pointing at
   fully-written bytes. Never a dangling/partial read.
+- **Compaction yields to writers.** A total pass reads outside the writer lock and applies batches
+  capped at 64 records or roughly 64 KiB under it (one record minimum), releasing and yielding
+  between batches. Writes during a pass append to both the target and the still-active source: the
+  source locator remains the durable publication until the final serialized compare-and-set + slot
+  switch, so an interrupted pass cannot lose or resurrect an interleaved write.
 - **Reads:** `System.IO.RandomAccess.Read` (positional, cursor-free, concurrent-safe) into the page
   cache; decrypted pages are immutable & GC-managed, so zero-copy results stay valid (§6.3).
 

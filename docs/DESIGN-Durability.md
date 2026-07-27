@@ -335,15 +335,25 @@ Trigger: `deadBytes / (liveBytes + deadBytes) >= CompactionDeadRatio` (default 0
 commit. Runs asynchronously; the switch is one superblock write, so it is atomic and instantaneous
 from a reader's perspective.
 
-1. Active is A, threshold crossed. Truncate B to its header, stamp a fresh random `fileSalt`.
-2. Copy A's live records into B. **New writes also append to B**, interleaved under the existing
-   write lock — a newer write for key K naturally supersedes the copier's version, because both land
-   in the same append stream and last-writer-wins by offset.
-3. When the copier drains A, A holds nothing live. Commit: `dataSlot = B`.
-4. A becomes recyclable one commit later, per §3.2.
+1. Active is A, threshold crossed. Under the write lock, truncate B to its header, stamp a fresh
+   random `fileSalt`, and publish the in-progress pass so subsequent writes also append to B.
+2. Read A without the write lock. Apply batches capped at 64 records or roughly 64 KiB under the
+   lock (one record minimum): append them to B, seal the target tail, and compare-and-set their
+   locators. Release and yield between batches so queued writers run.
+3. An interleaved write appends its future canonical copy to B and its crash-safe copy to A, then
+   publishes the A locator until the final switch. Commits during the pass therefore remain
+   self-contained A commits; a crash or abort between batches reopens exactly as if the partial B
+   copy never existed.
+4. When the copier drains A, seal B, compare-and-set every interleaved write from its A locator to
+   its B locator, rotate the index checkpoint, and commit `dataSlot = B` in the same serialized
+   switch. A writer that superseded a copied record wins because either compare-and-set sees that
+   the old locator changed.
+5. A becomes recyclable one commit later, per §3.2.
 
-The only genuine concurrency logic: when the copier relocates key K it must update the index *only
-if* the index still points at K's old locator in A — a compare-and-set, nothing more.
+If a pass aborts before the switch, successful batch relocations are compare-and-set back to their A
+locators; any concurrent write or delete that already displaced one is left alone. Target-only
+copies and their accounting are discarded. Only a `KvasarCorruptException` may remove an entry
+during copying; every other failure rolls the pass back without changing the logical index.
 
 The fresh `fileSalt` per recycle keeps nonce spaces disjoint. This is the same argument
 `StartNewSegment` already relies on today.

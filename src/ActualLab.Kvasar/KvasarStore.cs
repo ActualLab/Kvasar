@@ -14,6 +14,8 @@ namespace ActualLab.Kvasar;
 /// </summary>
 public sealed class KvasarStore : IAsyncDisposable
 {
+    private const int CompactionBatchBytes = 64 * 1024;
+    private const int CompactionBatchRecords = 64;
     // Below this, a GetMany batch cannot consume the ~1 MiB run a prefetch pulls, so it costs more
     // than it saves. See the note in GetMany.
     private const int MinPrefetchBatchSize = 8;
@@ -54,6 +56,8 @@ public sealed class KvasarStore : IAsyncDisposable
     private bool _isSlotSwitchPending;
     private bool _mustRotateIndex;
     private bool _isCompacting;
+    private CompactionState? _compaction;
+    private Task? _compactionTask;
     private long _uncommittedBytes;
     private Task? _flushLoopTask;
     private int _isDirty;
@@ -206,6 +210,14 @@ public sealed class KvasarStore : IAsyncDisposable
             }
             catch {
                 // Already best-effort; dispose still has to run.
+            }
+        }
+        if (_compactionTask is { } compactionTask) {
+            try {
+                await compactionTask.ConfigureAwait(false);
+            }
+            catch {
+                // The pass has already rolled back or reached a switch; disposal still has to run.
             }
         }
 
@@ -456,14 +468,13 @@ public sealed class KvasarStore : IAsyncDisposable
     {
         ThrowIfDisposed();
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-        // The only write with a genuinely cancellable interior: the token stops the copy pass at a record
-        // boundary (see CompactCore), and the pass in flight still leaves the store consistent.
         await CompactLocked(cancellationToken).WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     // Private methods
 
-    private readonly record struct AppendResult(Locator Locator, int RecordLength, bool IsTombstone);
+    private readonly record struct AppendResult(
+        Locator Locator, Locator CompactionLocator, int RecordLength, bool IsTombstone);
     private readonly record struct IndexedRecord(bool IsFound, Locator Locator, int Length, ulong KeyId);
 
     // --- Private: write-lock bodies ----------------------------------------
@@ -519,6 +530,8 @@ public sealed class KvasarStore : IAsyncDisposable
     {
         try {
             ObjectDisposedException.ThrowIf(_isDisposed, this);
+            if (_compaction is { } compaction)
+                AbortCompaction(compaction);
             _index.Clear();
             // Deliberately the one place that unlinks: Clear is an explicit, exclusive request to destroy
             // the data, so leaving the old bytes on disk under a recycled slot would be the wrong answer.
@@ -546,18 +559,17 @@ public sealed class KvasarStore : IAsyncDisposable
 
     private async Task CompactLocked(CancellationToken cancellationToken)
     {
+        Task? compactionTask = null;
         try {
             ObjectDisposedException.ThrowIf(_isDisposed, this);
             if (_data.DeadBytes > 0)
-                await CompactCore(cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) {
-            // Compaction is opportunistic maintenance: a cancelled pass has already left the store
-            // consistent (see CompactCore), and the caller's await observed the cancellation anyway.
+                compactionTask = await CompactCore(cancellationToken).ConfigureAwait(false);
         }
         finally {
             _writeLock.Release();
         }
+        if (compactionTask is not null)
+            await compactionTask.ConfigureAwait(false);
     }
 
     // --- Private: open / recovery (§3.1, §5.2) ------------------------------
@@ -727,6 +739,8 @@ public sealed class KvasarStore : IAsyncDisposable
         _slotSwitchGeneration = 0;
         _isSlotSwitchPending = false;
         _isCompacting = false;
+        _compaction = null;
+        _compactionTask = null;
         _uncommittedBytes = 0;
         _indexSlot = 1; // so the checkpoint below rotates into slot 0
         _mustRotateIndex = true;
@@ -886,7 +900,8 @@ public sealed class KvasarStore : IAsyncDisposable
         await indexLog.WriteCommitMac(generation).ConfigureAwait(false);
         await _superblock.Write(_superblockFile!, new SuperblockState(
             generation, (byte)_data.ActiveSlot, dataCommitLength,
-            (byte)_indexSlot, indexLog.Length, _data.LiveBytes, _data.DeadBytes)).ConfigureAwait(false);
+            (byte)_indexSlot, indexLog.Length, _data.ActiveLiveBytes, _data.ActiveDeadBytes))
+            .ConfigureAwait(false);
         _generation = generation;
         _uncommittedBytes = 0;
         if (_isSlotSwitchPending) {
@@ -897,6 +912,8 @@ public sealed class KvasarStore : IAsyncDisposable
 
     private bool MustRotateIndex()
     {
+        if (_isCompacting)
+            return false;
         if (_mustRotateIndex)
             return true;
         if (!_mustPersistIndex || _isSlotSwitchPending || _generation <= _slotSwitchGeneration)
@@ -942,15 +959,31 @@ public sealed class KvasarStore : IAsyncDisposable
         await MaybeCompact().ConfigureAwait(false);
     }
 
-    private ValueTask MaybeCompact()
+    private async ValueTask MaybeCompact()
     {
         // §4: one trigger, checked at commit, over the store as a whole rather than per file.
+        if (_isCompacting)
+            return;
+
         var dead = _data.DeadBytes;
         var total = _data.LiveBytes + dead;
-        return dead >= _options.CompactionMinBytes && total > 0
-            && (double)dead / total >= _options.CompactionDeadRatio
-            ? CompactCore(CancellationToken.None)
-            : default;
+        if (dead < _options.CompactionMinBytes || total <= 0
+            || (double)dead / total < _options.CompactionDeadRatio)
+            return;
+
+        var compactionTask = await CompactCore(CancellationToken.None).ConfigureAwait(false);
+        if (compactionTask is not null)
+            _ = ObserveCompaction(compactionTask);
+    }
+
+    private static async Task ObserveCompaction(Task compactionTask)
+    {
+        try {
+            await compactionTask.ConfigureAwait(false);
+        }
+        catch {
+            // Auto-compaction is maintenance; its rollback is complete before the task faults.
+        }
     }
 
     private void MarkDirty()
@@ -996,76 +1029,200 @@ public sealed class KvasarStore : IAsyncDisposable
 
     // --- Private: compaction (§4) ------------------------------------------
 
-    private async ValueTask CompactCore(CancellationToken cancellationToken)
+    private async ValueTask<Task?> CompactCore(CancellationToken cancellationToken)
     {
         if (_isCompacting)
-            return;
+            return _compactionTask;
+
         // A data file may be recycled only once no valid superblock slot names it, which with two slots
         // means the switch commit and one further commit both have to pass (§3.2).
         while (_isSlotSwitchPending || _generation <= _slotSwitchGeneration)
             await Commit(true).ConfigureAwait(false);
 
-        _isCompacting = true;
         var sourceSlot = _data.ActiveSlot;
         var targetSlot = await _data.BeginCompaction().ConfigureAwait(false);
         try {
-            // The copy loop only ever *adds* records — the index still points at the originals — so an
-            // abandoned pass leaves unreferenced copies in a slot the next BeginCompaction truncates,
-            // never a broken record or a dangling locator.
             var entries = _index.Snapshot().ToArray();
             Array.Sort(entries, static (a, b) => a.PackedLocator.CompareTo(b.PackedLocator));
-            var pending = new List<(ulong Hash, ulong KeyId, Locator OldLoc, Locator NewLoc, int NewLength)>(
-                entries.Length);
-            foreach (var e in entries) {
-                cancellationToken.ThrowIfCancellationRequested();
-                var loc = e.Locator;
-                RecordRead read;
-                try {
-                    read = await _data.TryReadRecord(loc, cancellationToken).ConfigureAwait(false);
-                }
-                catch (KvasarCorruptException) {
-                    read = default;
-                }
-                // Tombstones are simply dropped: compaction is total, so no earlier file survives holding
-                // the record this one deletes, and there is nothing left to resurrect (I4). A record that
-                // is corrupt — or isn't the one the entry named, which a locator left over from an earlier
-                // switch can be — is dropped rather than carried into the checkpoint.
-                var view = read.View;
-                if (!read.IsFound || view.IsTombstone
-                    || _hasher.Hash(view.Key.Span, _hashKey) != e.KeyHash) {
-                    _index.Remove(e.KeyHash, loc);
-                    continue;
-                }
-                var (newLoc, newLength) = await _data
-                    .AppendToTarget(view.Flags, view.ValueKind, view.Key, view.Value, false)
-                    .ConfigureAwait(false);
-                pending.Add((e.KeyHash, e.KeyId, loc, newLoc, newLength));
-            }
-            // Seal before repointing, so a published locator always names an immutable page.
-            await _data.SealTail().ConfigureAwait(false);
-            foreach (var p in pending) {
-                // Compare-and-set: relocate only while the index still points at the record we copied,
-                // otherwise a concurrent write has already superseded it.
-                if (!_index.Set(p.Hash, p.NewLoc, p.NewLength, p.OldLoc))
-                    continue;
-                await AppendDelta(p.Hash, p.KeyId, p.NewLoc, p.NewLength, false).ConfigureAwait(false);
-            }
+            var cancellationSource =
+                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
+            var compaction = new CompactionState(sourceSlot, targetSlot, entries, cancellationSource);
+            _compaction = compaction;
+            _isCompacting = true;
+            var compactionTask = RunCompaction(compaction);
+            _compactionTask = compactionTask;
+            return compactionTask;
         }
         catch {
             _data.AbortCompaction();
             _data.ResetAccounting(targetSlot);
-            _isCompacting = false;
             throw;
         }
+    }
 
-        await _data.CommitCompaction(targetSlot).ConfigureAwait(false);
-        _data.ResetAccounting(sourceSlot);
+    private async Task RunCompaction(CompactionState compaction)
+    {
+        // Reads are concurrent; only bounded target-appends/CAS batches and the final switch take the lock.
+        await Task.Yield();
+        try {
+            while (compaction.NextEntry < compaction.Entries.Length) {
+                var batch = await ReadCompactionBatch(compaction).ConfigureAwait(false);
+                await _writeLock.WaitAsync(compaction.CancellationToken).ConfigureAwait(false);
+                try {
+                    if (!ReferenceEquals(_compaction, compaction))
+                        return;
+                    await ApplyCompactionBatch(compaction, batch).ConfigureAwait(false);
+                }
+                finally {
+                    _writeLock.Release();
+                }
+                await Task.Yield();
+            }
+
+            await _writeLock.WaitAsync(compaction.CancellationToken).ConfigureAwait(false);
+            try {
+                if (ReferenceEquals(_compaction, compaction))
+                    await FinishCompaction(compaction).ConfigureAwait(false);
+            }
+            finally {
+                _writeLock.Release();
+            }
+        }
+        catch (OperationCanceledException) {
+            await AbortCompactionPass(compaction).ConfigureAwait(false);
+        }
+        catch {
+            await AbortCompactionPass(compaction).ConfigureAwait(false);
+            throw;
+        }
+        finally {
+            compaction.CancellationSource.Dispose();
+        }
+    }
+
+    private async ValueTask<List<CompactionCopy>> ReadCompactionBatch(CompactionState compaction)
+    {
+        var batch = new List<CompactionCopy>(CompactionBatchRecords);
+        var bytes = 0L;
+        while (compaction.NextEntry < compaction.Entries.Length
+            && batch.Count < CompactionBatchRecords
+            && (bytes < CompactionBatchBytes || batch.Count == 0)) {
+            compaction.CancellationToken.ThrowIfCancellationRequested();
+            var entry = compaction.Entries[compaction.NextEntry++];
+            RecordRead read;
+            try {
+                read = await _data.TryReadRecord(entry.Locator, compaction.CancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (KvasarCorruptException) {
+                batch.Add(new CompactionCopy(entry, default, true, false));
+                continue;
+            }
+
+            var view = read.View;
+            var isCopy = read.IsFound && !view.IsTombstone
+                && _hasher.Hash(view.Key.Span, _hashKey) == entry.KeyHash;
+            batch.Add(new CompactionCopy(entry, view, false, isCopy));
+            if (isCopy)
+                bytes += entry.Length;
+        }
+        return batch;
+    }
+
+    private async ValueTask ApplyCompactionBatch(
+        CompactionState compaction, List<CompactionCopy> batch)
+    {
+        var pending = new List<CompactionRelocation>(batch.Count);
+        foreach (var copy in batch) {
+            var entry = copy.Entry;
+            if (copy.IsCorrupt) {
+                _index.Remove(entry.KeyHash, entry.Locator);
+                continue;
+            }
+            if (!copy.IsCopy)
+                continue;
+
+            var view = copy.View;
+            var (newLoc, newLength) = await _data
+                .AppendToTarget(view.Flags, view.ValueKind, view.Key, view.Value, false)
+                .ConfigureAwait(false);
+            pending.Add(new CompactionRelocation(
+                entry.KeyHash, entry.Locator, (int)entry.Length, newLoc, newLength));
+        }
+        if (pending.Count == 0)
+            return;
+
+        await _data.SealCompactionTarget().ConfigureAwait(false);
+        foreach (var relocation in pending) {
+            compaction.Relocated.Add(relocation);
+            compaction.RelocatedByTarget.Add(relocation.TargetLocator.Packed, relocation);
+            if (_index.Set(
+                    relocation.KeyHash, relocation.TargetLocator, relocation.TargetLength,
+                    relocation.SourceLocator))
+                continue;
+
+            compaction.RelocatedByTarget.Remove(relocation.TargetLocator.Packed);
+            compaction.Relocated.RemoveAt(compaction.Relocated.Count - 1);
+            _data.OnSuperseded(relocation.TargetLocator, relocation.TargetLength);
+        }
+    }
+
+    private async ValueTask FinishCompaction(CompactionState compaction)
+    {
+        // No target locator may reach a persisted checkpoint before the commit that also switches data slots.
+        await _data.SealCompactionTarget().ConfigureAwait(false);
+        foreach (var relocation in compaction.WriteRelocations) {
+            compaction.Relocated.Add(relocation);
+            if (_index.Set(
+                    relocation.KeyHash, relocation.TargetLocator, relocation.TargetLength,
+                    relocation.SourceLocator))
+                continue;
+
+            compaction.Relocated.RemoveAt(compaction.Relocated.Count - 1);
+            _data.OnSuperseded(relocation.TargetLocator, relocation.TargetLength);
+        }
+
+        var targetFileId = (uint)compaction.TargetSlot + 1;
+        if (_index.Snapshot().Any(e => e.Locator.FileId != targetFileId))
+            throw new InvalidOperationException("Compaction left an index entry in the drained slot.");
+
+        await _data.CommitCompaction(compaction.TargetSlot).ConfigureAwait(false);
+        _data.ResetAccounting(compaction.SourceSlot);
         _isSlotSwitchPending = true;
-        // The index checkpoint and the data-slot switch have to land in the *same* superblock write: a
-        // checkpoint stamped in the old file's offset space would be replayed against the new one.
         _mustRotateIndex = true;
+        _compaction = null;
         _isCompacting = false;
         await Commit(true).ConfigureAwait(false);
+    }
+
+    private async Task AbortCompactionPass(CompactionState compaction)
+    {
+        await _writeLock.WaitAsync().ConfigureAwait(false);
+        try {
+            if (ReferenceEquals(_compaction, compaction))
+                AbortCompaction(compaction);
+        }
+        finally {
+            _writeLock.Release();
+        }
+    }
+
+    private void AbortCompaction(CompactionState compaction)
+    {
+        compaction.CancellationSource.Cancel();
+        for (var i = compaction.Relocated.Count - 1; i >= 0; i--) {
+            var relocation = compaction.Relocated[i];
+            if (_index.Set(
+                    relocation.KeyHash, relocation.SourceLocator, relocation.SourceLength,
+                    relocation.TargetLocator))
+                continue;
+            if (!compaction.SupersededSources.Contains(relocation.SourceLocator.Packed))
+                _data.OnSuperseded(relocation.SourceLocator, relocation.SourceLength);
+        }
+        _data.AbortCompaction();
+        _data.ResetAccounting(compaction.TargetSlot);
+        _compaction = null;
+        _isCompacting = false;
     }
 
     // --- Private: append / publish -----------------------------------------
@@ -1081,6 +1238,7 @@ public sealed class KvasarStore : IAsyncDisposable
 
     private async ValueTask<AppendResult> AppendOne(KvasarKey key, KvasarValue? value)
     {
+        // The source copy keeps interim commits recoverable; the target copy becomes canonical at the switch.
         var isTombstone = value is null;
         var record = value ?? default;
         if (!isTombstone && record.Length > _options.MaxValueBytes) {
@@ -1094,10 +1252,16 @@ public sealed class KvasarStore : IAsyncDisposable
             isTombstone = true;
             record = default;
         }
+        var compactionLocator = Locator.None;
+        if (!isTombstone && _compaction is not null) {
+            (compactionLocator, _) = await _data
+                .AppendToTarget(RecordFlags.None, record.Kind, key.Memory, record.Memory, false)
+                .ConfigureAwait(false);
+        }
         var (locator, recordLength) = await _data
             .Append(RecordFlags.None, record.Kind, key.Memory, record.Memory, isTombstone)
             .ConfigureAwait(false);
-        return new AppendResult(locator, recordLength, isTombstone);
+        return new AppendResult(locator, compactionLocator, recordLength, isTombstone);
     }
 
     private async ValueTask<IndexedRecord> FindIndexed(KvasarKey key, ulong keyHash, Locator newLoc)
@@ -1148,18 +1312,23 @@ public sealed class KvasarStore : IAsyncDisposable
 
     private async ValueTask Publish(KvasarKey key, ulong h, AppendResult appended)
     {
-        var (loc, recordLength, isTombstone) = appended;
+        var (loc, compactionLoc, recordLength, isTombstone) = appended;
         var old = await FindIndexed(key, h, loc).ConfigureAwait(false);
         if (isTombstone) {
             if (old.IsFound) {
                 _index.Remove(h, old.Locator);
+                TrackCompactionSupersession(old.Locator);
                 _data.OnSuperseded(old.Locator, old.Length);
             }
             _data.OnSuperseded(loc, recordLength); // the tombstone itself is reclaimable space
             await AppendDelta(h, old.KeyId, loc, recordLength, true).ConfigureAwait(false);
         }
         else {
+            if (!compactionLoc.IsNone && _compaction is { } compaction)
+                compaction.WriteRelocations.Add(new CompactionRelocation(
+                    h, loc, recordLength, compactionLoc, recordLength));
             if (old.IsFound) {
+                TrackCompactionSupersession(old.Locator);
                 _data.OnSuperseded(old.Locator, old.Length);
                 if (!_index.Set(h, loc, recordLength, old.Locator))
                     throw new InvalidOperationException("The index entry changed while the write lock was held.");
@@ -1168,6 +1337,15 @@ public sealed class KvasarStore : IAsyncDisposable
                 _index.Add(h, old.KeyId, loc, recordLength);
             await AppendDelta(h, old.KeyId, loc, recordLength, false).ConfigureAwait(false);
         }
+    }
+
+    private void TrackCompactionSupersession(Locator locator)
+    {
+        if (_compaction is not { } compaction
+            || !compaction.RelocatedByTarget.TryGetValue(locator.Packed, out var relocation)
+            || !compaction.SupersededSources.Add(relocation.SourceLocator.Packed))
+            return;
+        _data.OnSuperseded(relocation.SourceLocator, relocation.SourceLength);
     }
 
     private async ValueTask AppendDelta(
@@ -1327,6 +1505,47 @@ public sealed class KvasarStore : IAsyncDisposable
                 hash ^= b;
                 hash *= 16777619;
             }
+        }
+    }
+
+    // Nested types
+
+    private readonly record struct CompactionCopy(
+        IndexEntry Entry, RecordView View, bool IsCorrupt, bool IsCopy);
+
+    private readonly record struct CompactionRelocation(
+        ulong KeyHash,
+        Locator SourceLocator,
+        int SourceLength,
+        Locator TargetLocator,
+        int TargetLength);
+
+    private sealed class CompactionState
+    {
+        public int SourceSlot { get; }
+        public int TargetSlot { get; }
+        public IndexEntry[] Entries { get; }
+        public CancellationTokenSource CancellationSource { get; }
+        public CancellationToken CancellationToken => CancellationSource.Token;
+        public List<CompactionRelocation> Relocated { get; }
+        public Dictionary<ulong, CompactionRelocation> RelocatedByTarget { get; }
+        public HashSet<ulong> SupersededSources { get; }
+        public List<CompactionRelocation> WriteRelocations { get; }
+        public int NextEntry;
+
+        public CompactionState(
+            int sourceSlot, int targetSlot, IndexEntry[] entries,
+            CancellationTokenSource cancellationSource)
+        {
+            SourceSlot = sourceSlot;
+            TargetSlot = targetSlot;
+            Entries = entries;
+            CancellationSource = cancellationSource;
+            var initialCapacity = Math.Min(entries.Length, 1024);
+            Relocated = new List<CompactionRelocation>(initialCapacity);
+            RelocatedByTarget = new Dictionary<ulong, CompactionRelocation>(initialCapacity);
+            SupersededSources = new HashSet<ulong>();
+            WriteRelocations = new List<CompactionRelocation>(initialCapacity);
         }
     }
 }
