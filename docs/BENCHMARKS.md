@@ -45,6 +45,28 @@ median was 342.0k Set/s and 7,058.5k Get/s, with 0.9 µs p50 and 3.2 µs p99. Th
 ranged from 6,665.7k to 9,329.0k Get/s, so this confirms the guarded path remains fast but is too noisy
 to assign a precise cost to the added checks.
 
+## Final verification (post round-6)
+
+Spot check at `0469e5e`, after six review rounds, data format 2 and the read-lease work. **Single runs on
+a machine that had been running agents all session**, so treat these as a no-material-regression check
+rather than as a replacement for the multi-run tables below — the deltas sit inside the run-to-run spread
+those tables already record.
+
+Durability-matched (Kvasar `Flushed`, SQLite `wal_checkpoint(TRUNCATE)`):
+
+| Scenario | SQLCipher | Kvasar (AES-GCM) | Speedup |
+|---|--:|--:|--:|
+| Chat cold start, 12 MB | 51.2 ms | **8.1 ms** | 6.3x |
+| Chat cold start, 25 MB | 113.3 ms | **10.7 ms** | 10.6x |
+| Sweep 128 B — writes / lookups | 136.4 k/s / 121 k/s | **501.6 / 7,831** | 3.7x / 65x |
+| Sweep 1 KB — writes / lookups | 52.5 / 105.3 | **269.6 / 336.4** | 5.1x / 3.2x |
+| Sweep 4 KB — writes / lookups | 18.8 / 74.4 | **79.9 / 114.0** | 4.2x / 1.5x |
+| Startup hydration, 1 KB / 4 KB | 762.7 / 2,532.8 ms | **195.1 / 708.7 ms** | 3.9x / 3.6x |
+
+Chat cold start was 7.7 / 11.3 ms when the tables below were measured, so the correctness work — page
+framing, incarnation read leases, commit-window authentication — cost nothing measurable at this
+resolution. The 8-byte page frame costs 0.195% of payload at 4 KiB pages and 0.049% at 16 KiB.
+
 ## Representative results
 
 Measured 2026-07-27 on an AMD Ryzen 9 9950X3D (32 logical cores), Windows 11 Pro 24H2
