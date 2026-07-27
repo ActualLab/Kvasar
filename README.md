@@ -29,35 +29,35 @@ threads speculatively render the UI — a burst of distinct-key reads (80% of th
 `BatchingKvas`: a 256-entry LRU, batched reads, a 500 ms lazy writer); Kvasar runs with **no layer at
 all**, app threads calling `Get`/`Set` directly, with its own 0.5 s `FlushDelay` for write debouncing.
 
-| Cold start, median of 5 | SQLCipher + BatchingKvas | Kvasar, no layer | Speedup |
+| Cold start, median of three 5-run invocations | SQLCipher + BatchingKvas | Kvasar, no layer | Speedup |
 |---|--:|--:|--:|
-| 12 MB cache, 1,000 reads | 50.8 ms | **5.6 ms** | **9.1×** |
-| 25 MB cache, 2,000 reads | 100.0 ms | **7.6 ms** | **13.2×** |
+| 12 MB cache, 1,000 reads | 54.0 ms | **7.7 ms** | **7.0×** |
+| 25 MB cache, 2,000 reads | 123.9 ms | **11.3 ms** | **11.0×** |
 
-> **Not durability-matched.** SQLite ends these runs checkpointed; Kvasar's default `Durability` is
-> `Buffered`, so it does not fsync. Netting that out, its own v1→v2 gain here is ~10%, not ~38% — the
-> speedups above are still real but flatter than they look. See
-> [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+These are durability-matched: the harness runs Kvasar at `Flushed` and checkpoints SQLite's WAL.
+With Kvasar at `Buffered`, its totals are 7.2 / 10.0 ms; the matched flush costs 0.5 / 1.3 ms.
+See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for both modes and the full run-to-run spread.
 
 Batching layers exist to hide a slow backend; in front of Kvasar the same layer only *costs* time
-(6.9 / 9.6 ms), and its read cache never hits on a distinct-key burst.
+(9.2 / 14.0 ms), and its read cache never hits on a distinct-key burst.
 
 A per-value-size sweep of the engines in isolation — 100k keys, 50-byte keys, 8 reader threads:
 
 | Value size | Batched writes | Startup hydration | Point reads | Read p99 |
 |---|--:|--:|--:|--:|
-| 128 B (fits cache — the target scenario) | **4.7×** | 0.95× | **44×** | 1.6 µs vs 99 µs |
-| 1 KB | **6.0×** | **4.8×** | **2.6×** | 63 µs vs 118 µs |
-| 4 KB (16 KB pages) | **10.9×** | **8.2×** | **1.5×** | 105 µs vs 141 µs |
+| 128 B (fits cache — the target scenario) | **3.9×** | 1.0× | **75×** | 1.4 µs vs 124 µs |
+| 1 KB | **5.4×** | **4.5×** | **3.0×** | 79 µs vs 147 µs |
+| 4 KB (16 KB pages) | **7.7×** | **7.4×** | **1.8×** | 133 µs vs 185 µs |
 
-A warm read is one hash probe, one already-decrypted page, and a zero-copy slice — roughly **1 µs**,
-versus a B-tree descent through the SQLite VM. Where SQLite wins: opening a connection is trivially
-cheap; **startup hydration at 128 B**, where it is now marginally ahead (138 ms vs 145 ms) because it
-defers work Kvasar does eagerly and a small dataset never repays that; and its file is ~14% smaller
-for 4 KB values.
+A warm read is one hash probe, one already-decrypted page, and a zero-copy slice — under **1 µs** at
+the median, versus a B-tree descent through the SQLite VM. Where SQLite wins: opening a connection
+is trivially cheap, and its file is 17% smaller for 4 KB values even when Kvasar uses 16 KB pages.
+Startup hydration at 128 B is tied at about 141 ms; Kvasar's authenticated index load is eager while
+SQLite defers work.
 
-The point-read column is the least repeatable in this table — back-to-back runs on an idle machine
-moved it 30% for *both* engines. Treat those multiples as one significant figure.
+The disk-bound 4 KB writes were the least repeatable result: Kvasar varied by 73–89% across runs,
+depending on page size. The page-size direction held, but treat the exact write multiple as one
+significant figure.
 
 ## How it works
 
@@ -134,7 +134,8 @@ Keys and values are binary — `KvasarKey` / `KvasarValue`, thin structs over
 
 **Tune `PageSize` to your value size.** It is the highest-leverage knob: values larger than a page
 can't stay single-page, which costs both space and I/O. Moving 4 KB values from 4 KB to 16 KB pages
-is **+67% writes, −33% file size, and −52% startup**.
+is **+109% median writes, −34% file size, and −47% startup**. The write magnitude is unstable; all
+three 16 KB-page samples still beat all three 4 KB-page samples.
 
 ## Status
 
