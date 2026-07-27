@@ -120,8 +120,14 @@ public sealed class Superblock : IDisposable
     public Superblock(ReadOnlySpan<byte> masterKey, uint formatVer, IKeyDerivation? keyDerivation = null)
     {
         _key = new byte[KvasarConstants.SuperblockKeySize];
-        (keyDerivation ?? KeyDerivations.HkdfSha256)
-            .Derive(masterKey, [], KvasarConstants.SuperblockKeyInfo, _key);
+        try {
+            (keyDerivation ?? KeyDerivations.HkdfSha256)
+                .Derive(masterKey, [], KvasarConstants.SuperblockKeyInfo, _key);
+        }
+        catch {
+            CryptographicOperations.ZeroMemory(_key);
+            throw;
+        }
         _formatVer = formatVer;
     }
 

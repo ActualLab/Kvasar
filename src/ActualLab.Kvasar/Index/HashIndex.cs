@@ -41,45 +41,7 @@ public sealed class HashIndex
     public ProbeCursor Probe(ulong keyHash)
         => new(_table, keyHash); // single acquire-read of the table reference for the whole probe
 
-    public bool TryGetFirst(ulong keyHash, out Locator loc, out int length)
-    {
-        var cursor = Probe(keyHash);
-        while (cursor.MoveNext(out loc, out length)) {
-            if (cursor.CurrentHash == keyHash)
-                return true;
-        }
-        loc = default;
-        length = 0;
-        return false;
-    }
-
     // --- Writer (single-threaded) ----------------------------------------------------------------
-
-    public void Set(ulong keyHash, Locator loc, int length)
-    {
-        RequireLiveLocator(loc);
-        var packed = loc.Packed;
-        var t = _table;
-        Scan(t, keyHash, 0, matchKeyId: false, out var live, out var insert, out var insertIsEmpty);
-        if (live >= 0) {
-            t.Lengths[live] = length;
-            Volatile.Write(ref t.Locators[live], packed);
-            return;
-        }
-        if (insertIsEmpty && _used + 1 > t.Threshold) {
-            Rehash(CapacityFor(_count + 1));
-            t = _table;
-            Scan(t, keyHash, 0, matchKeyId: false, out _, out insert, out insertIsEmpty);
-        }
-
-        t.Hashes[insert] = keyHash;
-        t.KeyIds[insert] = packed;
-        t.Lengths[insert] = length;
-        Volatile.Write(ref t.Locators[insert], packed); // release: hash/length already written
-        _count++;
-        if (insertIsEmpty)
-            _used++; // reusing a tombstone doesn't add a non-empty slot
-    }
 
     public bool Set(ulong keyHash, Locator loc, int length, Locator previousLoc)
     {
@@ -153,30 +115,6 @@ public sealed class HashIndex
         _table = t; // release-publishes all the freshly built arrays
     }
 
-    // RCS1242: `in` is mandated by the contract; IndexEntry's members are all readonly so the
-    // by-ref pass makes no defensive copy here.
-#pragma warning disable RCS1242
-    public void Apply(in IndexEntry entry)
-#pragma warning restore RCS1242
-    {
-        if (entry.IsTombstone) {
-            if (entry.KeyId != Empty)
-                RemoveByKeyId(entry.KeyHash, entry.KeyId);
-            else if (TryGetFirst(entry.KeyHash, out var loc, out _))
-                Remove(entry.KeyHash, loc);
-            return;
-        }
-        // Same reasoning as BulkLoad: a corrupt .kidx entry must be dropped, not thrown on — Set now
-        // rejects sentinels, and that exception would escape Open's wipe-and-recreate.
-        var packed = entry.Locator.Packed;
-        if (packed is Empty or Tombstone)
-            return;
-        if (entry.KeyId == Empty)
-            Set(entry.KeyHash, entry.Locator, (int)entry.Length);
-        else
-            SetByKeyId(entry.KeyHash, entry.KeyId, entry.Locator, (int)entry.Length);
-    }
-
     public IEnumerable<IndexEntry> Snapshot()
     {
         // Writer/quiescent only: unsafe to call while another thread mutates the index.
@@ -225,13 +163,13 @@ public sealed class HashIndex
     private void Insert(ulong keyHash, ulong keyId, ulong packed, int length)
     {
         var t = _table;
-        Scan(t, keyHash, keyId, matchKeyId: true, out var live, out var insert, out var insertIsEmpty);
+        Scan(t, keyHash, keyId, mustMatchKeyId: true, out var live, out var insert, out var insertIsEmpty);
         if (live >= 0)
             throw new InvalidOperationException("The key identity is already present.");
         if (insertIsEmpty && _used + 1 > t.Threshold) {
             Rehash(CapacityFor(_count + 1));
             t = _table;
-            Scan(t, keyHash, keyId, matchKeyId: true, out _, out insert, out insertIsEmpty);
+            Scan(t, keyHash, keyId, mustMatchKeyId: true, out _, out insert, out insertIsEmpty);
         }
         t.Hashes[insert] = keyHash;
         t.KeyIds[insert] = keyId;
@@ -242,21 +180,8 @@ public sealed class HashIndex
             _used++;
     }
 
-    private bool RemoveByKeyId(ulong keyHash, ulong keyId)
-    {
-        if (keyId == Empty)
-            return false;
-        var t = _table;
-        Scan(t, keyHash, keyId, matchKeyId: true, out var live, out _, out _);
-        if (live < 0)
-            return false;
-        Volatile.Write(ref t.Locators[live], Tombstone);
-        _count--;
-        return true;
-    }
-
     private static void Scan(
-        Table t, ulong keyHash, ulong keyId, bool matchKeyId,
+        Table t, ulong keyHash, ulong keyId, bool mustMatchKeyId,
         out int liveIndex, out int insertIndex, out bool insertIsEmpty)
     {
         var mask = t.Mask;
@@ -277,7 +202,7 @@ public sealed class HashIndex
                 if (firstTomb < 0)
                     firstTomb = i;
             }
-            else if (hashes[i] == keyHash && (!matchKeyId || keyIds[i] == keyId)) {
+            else if (hashes[i] == keyHash && (!mustMatchKeyId || keyIds[i] == keyId)) {
                 liveIndex = i;
                 insertIndex = i;
                 insertIsEmpty = false;
@@ -285,18 +210,6 @@ public sealed class HashIndex
             }
             i = (i + 1) & mask;
         }
-    }
-
-    private void SetByKeyId(ulong keyHash, ulong keyId, Locator loc, int length)
-    {
-        var t = _table;
-        Scan(t, keyHash, keyId, matchKeyId: true, out var live, out _, out _);
-        if (live < 0) {
-            Insert(keyHash, keyId, loc.Packed, length);
-            return;
-        }
-        t.Lengths[live] = length;
-        Volatile.Write(ref t.Locators[live], loc.Packed);
     }
 
     private static void InsertOrUpdate(
@@ -426,7 +339,7 @@ public struct ProbeCursor
     private readonly ushort _fingerprint;
     private int _index;         // next slot to examine
     private ulong _currentHash; // full hash of the slot last returned by MoveNext
-    private int _currentSlot;
+    private ulong _currentKeyId;
 
     internal ProbeCursor(HashIndex.Table table, ulong keyHash)
     {
@@ -438,13 +351,12 @@ public struct ProbeCursor
         _fingerprint = (ushort)(keyHash >> 48);
         _index = (int)(keyHash & (ulong)table.Mask);
         _currentHash = 0;
-        _currentSlot = -1;
+        _currentKeyId = HashIndex.Empty;
     }
 
     // Full hash of the last MoveNext slot; the caller verifies against it (probe matches fingerprint only).
     public readonly ulong CurrentHash => _currentHash;
-    internal readonly ulong CurrentKeyId
-        => _currentSlot < 0 ? HashIndex.Empty : Volatile.Read(ref _keyIds[_currentSlot]);
+    internal readonly ulong CurrentKeyId => _currentKeyId;
 
     public bool MoveNext(out Locator loc, out int length)
     {
@@ -457,7 +369,7 @@ public struct ProbeCursor
                 loc = default;
                 length = 0;
                 _currentHash = 0;
-                _currentSlot = -1;
+                _currentKeyId = HashIndex.Empty;
                 return false; // terminating empty slot ends the run
             }
             if (packed == HashIndex.Tombstone) {
@@ -470,6 +382,7 @@ public struct ProbeCursor
             // between these reads would pair key A's locator with key B's hash/length. Re-reading the
             // locator (which the writer publishes last) confirms the parallel fields came from one generation.
             var h = Volatile.Read(ref _hashes[i]);
+            var keyId = Volatile.Read(ref _keyIds[i]);
             var len = Volatile.Read(ref _lengths[i]);
             if (Volatile.Read(ref _locators[i]) != packed)
                 continue; // slot changed under us: re-examine the same index
@@ -478,7 +391,7 @@ public struct ProbeCursor
             if ((ushort)(h >> 48) != _fingerprint)
                 continue; // fingerprint mismatch: reject with no I/O
             _currentHash = h;
-            _currentSlot = i;
+            _currentKeyId = keyId;
             loc = Locator.FromPacked(packed);
             length = len;
             return true;

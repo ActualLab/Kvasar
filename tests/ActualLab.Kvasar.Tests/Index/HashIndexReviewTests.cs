@@ -26,7 +26,7 @@ public class HashIndexReviewTests
     {
         var index = new HashIndex(Capacity1K);
         for (var i = 1; i <= Threshold1K; i++)
-            index.Set(H(i), Loc(H(i)), Len(H(i)));
+            index.UpsertUniqueHash(H(i), Loc(H(i)), Len(H(i)));
         index.Count.Should().Be(Threshold1K);
 
         // The table sits exactly at its resize threshold and the whole run is one cluster; an absent
@@ -36,19 +36,19 @@ public class HashIndexReviewTests
         while (cursor.MoveNext(out _, out _))
             probed++;
         probed.Should().Be(Threshold1K);
-        index.TryGetFirst(H(999_999), out _, out _).Should().BeFalse();
+        index.TryGetUniqueHash(H(999_999), out _, out _).Should().BeFalse();
 
         for (var i = 1; i <= Threshold1K; i++) {
-            index.TryGetFirst(H(i), out var loc, out var len).Should().BeTrue();
+            index.TryGetUniqueHash(H(i), out var loc, out var len).Should().BeTrue();
             loc.Should().Be(Loc(H(i)));
             len.Should().Be(Len(H(i)));
         }
 
         // One more key crosses the threshold and forces a rehash; nothing may be lost.
-        index.Set(H(Threshold1K + 1), Loc(H(Threshold1K + 1)), Len(H(Threshold1K + 1)));
+        index.UpsertUniqueHash(H(Threshold1K + 1), Loc(H(Threshold1K + 1)), Len(H(Threshold1K + 1)));
         index.Count.Should().Be(Threshold1K + 1);
         for (var i = 1; i <= Threshold1K + 1; i++)
-            index.TryGetFirst(H(i), out _, out _).Should().BeTrue();
+            index.TryGetUniqueHash(H(i), out _, out _).Should().BeTrue();
     }
 
     [Fact]
@@ -56,7 +56,7 @@ public class HashIndexReviewTests
     {
         var index = new HashIndex(Capacity1K);
         for (var i = 1; i <= Threshold1K; i++)
-            index.Set(H(i), Loc(H(i)), Len(H(i)));
+            index.UpsertUniqueHash(H(i), Loc(H(i)), Len(H(i)));
         for (var i = 1; i <= Threshold1K; i++)
             index.Remove(H(i), Loc(H(i))).Should().BeTrue();
         index.Count.Should().Be(0);
@@ -69,13 +69,13 @@ public class HashIndexReviewTests
         // Fresh keys reuse the tombstones rather than the (still empty) tail of the cluster.
         for (var i = 1; i <= Threshold1K; i++) {
             var h = H(i + 100_000);
-            index.Set(h, Loc(h), Len(h));
+            index.UpsertUniqueHash(h, Loc(h), Len(h));
         }
         index.Count.Should().Be(Threshold1K);
         for (var i = 1; i <= Threshold1K; i++) {
-            index.TryGetFirst(H(i), out _, out _).Should().BeFalse();
+            index.TryGetUniqueHash(H(i), out _, out _).Should().BeFalse();
             var h = H(i + 100_000);
-            index.TryGetFirst(h, out var loc, out var len).Should().BeTrue();
+            index.TryGetUniqueHash(h, out var loc, out var len).Should().BeTrue();
             loc.Should().Be(Loc(h));
             len.Should().Be(Len(h));
         }
@@ -87,27 +87,27 @@ public class HashIndexReviewTests
         var index = new HashIndex(64);
         const int n = 32;
         for (var i = 1; i <= n; i++)
-            index.Set(H(i), Loc(H(i)), Len(H(i)));
+            index.UpsertUniqueHash(H(i), Loc(H(i)), Len(H(i)));
 
         // Delete the head of the run, then every other entry: open addressing must not orphan the rest.
         index.Remove(H(1), Loc(H(1))).Should().BeTrue();
         for (var i = 2; i <= n; i += 2)
             index.Remove(H(i), Loc(H(i))).Should().BeTrue();
         for (var i = 3; i <= n; i += 2) {
-            index.TryGetFirst(H(i), out var loc, out _).Should().BeTrue();
+            index.TryGetUniqueHash(H(i), out var loc, out _).Should().BeTrue();
             loc.Should().Be(Loc(H(i)));
         }
         index.Count.Should().Be(index.Snapshot().Count());
 
         // Re-adding the removed keys must land them in the same run, not duplicate them.
         index.Remove(H(1), Loc(H(1))).Should().BeFalse();
-        index.Set(H(1), Loc(H(1)), Len(H(1)));
+        index.UpsertUniqueHash(H(1), Loc(H(1)), Len(H(1)));
         for (var i = 2; i <= n; i += 2)
-            index.Set(H(i), Loc(H(i)), Len(H(i)));
+            index.UpsertUniqueHash(H(i), Loc(H(i)), Len(H(i)));
         index.Count.Should().Be(n);
         index.Snapshot().Count().Should().Be(n);
         for (var i = 1; i <= n; i++)
-            index.TryGetFirst(H(i), out _, out _).Should().BeTrue();
+            index.TryGetUniqueHash(H(i), out _, out _).Should().BeTrue();
     }
 
     [Fact]
@@ -115,15 +115,15 @@ public class HashIndexReviewTests
     {
         var index = new HashIndex(16); // Threshold == 11
         for (var i = 1; i <= 5; i++)
-            index.Set(H(i), Loc(H(i)), Len(H(i)));
+            index.UpsertUniqueHash(H(i), Loc(H(i)), Len(H(i)));
         var cursor = index.Probe(H(1)); // pins the 16-slot table
 
         for (var j = 1; j <= 7; j++) // the 7th filler crosses the threshold and rehashes
-            index.Set(Filler(j), FillerLoc(j), j);
+            index.UpsertUniqueHash(Filler(j), FillerLoc(j), j);
         for (var i = 1; i <= 5; i++)
             index.Remove(H(i), Loc(H(i))).Should().BeTrue();
         for (var i = 1; i <= 5; i++)
-            index.TryGetFirst(H(i), out _, out _).Should().BeFalse();
+            index.TryGetUniqueHash(H(i), out _, out _).Should().BeFalse();
 
         // The pinned snapshot is copy-on-write: it still resolves everything it held, fillers excluded
         // by fingerprint, and it terminates on the old table's empty slot.
@@ -143,13 +143,11 @@ public class HashIndexReviewTests
         index.Remove(H(1), Loc(H(1))).Should().BeFalse();
         index.Count.Should().Be(0);
 
-        index.Set(H(1), Loc(H(1)), Len(H(1)));
+        index.UpsertUniqueHash(H(1), Loc(H(1)), Len(H(1)));
         index.Remove(H(1), Loc(H(1))).Should().BeTrue();
         index.Remove(H(1), Loc(H(1))).Should().BeFalse();
         index.Count.Should().Be(0);
 
-        index.Apply(new IndexEntry { KeyHash = H(2), Flags = (byte)RecordFlags.Tombstone });
-        index.Apply(new IndexEntry { KeyHash = H(2), Flags = (byte)RecordFlags.Tombstone });
         index.Count.Should().Be(0);
         index.Snapshot().Should().BeEmpty();
     }
@@ -171,14 +169,14 @@ public class HashIndexReviewTests
                     index.Remove(h, Loc(h)).Should().BeFalse();
             }
             else {
-                index.Set(h, Loc(h), Len(h));
+                index.UpsertUniqueHash(h, Loc(h), Len(h));
                 oracle[h] = Loc(h);
             }
             index.Count.Should().Be(oracle.Count);
         }
         index.Snapshot().Count().Should().Be(oracle.Count);
         foreach (var (h, loc) in oracle) {
-            index.TryGetFirst(h, out var actual, out _).Should().BeTrue();
+            index.TryGetUniqueHash(h, out var actual, out _).Should().BeTrue();
             actual.Should().Be(loc);
         }
     }
@@ -196,19 +194,24 @@ public class HashIndexReviewTests
                 entries.Add(new IndexEntry {
                     KeyHash = H(i),
                     PackedLocator = new Locator((uint)rev, (i * 16) + rev).Packed,
+                    KeyId = H(i),
                     Length = (uint)((i * 2) + rev),
                     Flags = 0,
                 });
         }
-        entries.Add(new IndexEntry { KeyHash = H(keyCount + 1), Flags = (byte)RecordFlags.Tombstone });
+        entries.Add(new IndexEntry {
+            KeyHash = H(keyCount + 1),
+            KeyId = H(keyCount + 1),
+            Flags = (byte)RecordFlags.Tombstone,
+        });
 
         var index = new HashIndex();
         index.BulkLoad(CollectionsMarshal.AsSpan(entries));
         index.Count.Should().Be(keyCount);
         index.Snapshot().Count().Should().Be(keyCount);
-        index.TryGetFirst(H(keyCount + 1), out _, out _).Should().BeFalse();
+        index.TryGetUniqueHash(H(keyCount + 1), out _, out _).Should().BeFalse();
         for (var i = 1; i <= keyCount; i++) {
-            index.TryGetFirst(H(i), out var loc, out var len).Should().BeTrue();
+            index.TryGetUniqueHash(H(i), out var loc, out var len).Should().BeTrue();
             loc.Should().Be(new Locator(revisions, (uint)((i * 16) + revisions)));
             len.Should().Be((i * 2) + revisions);
         }
@@ -231,7 +234,7 @@ public class HashIndexReviewTests
         const int churnTo = 2000;
         var index = new HashIndex(16);
         for (var i = 1; i <= stableCount; i++)
-            index.Set(H(i), Loc(H(i)), Len(H(i)));
+            index.UpsertUniqueHash(H(i), Loc(H(i)), Len(H(i)));
 
         using var stop = new CancellationTokenSource();
         var misses = 0L;
@@ -242,7 +245,7 @@ public class HashIndexReviewTests
             while (!stop.IsCancellationRequested) {
                 var k = rnd.Next(churnFrom, churnTo);
                 if ((k & 1) == 0)
-                    index.Set(H(k), Loc(H(k)), Len(H(k)));
+                    index.UpsertUniqueHash(H(k), Loc(H(k)), Len(H(k)));
                 else
                     index.Remove(H(k), Loc(H(k)));
                 Interlocked.Increment(ref ops);
@@ -283,6 +286,6 @@ public class HashIndexReviewTests
         Interlocked.Read(ref misses).Should().Be(0);
         Interlocked.Read(ref wrong).Should().Be(0);
         for (var i = 1; i <= stableCount; i++)
-            index.TryGetFirst(H(i), out _, out _).Should().BeTrue();
+            index.TryGetUniqueHash(H(i), out _, out _).Should().BeTrue();
     }
 }

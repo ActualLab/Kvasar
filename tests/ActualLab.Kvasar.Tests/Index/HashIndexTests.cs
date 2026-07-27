@@ -21,12 +21,12 @@ public class HashIndexTests
             var h = (ulong)rnd.NextInt64();
             if (h is HashIndex.Empty or HashIndex.Tombstone)
                 continue;
-            index.Set(h, Loc(h), Len(h));
+            index.UpsertUniqueHash(h, Loc(h), Len(h));
             oracle[h] = (Loc(h), Len(h));
         }
         index.Count.Should().Be(oracle.Count);
         foreach (var (h, v) in oracle) {
-            index.TryGetFirst(h, out var loc, out var len).Should().BeTrue();
+            index.TryGetUniqueHash(h, out var loc, out var len).Should().BeTrue();
             loc.Should().Be(v.Loc);
             len.Should().Be(v.Length);
         }
@@ -35,12 +35,12 @@ public class HashIndexTests
         foreach (var h in oracle.Keys.Take(oracle.Count / 2).ToArray()) {
             var newLoc = new Locator((uint)((h % 17) + 1000), (uint)((h % 31) + 7));
             var newLen = (int)((h % 500) + 5000);
-            index.Set(h, newLoc, newLen);
+            index.UpsertUniqueHash(h, newLoc, newLen);
             oracle[h] = (newLoc, newLen);
         }
         index.Count.Should().Be(oracle.Count);
         foreach (var (h, v) in oracle) {
-            index.TryGetFirst(h, out var loc, out var len).Should().BeTrue();
+            index.TryGetUniqueHash(h, out var loc, out var len).Should().BeTrue();
             loc.Should().Be(v.Loc);
             len.Should().Be(v.Length);
         }
@@ -53,9 +53,9 @@ public class HashIndexTests
         }
         index.Count.Should().Be(oracle.Count);
         foreach (var h in toRemove)
-            index.TryGetFirst(h, out _, out _).Should().BeFalse();
+            index.TryGetUniqueHash(h, out _, out _).Should().BeFalse();
         foreach (var (h, v) in oracle) {
-            index.TryGetFirst(h, out var loc, out _).Should().BeTrue();
+            index.TryGetUniqueHash(h, out var loc, out _).Should().BeTrue();
             loc.Should().Be(v.Loc);
         }
     }
@@ -64,7 +64,7 @@ public class HashIndexTests
     public void RemoveWithWrongLocatorFails()
     {
         var index = new HashIndex(16);
-        index.Set(42, new Locator(1, 100), 10);
+        index.UpsertUniqueHash(42, new Locator(1, 100), 10);
         index.Remove(42, new Locator(9, 999)).Should().BeFalse();
         index.Count.Should().Be(1);
         index.Remove(42, new Locator(1, 100)).Should().BeTrue();
@@ -86,7 +86,7 @@ public class HashIndexTests
         index.Remove(42, second).Should().BeTrue();
 
         index.Count.Should().Be(1);
-        index.TryGetFirst(42, out var loc, out var length).Should().BeTrue();
+        index.TryGetUniqueHash(42, out var loc, out var length).Should().BeTrue();
         loc.Should().Be(replacement);
         length.Should().Be(30);
     }
@@ -103,7 +103,7 @@ public class HashIndexTests
         for (var mid = 1; mid <= 5; mid++) {
             var h = ((ulong)fp << 48) | ((ulong)(uint)mid << 4) | bucket;
             keys.Add(h);
-            index.Set(h, Loc(h), Len(h));
+            index.UpsertUniqueHash(h, Loc(h), Len(h));
         }
         index.Count.Should().Be(5);
 
@@ -116,7 +116,7 @@ public class HashIndexTests
 
         // Exact lookup finds each with its own locator/length.
         foreach (var h in keys) {
-            index.TryGetFirst(h, out var loc, out var len).Should().BeTrue();
+            index.TryGetUniqueHash(h, out var loc, out var len).Should().BeTrue();
             loc.Should().Be(Loc(h));
             len.Should().Be(Len(h));
         }
@@ -124,7 +124,7 @@ public class HashIndexTests
         // A non-present hash sharing fingerprint+bucket: cursor still yields the 5 candidates,
         // exact lookup misses.
         var absent = ((ulong)fp << 48) | ((ulong)999u << 4) | bucket;
-        index.TryGetFirst(absent, out _, out _).Should().BeFalse();
+        index.TryGetUniqueHash(absent, out _, out _).Should().BeFalse();
         var probeCount = 0;
         var c2 = index.Probe(absent);
         while (c2.MoveNext(out _, out _))
@@ -134,9 +134,9 @@ public class HashIndexTests
         // Remove a middle one => tombstone in the run; the rest still resolve past it.
         var removed = keys[2];
         index.Remove(removed, Loc(removed)).Should().BeTrue();
-        index.TryGetFirst(removed, out _, out _).Should().BeFalse();
+        index.TryGetUniqueHash(removed, out _, out _).Should().BeFalse();
         foreach (var h in keys.Where(k => k != removed))
-            index.TryGetFirst(h, out _, out _).Should().BeTrue();
+            index.TryGetUniqueHash(h, out _, out _).Should().BeTrue();
         index.Count.Should().Be(4);
     }
 
@@ -150,12 +150,12 @@ public class HashIndexTests
             var h = (ulong)rnd.NextInt64();
             if (h is HashIndex.Empty or HashIndex.Tombstone || oracle.ContainsKey(h))
                 continue;
-            index.Set(h, Loc(h), Len(h));
+            index.UpsertUniqueHash(h, Loc(h), Len(h));
             oracle[h] = (Loc(h), Len(h));
         }
         index.Count.Should().Be(oracle.Count);
         foreach (var (h, v) in oracle) {
-            index.TryGetFirst(h, out var loc, out var len).Should().BeTrue();
+            index.TryGetUniqueHash(h, out var loc, out var len).Should().BeTrue();
             loc.Should().Be(v.Loc);
             len.Should().Be(v.Length);
         }
@@ -168,13 +168,13 @@ public class HashIndexTests
         // rather than growing without bound.
         var index = new HashIndex(16);
         for (ulong h = 1; h <= 100_000; h++) {
-            index.Set(h, Loc(h), Len(h));
+            index.UpsertUniqueHash(h, Loc(h), Len(h));
             index.Remove(h, Loc(h)).Should().BeTrue();
         }
         index.Count.Should().Be(0);
         // A fresh insert still works and resolves.
-        index.Set(123456, new Locator(3, 33), 7);
-        index.TryGetFirst(123456, out var loc, out var len).Should().BeTrue();
+        index.UpsertUniqueHash(123456, new Locator(3, 33), 7);
+        index.TryGetUniqueHash(123456, out var loc, out var len).Should().BeTrue();
         loc.Should().Be(new Locator(3, 33));
         len.Should().Be(7);
     }
@@ -184,14 +184,14 @@ public class HashIndexTests
     {
         var index = new HashIndex(16);
         for (ulong h = 1; h <= 100; h++)
-            index.Set(h, Loc(h), Len(h));
+            index.UpsertUniqueHash(h, Loc(h), Len(h));
         index.Count.Should().Be(100);
         index.Clear();
         index.Count.Should().Be(0);
-        index.TryGetFirst(50, out _, out _).Should().BeFalse();
-        index.Set(7, new Locator(2, 22), 3);
+        index.TryGetUniqueHash(50, out _, out _).Should().BeFalse();
+        index.UpsertUniqueHash(7, new Locator(2, 22), 3);
         index.Count.Should().Be(1);
-        index.TryGetFirst(7, out var loc, out _).Should().BeTrue();
+        index.TryGetUniqueHash(7, out var loc, out _).Should().BeTrue();
         loc.Should().Be(new Locator(2, 22));
     }
 
@@ -219,7 +219,7 @@ public class HashIndexTests
         index.BulkLoad(CollectionsMarshal.AsSpan(entries));
         index.Count.Should().Be(entries.Count);
         foreach (var e in entries) {
-            index.TryGetFirst(e.KeyHash, out var loc, out var len).Should().BeTrue();
+            index.TryGetUniqueHash(e.KeyHash, out var loc, out var len).Should().BeTrue();
             loc.Should().Be(e.Locator);
             len.Should().Be((int)e.Length);
         }
@@ -238,41 +238,20 @@ public class HashIndexTests
     public void BulkLoadSkipsTombstonesAndLastDupWins()
     {
         var entries = new List<IndexEntry> {
-            new() { KeyHash = 100, PackedLocator = new Locator(1, 10).Packed, Length = 1, Flags = 0 },
-            new() { KeyHash = 200, PackedLocator = new Locator(1, 20).Packed, Length = 2, Flags = (byte)RecordFlags.Tombstone },
-            new() { KeyHash = 100, PackedLocator = new Locator(5, 50).Packed, Length = 9, Flags = 0 }, // later dup wins
-            new() { KeyHash = 300, PackedLocator = new Locator(2, 30).Packed, Length = 3, Flags = 0 },
+            new() { KeyHash = 100, PackedLocator = new Locator(1, 10).Packed, KeyId = 1, Length = 1, Flags = 0 },
+            new() { KeyHash = 200, PackedLocator = new Locator(1, 20).Packed, KeyId = 2, Length = 2, Flags = (byte)RecordFlags.Tombstone },
+            new() { KeyHash = 100, PackedLocator = new Locator(5, 50).Packed, KeyId = 1, Length = 9, Flags = 0 }, // later dup wins
+            new() { KeyHash = 300, PackedLocator = new Locator(2, 30).Packed, KeyId = 3, Length = 3, Flags = 0 },
         };
         var index = new HashIndex();
         index.BulkLoad(CollectionsMarshal.AsSpan(entries));
 
         index.Count.Should().Be(2); // 100 (deduped) + 300; 200 was a tombstone
-        index.TryGetFirst(200, out _, out _).Should().BeFalse();
-        index.TryGetFirst(100, out var loc, out var len).Should().BeTrue();
+        index.TryGetUniqueHash(200, out _, out _).Should().BeFalse();
+        index.TryGetUniqueHash(100, out var loc, out var len).Should().BeTrue();
         loc.Should().Be(new Locator(5, 50));
         len.Should().Be(9);
-        index.TryGetFirst(300, out _, out _).Should().BeTrue();
-    }
-
-    [Fact]
-    public void ApplyDeltasWithTombstones()
-    {
-        var index = new HashIndex();
-        index.Apply(new IndexEntry { KeyHash = 1, PackedLocator = new Locator(1, 1).Packed, Length = 1, Flags = 0 });
-        index.Apply(new IndexEntry { KeyHash = 2, PackedLocator = new Locator(1, 2).Packed, Length = 2, Flags = 0 });
-        index.Count.Should().Be(2);
-
-        // Tombstone removes by hash regardless of locator.
-        index.Apply(new IndexEntry { KeyHash = 1, PackedLocator = new Locator(999, 999).Packed, Length = 0, Flags = (byte)RecordFlags.Tombstone });
-        index.Count.Should().Be(1);
-        index.TryGetFirst(1, out _, out _).Should().BeFalse();
-
-        // Re-add then last-writer-wins update.
-        index.Apply(new IndexEntry { KeyHash = 1, PackedLocator = new Locator(3, 3).Packed, Length = 3, Flags = 0 });
-        index.Apply(new IndexEntry { KeyHash = 1, PackedLocator = new Locator(4, 4).Packed, Length = 4, Flags = 0 });
-        index.TryGetFirst(1, out var loc, out var len).Should().BeTrue();
-        loc.Should().Be(new Locator(4, 4));
-        len.Should().Be(4);
+        index.TryGetUniqueHash(300, out _, out _).Should().BeTrue();
     }
 
     [Fact]
@@ -285,7 +264,7 @@ public class HashIndexTests
         var index = new HashIndex(64);
         const int keySpace = 4000;
         for (var k = 1; k <= keySpace; k++) // pre-populate so readers have hits from the start
-            index.Set((ulong)k, Loc((ulong)k), Len((ulong)k));
+            index.UpsertUniqueHash((ulong)k, Loc((ulong)k), Len((ulong)k));
 
         using var stop = new CancellationTokenSource();
         var errors = new ConcurrentQueue<string>();
@@ -296,7 +275,7 @@ public class HashIndexTests
             while (!stop.IsCancellationRequested) {
                 var k = (ulong)rnd.Next(1, keySpace + 1);
                 if (rnd.Next(2) == 0)
-                    index.Set(k, Loc(k), Len(k));
+                    index.UpsertUniqueHash(k, Loc(k), Len(k));
                 else
                     index.Remove(k, Loc(k));
                 Interlocked.Increment(ref writerOps);

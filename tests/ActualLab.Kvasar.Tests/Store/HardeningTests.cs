@@ -1,5 +1,6 @@
 using System.Text;
 using ActualLab.Kvasar.Internal;
+using ActualLab.Kvasar.Tests.Index;
 
 namespace ActualLab.Kvasar.Tests.Store;
 
@@ -71,7 +72,7 @@ public class HardeningTests : IDisposable
         // probe run early and orphans every later key in that chain. The old guard was a Debug.Assert,
         // which is stripped in Release.
         var index = new HashIndex();
-        var act = () => index.Set(0x1234_5678_9ABC_DEF0, Locator.None, 42);
+        var act = () => index.Add(0x1234_5678_9ABC_DEF0, 1, Locator.None, 42);
         act.Should().Throw<ArgumentOutOfRangeException>();
     }
 
@@ -91,9 +92,9 @@ public class HardeningTests : IDisposable
         var index = new HashIndex();
         index.BulkLoad(entries);
 
-        index.TryGetFirst(hashA, out var locA, out _).Should().BeTrue();
+        index.TryGetUniqueHash(hashA, out var locA, out _).Should().BeTrue();
         locA.Should().Be(new Locator(1, 100));
-        index.TryGetFirst(hashB, out var locB, out _).Should().BeTrue();
+        index.TryGetUniqueHash(hashB, out var locB, out _).Should().BeTrue();
         locB.Should().Be(new Locator(1, 200));
         index.Count.Should().Be(2);
     }
@@ -148,7 +149,13 @@ public class HardeningTests : IDisposable
         };
 
     private static IndexEntry NewEntry(ulong keyHash, uint segmentId, uint offset, uint length)
-        => new() { KeyHash = keyHash, PackedLocator = new Locator(segmentId, offset).Packed, Length = length, Flags = 0 };
+        => new() {
+            KeyHash = keyHash,
+            PackedLocator = new Locator(segmentId, offset).Packed,
+            KeyId = keyHash,
+            Length = length,
+            Flags = 0,
+        };
 
     private static KvasarKey Key(string s) => Encoding.UTF8.GetBytes(s);
     private static KvasarValue Val(string s) => Encoding.UTF8.GetBytes(s);
