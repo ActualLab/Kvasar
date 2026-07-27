@@ -620,16 +620,27 @@ public sealed class KvasarStore : IAsyncDisposable
     private ValueTask AuthenticateCommitWindow(
         SuperblockState state, SuperblockState? previousState, CancellationToken cancellationToken)
     {
-        var fromOffset = 0L;
-        if (previousState is { } previous
-            && previous.DataSlot == state.DataSlot
-            && previous.DataCommitLength >= KvasarConstants.SegmentHeaderSize
-            && previous.DataCommitLength <= state.DataCommitLength) {
-            var onDiskPageSize = _pageSize + _cipherFactory.Overhead;
-            var previousBodyLength = previous.DataCommitLength - KvasarConstants.SegmentHeaderSize;
-            if (previousBodyLength % onDiskPageSize == 0)
-                fromOffset = previousBodyLength / onDiskPageSize * _pageSize;
-        }
+        // Only the pages this generation *adds* may be authenticated. Everything below the previous
+        // committed extent was already adopted by an earlier open, and §5.2.1 deliberately leaves
+        // unauthenticatable pages down there: a torn tail burns its page id, and the commit that follows
+        // stamps an extent covering it forever. Authenticating from 0 therefore fails permanently once
+        // any tail has been torn — and because a rejected candidate falls through to the older one and
+        // then to WipeFiles, that turns a single burned page into total loss on exactly the crash path
+        // §5.2 step 3 exists to survive. Below the previous extent a failing page is a read-time miss
+        // (§5.3), never grounds to reject the slot. With no comparable predecessor there is no window to
+        // check, so this generation is adopted on the strength of the superblock's own authentication.
+        if (previousState is not { } previous
+            || previous.DataSlot != state.DataSlot
+            || previous.DataCommitLength < KvasarConstants.SegmentHeaderSize
+            || previous.DataCommitLength > state.DataCommitLength)
+            return default;
+
+        var onDiskPageSize = _pageSize + _cipherFactory.Overhead;
+        var previousBodyLength = previous.DataCommitLength - KvasarConstants.SegmentHeaderSize;
+        if (previousBodyLength % onDiskPageSize != 0)
+            return default;
+
+        var fromOffset = previousBodyLength / onDiskPageSize * _pageSize;
         return _data.Authenticate(
             state.DataSlot, fromOffset, _data.ActiveCommittedOffset, cancellationToken);
     }

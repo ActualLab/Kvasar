@@ -303,8 +303,9 @@ public sealed class PagedFile : IAsyncDisposable
     public long MarkCommitted()
     {
         // The extent is a high-water mark, so page ids burned by a torn tail fall inside it — the store
-        // accounts that gap as dead. Staged pages may not, hence the guard: a committed extent must
-        // never name bytes the storage file has not seen.
+        // accounts that gap as dead, and that is what stops the id (and its nonce) from being re-issued.
+        // Staged pages may not, hence the guard: a committed extent must never name bytes the storage
+        // file has not seen. A burned *partial* page is the one exception, and Open tolerates it.
         if (_pendingCount != 0)
             throw new InvalidOperationException("Flush the staged pages before committing.");
 
@@ -356,9 +357,15 @@ public sealed class PagedFile : IAsyncDisposable
         // The nonce is a pure function of (fileSalt, pageId), so re-issuing that id would reuse it.
         var pageCount = (bodyLength + onDiskPageSize - 1) / onDiskPageSize;
         var wholePagesLength = KvasarConstants.SegmentHeaderSize + bodyLength / onDiskPageSize * onDiskPageSize;
+        // The extent may name one page more than the file physically holds: MarkCommitted publishes the
+        // rounded-up PageCount so a torn tail's page id stays burned, and until an append covers that page
+        // the file is short by its remainder. Bounding by wholePagesLength instead would reject a
+        // generation the store itself wrote and, once a second commit put the same extent in the other
+        // slot, leave nothing adoptable. The burned page still reads as a miss — it cannot authenticate.
+        var burnedPagesLength = KvasarConstants.SegmentHeaderSize + (pageCount * onDiskPageSize);
         if (commitLength < 0)
             commitLength = wholePagesLength;
-        else if (commitLength < KvasarConstants.SegmentHeaderSize || commitLength > wholePagesLength)
+        else if (commitLength < KvasarConstants.SegmentHeaderSize || commitLength > burnedPagesLength)
             throw new KvasarCorruptException("Committed extent is outside the data file.");
         else if ((commitLength - KvasarConstants.SegmentHeaderSize) % onDiskPageSize != 0)
             throw new KvasarCorruptException("Committed extent is not page-aligned.");

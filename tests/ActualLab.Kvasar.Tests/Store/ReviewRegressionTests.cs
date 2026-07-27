@@ -796,6 +796,92 @@ public sealed class ReviewRegressionTests : IDisposable
             (await reopened.Get(K(i))).Should().NotBeNull($"key {i} must survive an unusable accounting pair");
     }
 
+    [Fact]
+    public async Task TwoRecoveryCyclesWithATornTailDoNotWipeTheStore()
+    {
+        // C1: a torn tail burns its page id and the commit that follows stamps an extent covering it
+        // (§5.2.1), so that page can never authenticate again. Adoption used to authenticate a candidate's
+        // whole extent whenever there was no comparable predecessor — which is exactly the fallback the
+        // Buffered default relies on — so the second unclean open rejected both generations and wiped.
+        const int total = 60;
+        var options = Options();
+        await using (var store = await KvasarStore.Open(options)) {
+            for (var i = 0; i < total; i++)
+                await store.Set(K(i), V(i, 200));
+            await store.Flush();
+        }
+
+        // First unclean cycle: tear the tail, reopen (recovery commits an extent over the burned page),
+        // write a little more, close.
+        AppendBytes(DataPath((await ReadSuperblock()).DataSlot), NewBytes(137, 11));
+        await using (var store = await KvasarStore.Open(options)) {
+            for (var i = total; i < total + 10; i++)
+                await store.Set(K(i), V(i, 200));
+            await store.Flush();
+        }
+
+        // Now the canonical Buffered crash §5.2 step 3 exists for: the newest commit's bytes never
+        // reached the device, so that generation is rejected and adoption falls back to the older one --
+        // the path that has no predecessor to bound the window against.
+        SuperblockState newest, older;
+        await using (var file = await FileStorageBackend.Instance.Open(KvsPath)) {
+            var read = await new Superblock(_key, FormatVer).Read(file);
+            read.States.Length.Should().Be(2, "the fallback needs a second adoptable generation");
+            (newest, older) = (read.States[0], read.States[1]);
+        }
+        newest.DataSlot.Should().Be(older.DataSlot);
+        var activePath = DataPath(newest.DataSlot);
+        // Exactly the older generation's extent: the newest is unadoptable, the older is intact.
+        using (var f = new FileStream(activePath, FileMode.Open, FileAccess.Write))
+            f.SetLength(older.DataCommitLength);
+
+        await using var reopened = await KvasarStore.Open(options);
+        var survivors = 0;
+        for (var i = 0; i < total; i++)
+            if (await reopened.Get(K(i)) is not null)
+                survivors++;
+        survivors.Should().BeGreaterThan(total / 2,
+            "falling back to the older generation must not wipe a store whose torn tail burned a page");
+    }
+
+    [Fact]
+    public async Task ATornTailFollowedByTwoCommitsDoesNotWipeTheStore()
+    {
+        // X1 probe: PagedFile.Length rounds PageCount *up*, so after a torn tail MarkCommitted publishes
+        // an extent past the physical end. Recovery force-commits whenever BurnedBytes > 0, and the R4
+        // safety loop can land a second such commit in the other slot before any page extends the file.
+        const int total = 120;
+        var options = Options();
+        await using (var store = await KvasarStore.Open(options)) {
+            for (var i = 0; i < total; i++)
+                await store.Set(K(i), V(i, 200));
+            await store.Flush();
+        }
+
+        var state = await ReadSuperblock();
+        var activePath = DataPath(state.DataSlot);
+        AppendBytes(activePath, NewBytes(137, 3)); // a partial trailing page
+
+        await using (var store = await KvasarStore.Open(options)) {
+            await store.Flush();
+            await store.Flush();
+        }
+
+        // The extent legitimately covers the burned partial page (§5.2.1 keeps its id from being
+        // re-issued), so it can exceed the physical length by up to one page — Open tolerates exactly
+        // that. What must never happen is the store becoming unadoptable because of it.
+        var after = await ReadSuperblock();
+        var physical = new FileInfo(DataPath(after.DataSlot)).Length;
+        after.DataCommitLength.Should().BeLessThanOrEqualTo(physical + PageSize + KvasarConstants.GcmTagSize);
+
+        await using var reopened = await KvasarStore.Open(options);
+        var survivors = 0;
+        for (var i = 0; i < total; i++)
+            if (await reopened.Get(K(i)) is not null)
+                survivors++;
+        survivors.Should().Be(total, "a torn tail must never cost the whole store");
+    }
+
     // Private methods
 
     private string BasePath => Path.Combine(_dir, "store");
