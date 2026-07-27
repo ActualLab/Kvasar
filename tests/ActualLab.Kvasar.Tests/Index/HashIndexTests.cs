@@ -73,6 +73,25 @@ public class HashIndexTests
     }
 
     [Fact]
+    public void SameHashEntriesReplaceAndRemoveByExactLocator()
+    {
+        var index = new HashIndex(16);
+        var first = new Locator(1, 100);
+        var second = new Locator(1, 200);
+        var replacement = new Locator(1, 300);
+
+        index.Set(42, first, 10, Locator.None).Should().BeTrue();
+        index.Set(42, second, 20, Locator.None).Should().BeTrue();
+        index.Set(42, replacement, 30, first).Should().BeTrue();
+        index.Remove(42, second).Should().BeTrue();
+
+        index.Count.Should().Be(1);
+        index.TryGetFirst(42, out var loc, out var length).Should().BeTrue();
+        loc.Should().Be(replacement);
+        length.Should().Be(30);
+    }
+
+    [Fact]
     public void ForcedCollisionsProbeWalksAllCandidates()
     {
         // Small table (mask=15). Same home bucket (low 4 bits) AND same fingerprint (top 16 bits),
@@ -186,9 +205,11 @@ public class HashIndexTests
             var h = (ulong)rnd.NextInt64();
             if (h is HashIndex.Empty or HashIndex.Tombstone || !keys.Add(h))
                 continue;
+            var locator = new Locator((uint)((h % 200) + 1), (long)((h % 9000) + 1));
             entries.Add(new IndexEntry {
                 KeyHash = h,
-                PackedLocator = new Locator((uint)((h % 200) + 1), (long)((h % 9000) + 1)).Packed,
+                PackedLocator = locator.Packed,
+                KeyId = locator.Packed,
                 Length = (uint)((h % 777) + 1),
                 Flags = 0,
             });

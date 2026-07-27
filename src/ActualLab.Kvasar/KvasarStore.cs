@@ -383,6 +383,10 @@ public sealed class KvasarStore : IAsyncDisposable
         if (key.Length > KvasarConstants.MaxKeyBytes)
             throw new ArgumentOutOfRangeException(
                 nameof(key), key.Length, $"Key length must not exceed {KvasarConstants.MaxKeyBytes} bytes.");
+        if (cancellationToken.CanBeCanceled) {
+            cancellationToken.ThrowIfCancellationRequested();
+            (key, value) = CopyUpdate(key, value);
+        }
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         await SetLocked(key, value).WaitAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -400,19 +404,27 @@ public sealed class KvasarStore : IAsyncDisposable
                     $"Key length must not exceed {KvasarConstants.MaxKeyBytes} bytes.");
         if (updates.Count == 0)
             return;
-        // Last write wins for duplicate keys: keep only the last occurrence per key hash. Hashing is
-        // keyed SipHash over the whole key, so the results are carried forward rather than recomputed
-        // in the append loop and again in Publish (I32).
+        if (cancellationToken.CanBeCanceled) {
+            cancellationToken.ThrowIfCancellationRequested();
+            var copied = new (KvasarKey Key, KvasarValue? Value)[updates.Count];
+            for (var i = 0; i < copied.Length; i++)
+                copied[i] = CopyUpdate(updates[i].Key, updates[i].Value);
+            updates = copied;
+        }
+        // Last write wins for byte-identical keys. Carry the hashes forward so Publish does not recompute them.
         var hashes = new ulong[updates.Count];
-        var lastByHash = new Dictionary<ulong, int>(updates.Count);
+        var lastByKey = new Dictionary<KvasarKey, int>(updates.Count);
         for (var i = 0; i < updates.Count; i++) {
             var h = _hasher.Hash(updates[i].Key.Span, _hashKey);
             hashes[i] = h;
-            lastByHash[h] = i;
+            lastByKey[updates[i].Key] = i;
         }
+        var isLast = new bool[updates.Count];
+        foreach (var i in lastByKey.Values)
+            isLast[i] = true;
 
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-        await SetManyLocked(updates, hashes, lastByHash).WaitAsync(cancellationToken).ConfigureAwait(false);
+        await SetManyLocked(updates, hashes, isLast).WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async ValueTask Clear(CancellationToken cancellationToken = default)
@@ -448,6 +460,7 @@ public sealed class KvasarStore : IAsyncDisposable
     // Private methods
 
     private readonly record struct AppendResult(Locator Locator, int RecordLength, bool IsTombstone);
+    private readonly record struct IndexedRecord(bool IsFound, Locator Locator, int Length, ulong KeyId);
 
     // --- Private: write-lock bodies ----------------------------------------
     // Each of these is entered with the write lock already held and releases it; they return Task (not
@@ -464,7 +477,7 @@ public sealed class KvasarStore : IAsyncDisposable
         try {
             ObjectDisposedException.ThrowIf(_isDisposed, this);
             var appended = await AppendOne(key, value).ConfigureAwait(false);
-            await Publish(_hasher.Hash(key.Span, _hashKey), appended).ConfigureAwait(false);
+            await Publish(key, _hasher.Hash(key.Span, _hashKey), appended).ConfigureAwait(false);
             await OnWritesPublished(appended.RecordLength).ConfigureAwait(false);
         }
         finally {
@@ -475,22 +488,22 @@ public sealed class KvasarStore : IAsyncDisposable
     private async Task SetManyLocked(
         IReadOnlyList<(KvasarKey Key, KvasarValue? Value)> updates,
         ulong[] hashes,
-        Dictionary<ulong, int> lastByHash)
+        bool[] isLast)
     {
         try {
             ObjectDisposedException.ThrowIf(_isDisposed, this);
-            var pending = new List<(ulong Hash, AppendResult Appended)>(lastByHash.Count);
+            var pending = new List<(KvasarKey Key, ulong Hash, AppendResult Appended)>();
             var bytes = 0L;
             for (var i = 0; i < updates.Count; i++) {
                 var (key, value) = updates[i];
-                if (lastByHash[hashes[i]] != i)
+                if (!isLast[i])
                     continue; // superseded within this batch
                 var appended = await AppendOne(key, value).ConfigureAwait(false);
-                pending.Add((hashes[i], appended));
+                pending.Add((key, hashes[i], appended));
                 bytes += appended.RecordLength;
             }
             foreach (var p in pending)
-                await Publish(p.Hash, p.Appended).ConfigureAwait(false);
+                await Publish(p.Key, p.Hash, p.Appended).ConfigureAwait(false);
             await OnWritesPublished(bytes).ConfigureAwait(false);
         }
         finally {
@@ -972,7 +985,8 @@ public sealed class KvasarStore : IAsyncDisposable
             // never a broken record or a dangling locator.
             var entries = _index.Snapshot().ToArray();
             Array.Sort(entries, static (a, b) => a.PackedLocator.CompareTo(b.PackedLocator));
-            var pending = new List<(ulong Hash, Locator OldLoc, Locator NewLoc, int NewLength)>(entries.Length);
+            var pending = new List<(ulong Hash, ulong KeyId, Locator OldLoc, Locator NewLoc, int NewLength)>(
+                entries.Length);
             foreach (var e in entries) {
                 cancellationToken.ThrowIfCancellationRequested();
                 var loc = e.Locator;
@@ -980,14 +994,13 @@ public sealed class KvasarStore : IAsyncDisposable
                 try {
                     read = await _data.TryReadRecord(loc, cancellationToken).ConfigureAwait(false);
                 }
-                catch (Exception ex) when (ex is not OperationCanceledException) {
-                    read = default; // an unauthenticatable page reads as a miss here too (§5.3)
+                catch (KvasarCorruptException) {
+                    read = default;
                 }
                 // Tombstones are simply dropped: compaction is total, so no earlier file survives holding
                 // the record this one deletes, and there is nothing left to resurrect (I4). A record that
-                // cannot be read — or that isn't the one the entry named, which a locator left over from
-                // an earlier switch can be — is dropped with them, rather than carrying a dangling
-                // locator into the checkpoint or copying a foreign record forward under this key's hash.
+                // is corrupt — or isn't the one the entry named, which a locator left over from an earlier
+                // switch can be — is dropped rather than carried into the checkpoint.
                 var view = read.View;
                 if (!read.IsFound || view.IsTombstone
                     || _hasher.Hash(view.Key.Span, _hashKey) != e.KeyHash) {
@@ -997,17 +1010,16 @@ public sealed class KvasarStore : IAsyncDisposable
                 var (newLoc, newLength) = await _data
                     .AppendToTarget(view.Flags, view.ValueKind, view.Key, view.Value, false)
                     .ConfigureAwait(false);
-                pending.Add((e.KeyHash, loc, newLoc, newLength));
+                pending.Add((e.KeyHash, e.KeyId, loc, newLoc, newLength));
             }
             // Seal before repointing, so a published locator always names an immutable page.
             await _data.SealTail().ConfigureAwait(false);
             foreach (var p in pending) {
                 // Compare-and-set: relocate only while the index still points at the record we copied,
                 // otherwise a concurrent write has already superseded it.
-                if (!_index.TryGetFirst(p.Hash, out var current, out _) || current != p.OldLoc)
+                if (!_index.Set(p.Hash, p.NewLoc, p.NewLength, p.OldLoc))
                     continue;
-                _index.Set(p.Hash, p.NewLoc, p.NewLength);
-                await AppendDelta(p.Hash, p.NewLoc, p.NewLength, false).ConfigureAwait(false);
+                await AppendDelta(p.Hash, p.KeyId, p.NewLoc, p.NewLength, false).ConfigureAwait(false);
             }
         }
         catch {
@@ -1028,6 +1040,15 @@ public sealed class KvasarStore : IAsyncDisposable
     }
 
     // --- Private: append / publish -----------------------------------------
+
+    private (KvasarKey Key, KvasarValue? Value) CopyUpdate(KvasarKey key, KvasarValue? value)
+    {
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(key.Length, KvasarConstants.MaxKeyBytes);
+        var copiedKey = new KvasarKey(key.Memory.ToArray());
+        if (value is not { } record || record.Length > _options.MaxValueBytes)
+            return (copiedKey, value);
+        return (copiedKey, new KvasarValue(record.Memory.ToArray(), record.Kind));
+    }
 
     private async ValueTask<AppendResult> AppendOne(KvasarKey key, KvasarValue? value)
     {
@@ -1050,27 +1071,78 @@ public sealed class KvasarStore : IAsyncDisposable
         return new AppendResult(locator, recordLength, isTombstone);
     }
 
-    private async ValueTask Publish(ulong h, AppendResult appended)
+    private async ValueTask<IndexedRecord> FindIndexed(KvasarKey key, ulong keyHash, Locator newLoc)
     {
-        var (loc, recordLength, isTombstone) = appended;
-        var hasOld = _index.TryGetFirst(h, out var oldLoc, out var oldLen);
-        if (isTombstone) {
-            if (hasOld) {
-                _index.Remove(h, oldLoc);
-                _data.OnSuperseded(oldLoc, oldLen);
+        var isKeyIdUsed = false;
+        var cursor = _index.Probe(keyHash);
+        while (cursor.MoveNext(out var loc, out var length)) {
+            if (cursor.CurrentHash != keyHash)
+                continue;
+            if (cursor.CurrentKeyId == newLoc.Packed)
+                isKeyIdUsed = true;
+            try {
+                RecordView view;
+                if (!_data.TryReadRecordCached(loc, out view)) {
+                    var read = await _data.TryReadRecord(loc, CancellationToken.None).ConfigureAwait(false);
+                    if (!read.IsFound)
+                        continue;
+                    view = read.View;
+                }
+                if (!view.IsTombstone && view.Key.Span.SequenceEqual(key.Span))
+                    return new IndexedRecord(true, loc, length, cursor.CurrentKeyId);
             }
-            _data.OnSuperseded(loc, recordLength); // the tombstone itself is reclaimable space
-            await AppendDelta(h, loc, recordLength, true).ConfigureAwait(false);
+            catch (KvasarCorruptException) {
+                continue;
+            }
         }
-        else {
-            if (hasOld)
-                _data.OnSuperseded(oldLoc, oldLen);
-            _index.Set(h, loc, recordLength);
-            await AppendDelta(h, loc, recordLength, false).ConfigureAwait(false);
+        var keyId = isKeyIdUsed ? MintKeyId(keyHash, newLoc) : newLoc.Packed;
+        return new IndexedRecord(false, default, 0, keyId);
+    }
+
+    private ulong MintKeyId(ulong keyHash, Locator loc)
+    {
+        var keyId = loc.Packed;
+        while (true) {
+            var isUsed = false;
+            var cursor = _index.Probe(keyHash);
+            while (cursor.MoveNext(out _, out _)) {
+                if (cursor.CurrentHash == keyHash && cursor.CurrentKeyId == keyId) {
+                    isUsed = true;
+                    break;
+                }
+            }
+            if (!isUsed)
+                return keyId;
+            keyId = keyId == ulong.MaxValue ? 1 : keyId + 1;
         }
     }
 
-    private async ValueTask AppendDelta(ulong keyHash, Locator loc, int length, bool isTombstone)
+    private async ValueTask Publish(KvasarKey key, ulong h, AppendResult appended)
+    {
+        var (loc, recordLength, isTombstone) = appended;
+        var old = await FindIndexed(key, h, loc).ConfigureAwait(false);
+        if (isTombstone) {
+            if (old.IsFound) {
+                _index.Remove(h, old.Locator);
+                _data.OnSuperseded(old.Locator, old.Length);
+            }
+            _data.OnSuperseded(loc, recordLength); // the tombstone itself is reclaimable space
+            await AppendDelta(h, old.KeyId, loc, recordLength, true).ConfigureAwait(false);
+        }
+        else {
+            if (old.IsFound) {
+                _data.OnSuperseded(old.Locator, old.Length);
+                if (!_index.Set(h, loc, recordLength, old.Locator))
+                    throw new InvalidOperationException("The index entry changed while the write lock was held.");
+            }
+            if (!old.IsFound)
+                _index.Add(h, old.KeyId, loc, recordLength);
+            await AppendDelta(h, old.KeyId, loc, recordLength, false).ConfigureAwait(false);
+        }
+    }
+
+    private async ValueTask AppendDelta(
+        ulong keyHash, ulong keyId, Locator loc, int length, bool isTombstone)
     {
         if (!_mustPersistIndex)
             return;
@@ -1078,6 +1150,7 @@ public sealed class KvasarStore : IAsyncDisposable
         var entry = new IndexEntry {
             KeyHash = keyHash,
             PackedLocator = loc.Packed,
+            KeyId = keyId,
             Length = (uint)length,
             Flags = isTombstone ? (byte)RecordFlags.Tombstone : (byte)0,
         };
@@ -1145,12 +1218,18 @@ public sealed class KvasarStore : IAsyncDisposable
     {
         // The adopted superblock supplies accounting after replay, so recovery does not mutate it here.
         var h = _hasher.Hash(view.Key.Span, _hashKey);
+        var findTask = FindIndexed(new KvasarKey(view.Key), h, loc);
+        var old = findTask.IsCompletedSuccessfully
+            ? findTask.Result
+            : findTask.AsTask().GetAwaiter().GetResult();
         if (view.IsTombstone) {
-            if (_index.TryGetFirst(h, out var oldLoc, out _))
-                _index.Remove(h, oldLoc);
+            if (old.IsFound)
+                _index.Remove(h, old.Locator);
         }
-        else
-            _index.Set(h, loc, recordLength);
+        else if (!old.IsFound)
+            _index.Add(h, old.KeyId, loc, recordLength);
+        else if (!_index.Set(h, loc, recordLength, old.Locator))
+            throw new InvalidOperationException("The loaded index entry changed during recovery.");
     }
 
     private void SeedAccounting(SuperblockState state)

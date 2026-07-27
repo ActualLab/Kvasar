@@ -82,12 +82,6 @@ public class EdgeCaseTests : IDisposable
 
     private static int KeyIndex(ReadOnlySpan<byte> key) => key[0] | (key[1] << 8);
 
-    /// <summary>
-    /// Full-key verification under a total 64-bit hash collision: a colliding probe must NEVER surface
-    /// another key's value (§6.2, §7). The most-recently-written key is always retrievable, and
-    /// overwrite/delete of a key affect only that key — regardless of how the index disambiguates
-    /// (or, per <see cref="HashCollisionFanOut_KnownBug"/>, fails to disambiguate) same-hash keys.
-    /// </summary>
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
@@ -124,32 +118,46 @@ public class EdgeCaseTests : IDisposable
         (await store.Get(last)).Should().BeNull();
     }
 
-    /// <summary>
-    /// KNOWN BUG (found by this suite). Distinct keys that share a full 64-bit hash cannot coexist:
-    /// the in-RAM <see cref="ActualLab.Kvasar.Internal.HashIndex"/> keys its slots by 64-bit hash alone
-    /// (full keys aren't in RAM, §6.1), so Set/Scan/Remove treat any two same-hash keys as the same
-    /// entry and a later Set silently EVICTS the earlier one — silent data loss. On-disk full-key
-    /// verify (§6.2) only prevents returning a <em>wrong</em> value; it does not provide the
-    /// "64-bit-collision fan-out" the spec's testing section (§14) implies. Astronomically rare with
-    /// SipHash-2-4, but reachable with a caller-supplied 64-bit hasher (e.g. the built-in xxHash3).
-    /// Skipped to keep the suite green; unskip once the index disambiguates same-hash distinct keys.
-    /// </summary>
-    [Fact(Skip = "Known bug: distinct keys with an identical 64-bit hash evict each other in HashIndex (silent data loss).")]
+    [Fact]
     public async Task HashCollisionFanOut_KnownBug()
     {
-        await using var store = await KvasarStore.Open(Options() with { Hasher = new LowEntropyHasher() });
-
+        var options = Options() with { Hasher = new LowEntropyHasher() };
         const int n = 64;
         var keys = CollidingKeys(n);
         byte[] Val(int i) => K($"value-{i}");
+        await using (var store = await KvasarStore.Open(options)) {
+            for (var i = 0; i < n; i++)
+                await store.Set(keys[i], Val(i));
 
-        for (var i = 0; i < n; i++)
-            await store.Set(keys[i], Val(i));
+            var batch = new List<(KvasarKey Key, KvasarValue? Value)>();
+            for (var i = 0; i < n; i++)
+                batch.Add((keys[i], Val(i)));
+            batch.Add((keys[0], Val(0)));
+            await store.SetMany(batch);
 
-        // Intended contract: every distinct colliding key resolves to its OWN value, and Scan returns them all.
-        for (var i = 0; i < n; i++)
-            (await store.Get(keys[i]))!.Value.ToArray().Should().Equal(Val(i));
-        (await ScanAll(store)).Should().HaveCount(n);
+            for (var i = 0; i < n; i++)
+                (await store.Get(keys[i]))!.Value.ToArray().Should().Equal(Val(i));
+            await store.Set(keys[17], K("updated"));
+            await store.Set(keys[31], null);
+            await store.Compact();
+
+            (await store.Get(keys[17]))!.Value.ToArray().Should().Equal(K("updated"));
+            (await store.Get(keys[31])).Should().BeNull();
+            (await ScanAll(store)).Should().HaveCount(n - 1);
+            await store.Flush();
+        }
+        await using (var reopened = await KvasarStore.Open(options)) {
+            (await reopened.Get(keys[17]))!.Value.ToArray().Should().Equal(K("updated"));
+            (await reopened.Get(keys[31])).Should().BeNull();
+            (await ScanAll(reopened)).Should().HaveCount(n - 1);
+        }
+        File.Delete(options.BasePath + ".0.kidx");
+        File.Delete(options.BasePath + ".1.kidx");
+        await using (var rebuilt = await KvasarStore.Open(options)) {
+            (await rebuilt.Get(keys[17]))!.Value.ToArray().Should().Equal(K("updated"));
+            (await rebuilt.Get(keys[31])).Should().BeNull();
+            (await ScanAll(rebuilt)).Should().HaveCount(n - 1);
+        }
     }
 
     // --- Empty vs missing ---------------------------------------------------
