@@ -362,9 +362,12 @@ public sealed class KvasarStore : IAsyncDisposable
     {
         ThrowIfDisposed();
         IndexEntry[] entries;
+        var slotCacheIds = new uint[DataLog.SlotCount];
         await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try {
             entries = _index.Snapshot().ToArray();
+            for (var slot = 0; slot < slotCacheIds.Length; slot++)
+                slotCacheIds[slot] = _data.SlotCacheId(slot);
         }
         finally {
             _writeLock.Release();
@@ -382,22 +385,46 @@ public sealed class KvasarStore : IAsyncDisposable
             if (e.IsTombstone)
                 continue;
             var loc = e.Locator;
-            var pageId = loc.Offset / _pageSize;
-            if (loc.FileId != prefetchedFile || pageId >= nextPrefetchPage) {
-                await _data.Prefetch(loc.FileId, pageId, prefetchPages, cancellationToken).ConfigureAwait(false);
-                prefetchedFile = loc.FileId;
-                nextPrefetchPage = pageId + prefetchPages;
-            }
+            var slot = (int)loc.FileId - 1;
+            var slotCacheId = slotCacheIds[slot];
+            var mustResolve = _data.SlotCacheId(slot) != slotCacheId;
             RecordRead read;
-            try {
-                read = await _data.TryReadRecord(e.Locator, cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException) {
-                continue; // an unauthenticatable page or a slot recycled mid-scan ⇒ skip (§5.3)
+            while (true) {
+                read = default;
+                if (mustResolve) {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var slot0CacheId = _data.SlotCacheId(0);
+                    var slot1CacheId = _data.SlotCacheId(1);
+                    if (!TryResolveIndexEntry(e, out loc))
+                        break;
+
+                    slot = (int)loc.FileId - 1;
+                    slotCacheId = slot == 0 ? slot0CacheId : slot1CacheId;
+                }
+
+                var pageId = loc.Offset / _pageSize;
+                if (loc.FileId != prefetchedFile || pageId >= nextPrefetchPage) {
+                    await _data.Prefetch(loc.FileId, pageId, prefetchPages, cancellationToken)
+                        .ConfigureAwait(false);
+                    prefetchedFile = loc.FileId;
+                    nextPrefetchPage = pageId + prefetchPages;
+                }
+                try {
+                    read = await _data.TryReadRecord(loc, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException) {
+                    if (_data.SlotCacheId(slot) == slotCacheId)
+                        break;
+
+                    mustResolve = true;
+                    continue;
+                }
+                if (_data.SlotCacheId(slot) == slotCacheId)
+                    break;
+
+                mustResolve = true;
             }
             if (!read.IsFound || read.View.IsTombstone)
-                continue;
-            if (!IsLiveIndexEntry(e))
                 continue;
             yield return (new KvasarKey(read.View.Key), new KvasarValue(read.View.Value, read.View.ValueKind));
         }
@@ -1464,14 +1491,17 @@ public sealed class KvasarStore : IAsyncDisposable
         }
     }
 
-    private bool IsLiveIndexEntry(IndexEntry entry)
+    private bool TryResolveIndexEntry(IndexEntry entry, out Locator locator)
     {
         var cursor = _index.Probe(entry.KeyHash);
-        while (cursor.MoveNext(out var locator, out _))
+        while (cursor.MoveNext(out var candidate, out _))
             if (cursor.CurrentHash == entry.KeyHash
-                && cursor.CurrentKeyId == entry.KeyId
-                && locator == entry.Locator)
+                && cursor.CurrentKeyId == entry.KeyId) {
+                locator = candidate;
                 return true;
+            }
+
+        locator = default;
         return false;
     }
 

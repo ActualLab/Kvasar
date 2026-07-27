@@ -241,6 +241,10 @@ public sealed class ConcurrencyTests : IDisposable
                         all.Clear();
                         await foreach (var item in store.Scan())
                             all.Add(item);
+                        if (all.Count != KeyCount) {
+                            errors.Enqueue($"Scan yielded {all.Count} of {KeyCount} live keys.");
+                            return;
+                        }
                         foreach (var (_, value) in all) {
                             if (!IsConsistent(value.Span)) {
                                 errors.Enqueue($"Scan yielded inconsistent value: {Hex(value.Span)}");
