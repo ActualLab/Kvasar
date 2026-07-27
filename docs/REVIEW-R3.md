@@ -2,8 +2,8 @@
 
 A second cold-read pass by two independent agents, run **after** the 22 round-2 fixes landed and
 deliberately aimed at *what those fixes introduced or left behind* rather than at the codebase at large.
-**14 distinct findings**; both agents independently hit the same P0 from opposite directions, which is
-what made it worth chasing.
+**13 distinct findings** (Claude 10 + Codex 6, with C1≡X1, C5≡X4 and C10≡X5 overlapping); both agents
+independently hit the same P0 from opposite directions, which is what made it worth chasing.
 
 > **Scope: the code as of `707b88c`** (all of [`REVIEW-R2.md`](REVIEW-R2.md) fixed, suite green at 440).
 > Both agents read the round-2 findings, the full `git diff 72787a9..HEAD -- src/`, and the current
@@ -23,16 +23,33 @@ what made it worth chasing.
 | **C1 / X1** | A burned page makes the store unadoptable → full wipe | **P0** | X | X | **fixed** `099ed50` |
 | **C2** | `ScanFrom` resyncs mid-record, then abandons the replay | P2 | X | | **fixed** `5c33b02` |
 | **C4** | An unreadable record reads as "key absent" | P2 | X | | **fixed** `5c33b02` |
-| **X2** | `Scan` uses the 64-bit hash as an identity check | **P3** | | X | **fixed** + regression test |
+| **X2** | `Scan` uses the 64-bit hash as an identity check | **P3** | | X | **fixed** `567821f` + test |
 | **C3** | Fallback adoption decrypts the whole store at open | P2 | X | | open |
-| **C5 / X4** | Derived keys survive a failed `Open` and the wipe-retry | P3 | X | X | **fixed** |
-| **C6** | A write racing `DisposeAsync` can start a compaction | P3 | X | | **fixed** |
-| **C7** | `IndexLog`'s internal `Read` overload writes, and shadows | P3 | X | | **fixed** |
-| **C8** | `matchKeyId` violates the boolean naming rule | P3 | X | | **fixed** |
-| **C9** | Three `HashIndex` members still implement the pre-R12 collapse | P3 | X | | **fixed** (deleted) |
-| **C10 / X5** | Docs still describe the pre-R12 collision contract | P3 | X | X | **fixed** |
+| **C5 / X4** | Derived keys survive a failed `Open` and the wipe-retry | P3 | X | X | **fixed** `3fb9405` |
+| **C6** | A write racing `DisposeAsync` can start a compaction | P3 | X | | **fixed** `3fb9405` |
+| **C7** | `IndexLog`'s internal `Read` overload writes, and shadows | P3 | X | | **fixed** `3fb9405` |
+| **C8** | `matchKeyId` violates the boolean naming rule | P3 | X | | **fixed** `3fb9405` |
+| **C9** | Three `HashIndex` members still implement the pre-R12 collapse | P3 | X | | **fixed** `3fb9405` (deleted) |
+| **C10 / X5** | Docs still describe the pre-R12 collision contract | P3 | X | X | **fixed** `3fb9405` |
 | **X3** | `Recycle` strands the previous page cipher unzeroized | P3 | | X | open — see below |
-| **X6** | `SetByKeyId` sits below its callees | P3 | | X | **fixed** with C8/C9 |
+| **X6** | `SetByKeyId` sits below its callees | P3 | | X | **fixed** `3fb9405` |
+
+**Status as of 2026-07-27: 11 of 13 fixed.** C3 and X3 are open and described below; both are recorded
+rather than patched because each needs a design decision, not a code change. Suite: 445 passed, 0 skipped,
+0 failed, on net10.0 and net9.0.
+
+### Exploitability
+
+None of these is meaningfully attackable. Kvasar is a single-process, single-device local cache with no
+untrusted input path: whoever can call `Get`/`Scan` already owns the data, and there is no remote surface.
+X2 is the only finding with an attacker-shaped framing, and reaching it deliberately would need a 64-bit
+collision under SipHash-2-4 keyed from the master key — not computable offline, so a blind ~2⁶⁴ birthday
+search against a live store with no oracle telling you when you hit one — *plus* a scan paused mid-flight,
+*plus* two compaction passes recycling that scan's snapshot slot, *plus* the stale locator landing exactly
+on a record start. The payoff is one live key missing from one scan; no fabricated bytes reach the caller.
+The collision requirement does disappear if a caller supplies a non-keyed `IKeyHasher`, but that is a
+caller disarming their own store, and `IndexEncryption.Auto` already degrades index persistence there.
+Treat these as correctness bugs, not as a security surface.
 
 ---
 

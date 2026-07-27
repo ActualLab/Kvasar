@@ -36,33 +36,56 @@ mitigation — a throw from `Get` is indistinguishable from a miss, and a throw 
 
 ## Summary table
 
-| # | Short title | Sev | C | X | Status |
-|---|---|---|:-:|:-:|---|
-| **R1** | `Prefetch` captures the incarnation *after* the read | P0 | X | X | KNOWN symptom (C4) / **NEW root cause** |
-| **R2** | `IndexLog` resumes appending past the committed extent | P0 | X | | **NEW** |
-| **R3** | A torn *inactive* slot header wipes the whole valid store | P0 | | X | **NEW** |
-| **R4** | A failed slot-switch commit leaves the referenced slot recyclable | P0 | | X | **NEW** |
-| **R5** | Adoption never authenticates the newest commit window | P0 | | X | KNOWN (I2 / T5) |
-| **R6** | A cancelled `Set` returns while the store still reads caller buffers | P1 | X | X | **NEW** |
-| **R7** | An older `.kdat` incarnation can be replayed intact | P1 | (x) | X | **NEW** — *disputed*, see note |
-| **R8** | A corrupted-but-parseable `.kidx` is treated as authoritative | P1 | | X | KNOWN (G5 #3 / I12) |
-| **R9** | Reopen counts the drained slot as dead → spurious full compaction | P2 | X | | **NEW** |
-| **R10** | `_generation` advances even when the superblock write fails | P2 | X | | **NEW** |
-| **R11** | Compaction drops index entries on *any* read exception | P2 | X | | **NEW** |
-| **R12** | 64-bit hash collapse across seven index/write sites | P2 | X | X | KNOWN (C1 / I29) |
-| **R13** | Wipe deletes unrelated numeric-suffix files | P2 | | X | KNOWN (G5 #4 / I31) |
-| **R14** | Total compaction holds the write lock for the whole copy | P2 | | X | KNOWN (P4) |
-| **R15** | Public API that silently ignores what it is told | P2 | X | X | partly KNOWN (P5) |
-| **R16** | Plaintext key/value returned to `ArrayPool` uncleared | P3 | X | | **NEW** |
-| **R17** | Derived key material is never zeroized | P3 | X | X | **NEW** |
-| **R18** | `SuperblockState.LiveBytes`/`DeadBytes` written, never read | P3 | X | | **NEW** |
-| **R19** | Reads on a disposed store are inconsistent | P3 | X | | **NEW** |
-| **R20** | `GetMany` hashes and probes every key twice | P3 | X | | **NEW** |
-| **R21** | Unvalidated `KvasarOptions` numerics | P3 | X | | **NEW** |
-| **R22** | Crash-test worker processes can outlive a failed assertion | P3 | | X | KNOWN (T6) |
-| **R23** | Style / hygiene deviations | P3 | X | | **NEW** |
+| # | Short title | Sev | C | X | Status | Resolution |
+|---|---|---|:-:|:-:|---|---|
+| **R1** | `Prefetch` captures the incarnation *after* the read | P0 | X | X | KNOWN symptom (C4) / **NEW root cause** | **fixed** `066d876` |
+| **R2** | `IndexLog` resumes appending past the committed extent | P0 | X | | **NEW** | **fixed** `b688bac` |
+| **R3** | A torn *inactive* slot header wipes the whole valid store | P0 | | X | **NEW** | **fixed** `d98e629` |
+| **R4** | A failed slot-switch commit leaves the referenced slot recyclable | P0 | | X | **NEW** | **fixed** `d98e629` |
+| **R5** | Adoption never authenticates the newest commit window | P0 | | X | KNOWN (I2 / T5) | **fixed** `db44e0a` ᵃ |
+| **R6** | A cancelled `Set` returns while the store still reads caller buffers | P1 | X | X | **NEW** | **fixed** `f79ddd9` |
+| **R7** | An older `.kdat` incarnation can be replayed intact | P1 | (x) | X | **NEW** — *disputed*, see note | **open** — deferred |
+| **R8** | A corrupted-but-parseable `.kidx` is treated as authoritative | P1 | | X | KNOWN (G5 #3 / I12) | **fixed** `db44e0a` |
+| **R9** | Reopen counts the drained slot as dead → spurious full compaction | P2 | X | | **NEW** | **fixed** `b688bac` ᵇ |
+| **R10** | `_generation` advances even when the superblock write fails | P2 | X | | **NEW** | **fixed** `d98e629` |
+| **R11** | Compaction drops index entries on *any* read exception | P2 | X | | **NEW** | **fixed** `f79ddd9` |
+| **R12** | 64-bit hash collapse across seven index/write sites | P2 | X | X | KNOWN (C1 / I29) | **fixed** `f79ddd9` |
+| **R13** | Wipe deletes unrelated numeric-suffix files | P2 | | X | KNOWN (G5 #4 / I31) | **fixed** `c3c2586` |
+| **R14** | Total compaction holds the write lock for the whole copy | P2 | | X | KNOWN (P4) | **fixed** `73528ff` |
+| **R15** | Public API that silently ignores what it is told | P2 | X | X | partly KNOWN (P5) | **fixed** `c3c2586` ᶜ |
+| **R16** | Plaintext key/value returned to `ArrayPool` uncleared | P3 | X | | **NEW** | **fixed** `1280d20` |
+| **R17** | Derived key material is never zeroized | P3 | X | X | **NEW** | **fixed** `1280d20` ᵈ |
+| **R18** | `SuperblockState.LiveBytes`/`DeadBytes` written, never read | P3 | X | | **NEW** | **fixed** `b688bac` ᵇ |
+| **R19** | Reads on a disposed store are inconsistent | P3 | X | | **NEW** | **fixed** `c3c2586` |
+| **R20** | `GetMany` hashes and probes every key twice | P3 | X | | **NEW** | **fixed** `c3c2586` |
+| **R21** | Unvalidated `KvasarOptions` numerics | P3 | X | | **NEW** | **fixed** `c3c2586` |
+| **R22** | Crash-test worker processes can outlive a failed assertion | P3 | | X | KNOWN (T6) | **fixed** `1280d20` |
+| **R23** | Style / hygiene deviations | P3 | X | | **NEW** | **fixed** `1280d20` |
 
 **Both agents**: 5 (R1, R6, R12, R15, R17). **Claude only**: 10. **Codex only**: 8.
+
+**Status as of 2026-07-27: 22 of 23 fixed**; R7 is open by decision, not by omission. Commit hashes above
+are the branch commits; each was merged to `main`. Footnotes:
+
+- ᵃ **R5** is fixed for the window a generation *adds*. The fallback path still authenticates the whole
+  extent when two candidates name different data slots — recorded as **C3** in
+  [`REVIEW-R3.md`](REVIEW-R3.md). Note also that R5's first implementation *caused* the round-3 P0.
+- ᵇ **R9/R18** were fixed, but the implementation initially turned advisory accounting into an integrity
+  gate in three places (`SeedAccounting` threw, `Superblock.Write` threw, `TryParseSlot` returned null).
+  Any of those could reach `WipeFiles` through `TryAdopt`, and the `TryParseSlot` one would have wiped
+  every already-on-disk store that had ever compacted, since `DataLog.DeadBytes` sums both slots. All
+  three were reverted to degrade instead (`6c0a3a6`).
+- ᶜ **R15** changed the benchmark to `KvasarDurability.Flushed`, which is why the numbers in
+  [`BENCHMARKS.md`](BENCHMARKS.md) had to be re-measured rather than compared.
+- ᵈ **R17** is fixed for store-lifetime keys. Two gaps were found afterwards: keys surviving a failed
+  `Open` (**C5**, fixed) and the per-incarnation cipher stranded by `Recycle` (**X3**, still open —
+  disposing it there races the R1 fix).
+
+## Round 3
+
+A second pass over the *fixed* code found 14 more findings, one of them a P0 caused by R5 interacting
+with the never-rewind rule. See [`REVIEW-R3.md`](REVIEW-R3.md); 12 of those 14 are fixed, with C3 and X3
+open.
 
 ---
 
@@ -572,7 +595,11 @@ setting `_slotSwitchGeneration` only at `:777`.
 R2 and R9 additionally carry empirical repros from the reviewing agent. R7 is **disputed between the
 two agents** and needs an author call on threat-model scope. Everything else is reported as stated.
 
-## Suggested fix order
+## Suggested fix order — *executed*
+
+All eight steps below were carried out in this order (R7 excluded by decision); the order held up, in
+that R10 did have to precede R4 and R1 did close `TODO.md` C4. Kept as the record of how it was
+sequenced.
 
 1. **R10** (three-line change) — it is the prerequisite for R4 and closes a wipe path on its own.
 2. **R1** (two-line change) — closes the open P0 `TODO.md` C4 has been chasing.

@@ -21,6 +21,19 @@
 > - **P4** (compaction blocks writers) and **T5** (index-less replay stops at the first unreadable page)
 >   are addressed by R14 and R5 respectively.
 >
+> A round-3 pass over the fixed code then found 13 more issues (see [`REVIEW-R3.md`](REVIEW-R3.md)),
+> including a **P0 introduced by the R5 fix itself** — adoption authenticated a candidate's whole
+> committed extent, which §5.2.1 guarantees contains an unauthenticatable burned page, so any store whose
+> tail had ever been torn was wiped on the fallback path. Fixed. **The only items still open across both
+> rounds are:**
+>
+> - **R7** — whether replaying a prior `.kdat` incarnation is in scope, or is already covered by
+>   `DESIGN.md` known-limitation 3. Deferred by decision, not by omission.
+> - **C3** — fallback adoption still authenticates the whole extent when two superblock candidates name
+>   different data slots, so open is O(store) there rather than O(index). Correct, just slow.
+> - **X3** — `PagedFile.Recycle` strands the previous page cipher without zeroizing it. Disposing it at
+>   that point races the R1 fix, so it needs refcounting or quiescence tracking.
+>
 > Treat the per-item text below as the historical record; where it conflicts with the above, the above
 > is current.
 
