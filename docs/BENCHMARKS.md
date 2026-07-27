@@ -33,6 +33,41 @@ Kvasar uses AES-256-GCM (encrypted, like SQLCipher). Higher is better except ms 
 Re-measured after the v2 storage rewrite (superblock + two-slot data/index files, total compaction).
 The previous numbers, taken against the segment model, are kept in the comparison below.
 
+> **STALE — the tables below predate the round-2 fixes (2026-07-27) and two methodology changes.**
+> They must not be quoted until a full `--engines both` re-measure lands.
+>
+> 1. **Durability.** The harness now runs Kvasar at `KvasarDurability.Flushed` by default, so both sides
+>    are finally durability-matched (this was `TODO.md` P5 — Kvasar used to end a run un-fsynced while
+>    SQLite still ran `wal_checkpoint(TRUNCATE)`). Pass `--durability Buffered` to reproduce the older,
+>    un-matched numbers. In the chat scenario the honest fsync costs ~1.1–1.5 ms of flush time that the
+>    old numbers simply omitted.
+> 2. **Round-2 fixes.** Measured pre-fix vs post-fix on one machine, same session, `Buffered` on both
+>    sides so only the code differs (the tables' absolute values do not reproduce on today's machine —
+>    it runs ~15% slower than when they were recorded, which is why the comparison below is same-session
+>    rather than against the numbers above):
+>
+> | Config | Write k/s | Lookup k/s |
+> |---|---|---|
+> | Kvasar AES-GCM, 128 B | 559 → 532 (−4.8%) | 6,109 → 8,952 (**+46%**) |
+> | Kvasar AES-GCM, 1 KB | 299 → 309 (**+3.3%**) | 301 → 326 (**+8%**) |
+> | Kvasar no-enc, 128 B | 919 → 734 (−20%) | 8,949 → 10,698 (+20%) |
+> | Kvasar no-enc, 1 KB | 621 → 465 (−25%) | 390 → 309 (−21%) |
+>
+> Chat cold start (AES-GCM, `Buffered` both sides): config A 5.1 → 6.2 ms, config B 8.4 → 10.4 ms
+> (+22–24%), almost entirely in **Open** (2.3 → 4.1 ms and 2.9 → 4.0 ms). That is the cost of R5
+> (adoption authenticates the pages the candidate generation adds) and R8 (the `.kidx` MAC is verified
+> at open) — both bought a P0/P1 authentication guarantee, so it is a deliberate trade, not a
+> defect. Kvasar still beats SQLCipher's 50.8 ms by ~8×.
+>
+> The **encrypted** path — the shipping configuration — is neutral to faster on writes and clearly
+> faster on lookups (R20 removed `GetMany`'s double hash-and-probe). The **no-enc** write drop is the
+> new per-delta index MAC (R8) plus 32-byte index entries (R12) becoming visible once AES-GCM no longer
+> dominates the cost; the no-enc lookup figures disagree in sign between the two value sizes, so treat
+> them as single-run noise until re-measured.
+>
+> The 4 KB sweep is disk-bound at 822 MB and varied by 20–60% run to run here (write 108 vs 91 k/s,
+> p99 636 vs 184 µs across two consecutive runs) — it needs a quiesced machine and several runs.
+
 ### Value = 128 B (12.8 MB — fits the page cache, like the ~25 MB hot set)
 | Engine | Write k/s | File MB | Open ms | Startup ms* | Lookup k/s | p50 µs | p99 µs |
 |---|--:|--:|--:|--:|--:|--:|--:|

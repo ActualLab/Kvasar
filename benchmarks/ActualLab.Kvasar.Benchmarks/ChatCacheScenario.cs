@@ -1,3 +1,4 @@
+using ActualLab.Kvasar;
 using System.Diagnostics;
 using System.Text;
 
@@ -33,7 +34,9 @@ public static class ChatCacheScenario
         new(25_000_000, 1000, 1000),
     ];
 
-    public static async Task Run(string root, byte[] encryptionKey, string engines, int pageSize)
+    public static async Task Run(
+        string root, byte[] encryptionKey, string engines, int pageSize,
+        KvasarDurability durability = KvasarDurability.Flushed)
     {
         // 8 app threads + 4 reader workers + 1 writer must all be resident, or thread injection
         // (~1 thread/sec) would land inside the measured burst.
@@ -41,9 +44,9 @@ public static class ChatCacheScenario
         ThreadPool.SetMinThreads(Math.Max(minWorkers, AppThreads + ReaderAndWriterThreads), minIoThreads);
 
         var kvasarAes = (string dir) => (IKvEngine)new KvasarEngine(
-            Path.Combine(dir, "store"), encryptionKey, true, pageSize, PageCacheBytes, FlushDelay);
+            Path.Combine(dir, "store"), encryptionKey, true, pageSize, PageCacheBytes, FlushDelay, durability);
         var kvasarNoEnc = (string dir) => (IKvEngine)new KvasarEngine(
-            Path.Combine(dir, "store"), encryptionKey, false, pageSize, PageCacheBytes, FlushDelay);
+            Path.Combine(dir, "store"), encryptionKey, false, pageSize, PageCacheBytes, FlushDelay, durability);
         var runs = new List<(string Tag, KvasStack Stack, Func<string, IKvEngine> Factory)>();
         if (engines is "sqlite" or "both")
             runs.Add(("sq", KvasStack.BatchingKvas,

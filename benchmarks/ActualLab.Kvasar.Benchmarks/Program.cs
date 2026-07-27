@@ -1,3 +1,4 @@
+using ActualLab.Kvasar;
 using System.Diagnostics;
 using System.Text;
 using ActualLab.Kvasar.Benchmarks;
@@ -11,7 +12,9 @@ int threads = ArgInt("--threads", Math.Min(8, Environment.ProcessorCount));
 int totalLookups = ArgInt("--lookups", 500_000);
 var engines = ArgStr("--engines", "both")!;   // kvasar | sqlite | both
 var scenario = ArgStr("--scenario", "sweep")!; // sweep | chat
-int pageSize = ArgInt("--pagesize", 4096);  // Kvasar page size; larger pages = fewer, bigger async I/Os
+int pageSize = ArgInt("--pagesize", 4096);
+// Buffered matches the pre-R15 numbers in BENCHMARKS.md; Flushed is the durability-matched default.
+var durability = Enum.Parse<KvasarDurability>(ArgStr("--durability", nameof(KvasarDurability.Flushed))!, true);  // Kvasar page size; larger pages = fewer, bigger async I/Os
 const int BatchSize = 64;
 
 SQLitePCL.Batteries_V2.Init();
@@ -30,7 +33,7 @@ Console.WriteLine($"Machine: {Environment.ProcessorCount} logical cores, .NET {E
 if (scenario is "chat") {
     Console.WriteLine("Scenario: ActualChat cold start (each engine in the stack it would ship in)");
     Console.WriteLine();
-    await ChatCacheScenario.Run(root, key, engines, ArgInt("--pagesize", ChatCacheScenario.DefaultPageSize));
+    await ChatCacheScenario.Run(root, key, engines, ArgInt("--pagesize", ChatCacheScenario.DefaultPageSize), durability);
     try { Directory.Delete(root, true); } catch { /* ignore */ }
     return;
 }
@@ -44,8 +47,8 @@ foreach (var size in sizes) {
     var data = GenData(N, size);
     var results = new List<Result>();
     if (engines is "kvasar" or "both") {
-        results.Add(await RunEngine(() => new KvasarEngine(Path.Combine(NewDir("kv"), "store"), key, true, pageSize), data));
-        results.Add(await RunEngine(() => new KvasarEngine(Path.Combine(NewDir("kvne"), "store"), key, false, pageSize), data));
+        results.Add(await RunEngine(() => new KvasarEngine(Path.Combine(NewDir("kv"), "store"), key, true, pageSize, durability: durability), data));
+        results.Add(await RunEngine(() => new KvasarEngine(Path.Combine(NewDir("kvne"), "store"), key, false, pageSize, durability: durability), data));
     }
     if (engines is "sqlite" or "both")
         results.Add(await RunEngine(() => new SqliteEngine(Path.Combine(NewDir("sq"), "cache.db3"), key), data));

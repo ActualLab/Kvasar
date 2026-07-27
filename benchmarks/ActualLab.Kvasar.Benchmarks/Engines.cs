@@ -32,13 +32,16 @@ public sealed class KvasarEngine(
     bool encrypt,
     int pageSize = 4096,
     long pageCacheBytes = 64L * 1024 * 1024,
-    TimeSpan? flushDelay = null
+    TimeSpan? flushDelay = null,
+    KvasarDurability durability = KvasarDurability.Flushed
 ) : IKvEngine
 {
     private KvasarStore _store = null!;
 
     public string Name { get; } =
-        (encrypt ? "Kvasar (AES-GCM)" : "Kvasar (no-enc)") + (pageSize == 4096 ? "" : $" p{pageSize / 1024}K");
+        (encrypt ? "Kvasar (AES-GCM)" : "Kvasar (no-enc)")
+            + (pageSize == 4096 ? "" : $" p{pageSize / 1024}K")
+            + (durability == KvasarDurability.Flushed ? "" : $" {durability}");
 
     public async ValueTask Open()
     {
@@ -48,7 +51,7 @@ public sealed class KvasarEngine(
             DisableEncryption = !encrypt,
             PageSize = pageSize,
             PageCacheBytes = pageCacheBytes,
-            Durability = KvasarDurability.Flushed,
+            Durability = durability,
         };
         if (flushDelay is { } d)
             options = options with { FlushDelay = d };
