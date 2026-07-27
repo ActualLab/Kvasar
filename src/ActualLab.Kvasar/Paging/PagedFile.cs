@@ -191,10 +191,12 @@ public sealed class PagedFile : IAsyncDisposable
     {
         // Best-effort readahead for sequential walks: pulls a run of pages in one I/O instead of faulting
         // them one at a time. Any failure is swallowed — this only warms the cache, so the normal read
-        // path stays the single place that decides what a bad page means.
+        // path stays the single place that decides what a bad page means. The incarnation is captured
+        // before its flushed bound and rechecked after the read, so Recycle discards the whole run.
         if (firstPageId < 0 || maxPages <= 0)
             return;
         try {
+            var inc = _incarnation;
             // Bound by pages whose writes have *completed*. Using _file.Length here read bytes belonging
             // to a write still in flight: with a real cipher that page failed authentication and was
             // swallowed, but under NoopPageCipher it decrypted to garbage and was cached under a valid
@@ -212,9 +214,9 @@ public sealed class PagedFile : IAsyncDisposable
             try {
                 await _file.ReadExact(PagePosition(firstPageId), buffer.AsMemory(0, byteLength), cancellationToken)
                     .ConfigureAwait(false);
-                // One incarnation for the whole run: a Recycle between the read and the decrypt would
-                // otherwise let these bytes be cached under the *new* id.
-                var inc = _incarnation;
+                if (!ReferenceEquals(_incarnation, inc))
+                    return;
+
                 for (var i = 0; i < count; i++) {
                     var pageId = firstPageId + i;
                     if (_cache.TryGet(inc.FileId, pageId, out _))
@@ -304,7 +306,8 @@ public sealed class PagedFile : IAsyncDisposable
     {
         // Resets the file for a new life instead of unlinking it (§3.2/§4). The fresh fileSalt is what
         // makes restarting page ids at 0 safe: it puts this life's nonces in a different space entirely.
-        // Exclusive with every reader and appender — the cipher and the page ids change under them.
+        // The new incarnation is published only after its page bounds are reset, so a lock-free reader
+        // never combines it with the previous life's extent.
         _pendingCount = 0;
         _pendingPlain.Clear();
         _cache.DropSegment(FileId);
@@ -313,13 +316,11 @@ public sealed class PagedFile : IAsyncDisposable
 
         var header = new SegmentHeader(_formatVer, PageSize, fileId);
         await WriteHeader(_file, header).ConfigureAwait(false);
-        // One atomic swap, so a concurrent lock-free reader sees either the whole old incarnation or the
-        // whole new one — never the old cipher paired with the new cache id.
-        _incarnation = new Incarnation(fileId, _cipherFactory.Create(header.FileSalt));
         ResumePageId = 0;
         Volatile.Write(ref _flushedPageCount, 0);
         Volatile.Write(ref _commitLength, KvasarConstants.SegmentHeaderSize);
         Volatile.Write(ref _pageCount, 0);
+        _incarnation = new Incarnation(fileId, _cipherFactory.Create(header.FileSalt));
     }
 
     // Private methods
