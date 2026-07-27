@@ -1,5 +1,3 @@
-using ActualLab.Kvasar;
-
 namespace ActualLab.Kvasar.Internal;
 
 /// <summary>

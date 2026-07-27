@@ -86,7 +86,7 @@ public readonly record struct SuperblockReadResult(SuperblockStatus Status, Supe
 /// (<c>docs/DESIGN-Durability.md</c> §3.1, §5). <see cref="Initialize"/> creates the file; the first
 /// <see cref="Write"/> assumes it already exists.
 /// </summary>
-public sealed class Superblock
+public sealed class Superblock : IDisposable
 {
     public const int HeaderSize = 64;
     public const int SlotSize = 512;
@@ -124,6 +124,9 @@ public sealed class Superblock
             .Derive(masterKey, [], KvasarConstants.SuperblockKeyInfo, _key);
         _formatVer = formatVer;
     }
+
+    public void Dispose()
+        => CryptographicOperations.ZeroMemory(_key);
 
     public ValueTask Initialize(IStorageFile file)
     {
@@ -179,21 +182,6 @@ public sealed class Superblock
     private static long SlotOffset(int slot)
         => HeaderSize + ((long)slot * SlotSize);
 
-    private static async ValueTask<bool> ReadExact(
-        IStorageFile file, long offset, byte[] buffer, CancellationToken cancellationToken)
-    {
-        var total = 0;
-        while (total < buffer.Length) {
-            var read = await file
-                .Read(offset + total, buffer.AsMemory(total), cancellationToken)
-                .ConfigureAwait(false);
-            if (read == 0)
-                return false;
-            total += read;
-        }
-        return true;
-    }
-
     private async ValueTask<SuperblockStatus> ReadHeader(IStorageFile file, CancellationToken cancellationToken)
     {
         if (file.Length == 0)
@@ -202,7 +190,7 @@ public sealed class Superblock
             return SuperblockStatus.FormatMismatch;
 
         var header = new byte[HeaderSize];
-        if (!await ReadExact(file, 0, header, cancellationToken).ConfigureAwait(false))
+        if (!await file.TryReadExact(0, header, cancellationToken).ConfigureAwait(false))
             return SuperblockStatus.FormatMismatch;
 
         var magic = KvasarConstants.KSupMagic;
@@ -242,7 +230,7 @@ public sealed class Superblock
         if (file.Length < offset + SlotSize)
             return null;
 
-        return await ReadExact(file, offset, buffer, cancellationToken).ConfigureAwait(false)
+        return await file.TryReadExact(offset, buffer, cancellationToken).ConfigureAwait(false)
             ? TryParseSlot(buffer, slot)
             : null;
     }

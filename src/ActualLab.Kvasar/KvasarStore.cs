@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using ActualLab.Kvasar.Crypto;
 using ActualLab.Kvasar.Internal;
 using ActualLab.Kvasar.Internal.Storage;
@@ -34,9 +36,7 @@ public sealed class KvasarStore : IAsyncDisposable
 
     private int _pageSize;
     private int _nextCacheId;
-    // volatile: Clear() swaps these while lock-free readers are dereferencing them, so readers must not
-    // cache a stale reference.
-    private volatile PageCache _cache = null!;
+    private PageCache _cache = null!;
     private volatile DataLog _data = null!;
     private volatile HashIndex _index = null!;
     private IStorageFile? _superblockFile;
@@ -134,9 +134,14 @@ public sealed class KvasarStore : IAsyncDisposable
         if (_hashKey.Length != 0)
             kdf.Derive(options.EncryptionKey, [], KvasarConstants.HashKeyInfo, _hashKey);
 
-        _cipherFactory = options.DisableEncryption
-            ? NoopPageCipherFactory.Instance
-            : new AesGcmPageCipherFactory(pageKey, _formatVer);
+        try {
+            _cipherFactory = options.DisableEncryption
+                ? NoopPageCipherFactory.Instance
+                : new AesGcmPageCipherFactory(pageKey, _formatVer);
+        }
+        finally {
+            CryptographicOperations.ZeroMemory(pageKey);
+        }
         _superblock = new Superblock(options.EncryptionKey, _formatVer, kdf);
 
         // The .kidx may live unencrypted only under a keyed-PRF hasher; otherwise we persist only its
@@ -187,6 +192,9 @@ public sealed class KvasarStore : IAsyncDisposable
                 // Must run even if the commit throws (a full disk can fail it): _isDisposed is already
                 // set, so a retry would no-op and the store lock would leak for the rest of the process.
                 await CloseFiles().ConfigureAwait(false);
+                CryptographicOperations.ZeroMemory(_hashKey);
+                (_cipherFactory as IDisposable)?.Dispose();
+                _superblock.Dispose();
                 _lock.Dispose();
             }
         }
@@ -1108,7 +1116,7 @@ public sealed class KvasarStore : IAsyncDisposable
         return hash | 0x8000_0000; // keep it distinct from small numeric versions
 
         void Add(string s) {
-            foreach (var b in System.Text.Encoding.UTF8.GetBytes(s)) {
+            foreach (var b in Encoding.UTF8.GetBytes(s)) {
                 hash ^= b;
                 hash *= 16777619;
             }

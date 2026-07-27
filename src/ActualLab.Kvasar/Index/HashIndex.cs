@@ -1,5 +1,3 @@
-using System.Threading;
-
 namespace ActualLab.Kvasar.Internal;
 
 /// <summary>
@@ -16,6 +14,7 @@ public sealed class HashIndex
     internal const ulong Tombstone = ulong.MaxValue;
 
     private const double MaxLoadFactor = 0.7;
+    private const int MaxCapacity = 1 << 30;
     private const int MinCapacity = 8;
 
     // Single writer owns these; readers never touch them. `_used` counts non-empty slots
@@ -280,8 +279,6 @@ public sealed class HashIndex
 
     // Both loops are capped: `cap <<= 1` overflows 2^30 to int.MinValue and then 0, after which the
     // condition stays true forever — an unkillable spin rather than an exception.
-    private const int MaxCapacity = 1 << 30;
-
     private static int CapacityFor(int liveCount)
     {
         var cap = MinCapacity;

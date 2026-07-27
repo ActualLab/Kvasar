@@ -176,6 +176,15 @@ public class EncryptionTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task DisposeDoesNotClearCallerOwnedEncryptionKey()
+    {
+        var expected = _key.ToArray();
+        var store = await KvasarStore.Open(Options());
+        await store.DisposeAsync();
+        _key.Should().Equal(expected);
+    }
+
     // 5. Two stores with the SAME key but different BasePath are fully independent.
     [Fact]
     public async Task SameKeyDifferentBasePathsDoNotInterfere()

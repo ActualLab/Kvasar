@@ -10,6 +10,8 @@ namespace ActualLab.Kvasar.Internal;
 /// </summary>
 public sealed class PageCache
 {
+    private const int MaxShardCount = 1 << 20;
+
     private readonly Shard[] _shards;
     private readonly int _shardMask;
 
@@ -121,8 +123,6 @@ public sealed class PageCache
     }
 
     private Shard ShardFor(PageKey key) => _shards[key.GetHashCode() & _shardMask];
-
-    private const int MaxShardCount = 1 << 20;
 
     private static int DefaultShardCount() => RoundUpPow2(Math.Min(256, Environment.ProcessorCount * 4));
 

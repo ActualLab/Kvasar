@@ -1,5 +1,3 @@
-using ActualLab.Kvasar;
-
 namespace ActualLab.Kvasar.Internal;
 
 /// <summary>The outcome of a record read: whether it was found, the view, and its on-stream length.</summary>

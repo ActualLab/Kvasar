@@ -147,7 +147,12 @@ public sealed class PagedFile : IAsyncDisposable
             // Ignored: a tail lost here is below no committed extent, so it is exactly the dead space
             // that the never-rewind rule already accounts for.
         }
-        await _file.DisposeAsync().ConfigureAwait(false);
+        try {
+            await _file.DisposeAsync().ConfigureAwait(false);
+        }
+        finally {
+            (_incarnation.Cipher as IDisposable)?.Dispose();
+        }
     }
 
     public bool TryGetCachedPage(long pageId, out ReadOnlyMemory<byte> page)
@@ -315,7 +320,9 @@ public sealed class PagedFile : IAsyncDisposable
         await WriteHeader(_file, header).ConfigureAwait(false);
         // One atomic swap, so a concurrent lock-free reader sees either the whole old incarnation or the
         // whole new one — never the old cipher paired with the new cache id.
+        var oldIncarnation = _incarnation;
         _incarnation = new Incarnation(fileId, _cipherFactory.Create(header.FileSalt));
+        (oldIncarnation.Cipher as IDisposable)?.Dispose();
         ResumePageId = 0;
         Volatile.Write(ref _flushedPageCount, 0);
         Volatile.Write(ref _commitLength, KvasarConstants.SegmentHeaderSize);
