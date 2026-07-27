@@ -210,7 +210,8 @@ public sealed class DataLog : IAsyncDisposable
             return false;
 
         var span = firstPage.Span;
-        if (!TryReadRecordLength(span, offset, len, inPage, out var totalLen))
+        if (inPage >= span.Length
+            || !RecordCodec.TryReadHeader(span[inPage..], len - offset, out var totalLen))
             return false;
         if (inPage + totalLen > span.Length)
             return false;
@@ -290,12 +291,13 @@ public sealed class DataLog : IAsyncDisposable
                 }
                 if (read.IsFound)
                     yield return (new Locator(fileId, p), read.View, read.TotalLength);
+
                 p += recordLength;
                 continue;
             }
 
             try {
-                read = await TryReadAt(st, p, cancellationToken).ConfigureAwait(false);
+                read = await TryReadTiledPageAt(st, p, len, cancellationToken).ConfigureAwait(false);
             }
             catch (KvasarCorruptException) {
                 read = default;
@@ -303,6 +305,7 @@ public sealed class DataLog : IAsyncDisposable
             if (read.IsFound) {
                 mustResynchronize = false;
                 yield return (new Locator(fileId, p), read.View, read.TotalLength);
+
                 p += read.TotalLength;
             }
             else
@@ -525,8 +528,37 @@ public sealed class DataLog : IAsyncDisposable
         PublishTail(st);
     }
 
-    private async ValueTask<RecordRead> TryReadAt(
+    private async ValueTask<RecordRead> TryReadTiledPageAt(
+        SlotState st, long offset, long len, CancellationToken cancellationToken)
+    {
+        var first = await TryReadAt(st, offset, len, cancellationToken).ConfigureAwait(false);
+        if (!first.IsFound)
+            return default;
+
+        var p = offset + first.TotalLength;
+        while (p < len && p % _pageSize != 0) {
+            var tail = st.Tail;
+            var pageId = p / _pageSize;
+            var inPage = (int)(p % _pageSize);
+            var page = await GetLogicalPage(st, tail, pageId, cancellationToken).ConfigureAwait(false);
+            if (page.Span[inPage..].IndexOfAnyExcept((byte)0) < 0)
+                return first;
+
+            var next = await TryReadAt(st, p, len, cancellationToken).ConfigureAwait(false);
+            if (!next.IsFound)
+                return default;
+
+            p += next.TotalLength;
+        }
+        return p <= len ? first : default;
+    }
+
+    private ValueTask<RecordRead> TryReadAt(
         SlotState st, long offset, CancellationToken cancellationToken)
+        => TryReadAt(st, offset, -1, cancellationToken);
+
+    private async ValueTask<RecordRead> TryReadAt(
+        SlotState st, long offset, long maxEndOffset, CancellationToken cancellationToken)
     {
         // Pin the slot's incarnation for the whole read. A multi-page record is assembled from several
         // GetPage calls, and BeginCompaction can recycle this slot between any two of them — which
@@ -537,6 +569,8 @@ public sealed class DataLog : IAsyncDisposable
         var incarnation = st.File.FileId;
         var tail = st.Tail; // one read: everything below must agree on the same tail generation
         var len = LogicalLength(st, tail);
+        if (maxEndOffset >= 0)
+            len = Math.Min(len, maxEndOffset);
         if (offset < 0 || offset >= len)
             return default;
 
@@ -546,7 +580,8 @@ public sealed class DataLog : IAsyncDisposable
         int totalLen;
         {
             var span = firstPage.Span;
-            if (!TryReadRecordLength(span, offset, len, inPage, out totalLen))
+            if (inPage >= span.Length
+                || !RecordCodec.TryReadHeader(span[inPage..], len - offset, out totalLen))
                 return default;
             if (inPage + totalLen <= span.Length) {
                 return RecordCodec.TryDecode(firstPage.Slice(inPage, totalLen), out var view, out _)

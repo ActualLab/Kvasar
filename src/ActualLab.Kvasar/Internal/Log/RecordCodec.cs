@@ -70,6 +70,29 @@ public static class RecordCodec
         return true;
     }
 
+    // Protected/internal methods
+
+    internal static bool TryReadHeader(ReadOnlySpan<byte> src, long availableLength, out int totalLen)
+    {
+        totalLen = 0;
+        if (availableLength <= 0
+            || !Varint.TryRead(src, out var bodyLenU, out var recordLenByteCount))
+            return false;
+        if (bodyLenU < 2
+            || availableLength < recordLenByteCount
+            || bodyLenU > (ulong)(availableLength - recordLenByteCount)
+            || bodyLenU > (ulong)(int.MaxValue - recordLenByteCount)
+            || src.Length < recordLenByteCount + 2)
+            return false;
+
+        var valueKind = (KvasarValueKind)src[recordLenByteCount + 1];
+        if (!Enum.IsDefined(valueKind))
+            return false;
+
+        totalLen = recordLenByteCount + (int)bodyLenU;
+        return true;
+    }
+
     // Private methods
 
     private static void RequireLengths(int keyLen, int valueLen)
@@ -91,23 +114,14 @@ public static class RecordCodec
         isTombstone = false;
         totalLen = 0;
 
-        if (!Varint.TryRead(src, out var bodyLenU, out var recLenBytes))
-            return false;
-        // Bound the varint against the buffer *before* narrowing it: a value >= 2^63 casts to a negative
-        // long and would sail through every check below, ending in a negative-length Slice.
-        if (bodyLenU < 2 || bodyLenU > (ulong)(src.Length - recLenBytes))
+        if (!TryReadHeader(src, src.Length, out totalLen)
+            || !Varint.TryRead(src, out var bodyLenU, out var recLenBytes))
             return false;
         var bodyLen = (int)bodyLenU;
-        var total = recLenBytes + bodyLen;
 
         var body = src.Slice(recLenBytes, bodyLen);
         flags = (RecordFlags)body[0];
-        // An unknown value kind is corruption or a forward format (§4.3) — never serve it as Raw.
-        var kind = (KvasarValueKind)body[1];
-        if (!Enum.IsDefined(kind))
-            return false;
-
-        valueKind = kind;
+        valueKind = (KvasarValueKind)body[1];
         isTombstone = (flags & RecordFlags.Tombstone) != 0;
         if (!Varint.TryRead(body[2..], out var keyLenU, out var keyLenBytes))
             return false;
@@ -120,7 +134,6 @@ public static class RecordCodec
         keyLen = kLen;
         valueOffset = keyOffset + keyLen;
         valueLen = isTombstone ? 0 : bodyLen - headerLen - kLen;
-        totalLen = total;
         return true;
     }
 }

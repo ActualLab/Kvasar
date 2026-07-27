@@ -271,6 +271,51 @@ public sealed class ReviewR2Tests : IDisposable
     }
 
     [Fact]
+    public async Task IndexLessRebuildRejectsRecordShapedBytesAfterADamagedHeaderPage()
+    {
+        const int damagedRecordLength = 4 * PageSize;
+        const string damagedKey = "damaged";
+        const string phantomKey = "never-written";
+        var options = Options(FileStorageBackend.Instance) with {
+            Hasher = KeyHashers.XxHash3,
+        };
+        var damagedValueLength = damagedRecordLength;
+        while (RecordCodec.GetRecordLength(damagedKey.Length, damagedValueLength, false) > damagedRecordLength)
+            damagedValueLength--;
+        RecordCodec.GetRecordLength(damagedKey.Length, damagedValueLength, false).Should().Be(damagedRecordLength);
+
+        var damagedValue = new byte[damagedValueLength];
+        damagedValue.AsSpan().Fill(byte.MaxValue);
+        var phantomValue = Encoding.UTF8.GetBytes("phantom-value");
+        var phantomRecord = new byte[RecordCodec.GetRecordLength(phantomKey.Length, phantomValue.Length, false)];
+        RecordCodec.Encode(
+            phantomRecord, RecordFlags.None, KvasarValueKind.Raw,
+            Encoding.UTF8.GetBytes(phantomKey), phantomValue, false);
+        var damagedHeaderLength = damagedRecordLength - damagedValueLength;
+        phantomRecord.CopyTo(damagedValue, (3 * PageSize) - damagedHeaderLength);
+
+        var expected = Enumerable.Range(0, 10)
+            .ToDictionary(i => $"after-{i:D2}", i => $"value-{i:D2}", StringComparer.Ordinal);
+        expected.Add("before", "value-before");
+        await using (var store = await KvasarStore.Open(options)) {
+            await store.Set("before", "value-before");
+            await store.Set(damagedKey, damagedValue);
+            foreach (var (key, value) in expected.Where(x => x.Key != "before"))
+                await store.Set(key, value);
+            await store.Flush();
+        }
+
+        var state = await ReadSuperblock();
+        CorruptPage($"{options.BasePath}.{state.DataSlot}.kdat", 1);
+
+        await using var reopened = await KvasarStore.Open(options);
+        foreach (var (key, value) in expected)
+            (await reopened.Get(key))!.Value.AsString.Should().Be(value);
+        (await reopened.Get(damagedKey)).Should().BeNull();
+        (await reopened.Get(phantomKey)).Should().BeNull();
+    }
+
+    [Fact]
     public async Task IndexLessRebuildResynchronizesAfterACorruptMultiPageRecord()
     {
         const int damagedRecordLength = 4 * PageSize;
@@ -321,6 +366,51 @@ public sealed class ReviewR2Tests : IDisposable
             scanned.Add(key.AsString, value.AsString);
         scanned.Should().BeEquivalentTo(expected);
         scanned.Should().NotContainKey(phantomKey);
+    }
+
+    [Fact]
+    public async Task IndexLessRebuildPrevalidatesResynchronizationCandidates()
+    {
+        const int damagedValueLength = 16 * 1024 * 1024;
+        const string damagedKey = "damaged";
+        var options = Options(FileStorageBackend.Instance) with {
+            Hasher = KeyHashers.XxHash3,
+            MaxValueBytes = damagedValueLength,
+            PageCacheBytes = PageSize,
+        };
+        var damagedRecordLength = RecordCodec.GetRecordLength(damagedKey.Length, damagedValueLength, false);
+        var damagedHeaderLength = damagedRecordLength - damagedValueLength;
+        var damagedValue = new byte[damagedValueLength];
+        for (var recordOffset = PageSize; recordOffset < damagedRecordLength; recordOffset += PageSize) {
+            var valueOffset = recordOffset - damagedHeaderLength;
+            var bodyLength = damagedRecordLength - recordOffset - Varint.MaxSize;
+            if (valueOffset < 0 || valueOffset + Varint.MaxSize + 2 > damagedValue.Length || bodyLength < 2)
+                continue;
+
+            var lengthByteCount = Varint.Write(damagedValue.AsSpan(valueOffset), (ulong)bodyLength);
+            damagedValue[valueOffset + lengthByteCount] = (byte)RecordFlags.None;
+            damagedValue[valueOffset + lengthByteCount + 1] = byte.MaxValue;
+        }
+
+        await using (var store = await KvasarStore.Open(options)) {
+            await store.Set("before", "value-before");
+            await store.Set(damagedKey, damagedValue);
+            await store.Set("after", "value-after");
+            await store.Flush();
+        }
+
+        var state = await ReadSuperblock();
+        CorruptPage($"{options.BasePath}.{state.DataSlot}.kdat", 1);
+
+        using var cancellationSource = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var startedAt = Stopwatch.GetTimestamp();
+        await using var reopened = await KvasarStore.Open(options, cancellationSource.Token);
+        var elapsed = Stopwatch.GetElapsedTime(startedAt);
+
+        (await reopened.Get("before"))!.Value.AsString.Should().Be("value-before");
+        (await reopened.Get("after"))!.Value.AsString.Should().Be("value-after");
+        (await reopened.Get(damagedKey)).Should().BeNull();
+        elapsed.Should().BeLessThan(TimeSpan.FromSeconds(10));
     }
 
     [Theory]
