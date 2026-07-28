@@ -45,27 +45,36 @@ median was 342.0k Set/s and 7,058.5k Get/s, with 0.9 µs p50 and 3.2 µs p99. Th
 ranged from 6,665.7k to 9,329.0k Get/s, so this confirms the guarded path remains fast but is too noisy
 to assign a precise cost to the added checks.
 
-## Final verification (post round-6)
+## Final verification (post-audit, format 3)
 
-Spot check at `0469e5e`, after six review rounds, data format 2 and the read-lease work. **Single runs on
-a machine that had been running agents all session**, so treat these as a no-material-regression check
-rather than as a replacement for the multi-run tables below — the deltas sit inside the run-to-run spread
-those tables already record.
+Measured 2026-07-27 at `0adf362` on an idle machine (CPU < 8% before each run), AMD Ryzen 9 9950X3D,
+Windows 11 Pro 24H2, .NET 10.0.8. Single runs — treat as a regression check, not a replacement for the
+multi-run tables below.
 
-Durability-matched (Kvasar `Flushed`, SQLite `wal_checkpoint(TRUNCATE)`):
+**These numbers include the durability fix, and it is not free.** `Flushed` previously fsynced the data
+pages but never the commit record naming them, so a power loss could discard 246 KB of fsynced data
+because the 1 KB superblock write was still volatile (measured: 0/60 survivors). `Flushed` now fsyncs the
+commit record too, at **783 µs per commit**.
 
-| Scenario | SQLCipher | Kvasar (AES-GCM) | Speedup |
-|---|--:|--:|--:|
-| Chat cold start, 12 MB | 51.2 ms | **8.1 ms** | 6.3x |
-| Chat cold start, 25 MB | 113.3 ms | **10.7 ms** | 10.6x |
-| Sweep 128 B — writes / lookups | 136.4 k/s / 121 k/s | **501.6 / 7,831** | 3.7x / 65x |
-| Sweep 1 KB — writes / lookups | 52.5 / 105.3 | **269.6 / 336.4** | 5.1x / 3.2x |
-| Sweep 4 KB — writes / lookups | 18.8 / 74.4 | **79.9 / 114.0** | 4.2x / 1.5x |
-| Startup hydration, 1 KB / 4 KB | 762.7 / 2,532.8 ms | **195.1 / 708.7 ms** | 3.9x / 3.6x |
+| Scenario | SQLCipher | Kvasar (AES-GCM) | Speedup | Was, pre-fsync |
+|---|--:|--:|--:|--:|
+| Chat cold start, 12 MB | 51.0 ms | **9.3 ms** | 5.5x | 6.3x |
+| Chat cold start, 25 MB | 114.2 ms | **12.4 ms** | 9.2x | 10.6x |
+| Sweep 128 B — writes | 137.9 k/s | **490.5** | 3.6x | 3.7x |
+| Sweep 128 B — lookups | 116.7 k/s | **8,670.8** | **74x** | 75x |
+| Sweep 1 KB — writes | 40.0 | **141.8** | 3.5x | 5.1x |
+| Sweep 4 KB — writes | 16.7 | **47.3** | 2.8x | 4.2x |
+| Startup hydration, 1 KB / 4 KB | 745.7 / 2,474.0 ms | **269.4 / 689.1 ms** | 2.8x / 3.6x |
 
-Chat cold start was 7.7 / 11.3 ms when the tables below were measured, so the correctness work — page
-framing, incarnation read leases, commit-window authentication — cost nothing measurable at this
-resolution. The 8-byte page frame costs 0.195% of payload at 4 KiB pages and 0.049% at 16 KiB.
+Reads are untouched — 128 B lookups stay at ~74x with p50 0.8 µs. The cost lands on **write throughput at
+larger values**: 1 KB writes 269.6 -> 141.8 k/s and 4 KB 88.2 -> 47.3 k/s, roughly halved, because the
+sweep commits per batch and each commit now pays an extra fsync. The realistic chat workload, which
+debounces writes behind `FlushDelay`, lost only ~13%.
+
+**This is a tunable trade, not a fixed cost.** `--durability Buffered` restores the previous throughput
+and is the library default; `Flushed` now genuinely means "the commit record is on the device". If the
+per-commit fsync proves too expensive for a given workload, the lever is commit frequency
+(`FlushDelay` / `CommitBytes`), not the fsync.
 
 ## Representative results
 
