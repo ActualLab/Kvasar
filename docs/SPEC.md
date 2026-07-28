@@ -566,6 +566,8 @@ before that rebuild and never wipes the format-1 files. Format 1 cannot be selec
 serializer, cache generation) fold into the single on-disk `formatVer` tag stamped into every
 segment header; that plus `pageSize`, any mismatch ⇒ wipe & recreate (safe: cache). This mirrors
 what the SQLite backend did with its `(version)` row, minus the reserved key.
+An effective current tag equal to the corresponding format-1 tag is rejected before opening files;
+the slot layout version is selected independently, so a caller-derived tag can never enable legacy writes.
 This is also the migration story **from SQLite** — first launch finds no `.kvs`, starts empty,
 caches repopulate. `.kidx` has its own **layout version 3**, distinct from data format 2; it is always
 rebuildable and may be discarded across either version boundary.

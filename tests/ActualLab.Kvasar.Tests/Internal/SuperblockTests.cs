@@ -203,18 +203,20 @@ public class SuperblockTests
     }
 
     [Fact]
-    public async Task CorruptKcvIsWrongKey()
+    public async Task CorruptKcvFallsBackToAuthenticatedSlot()
     {
         var superblock = NewSuperblock();
         var file = await NewFile(superblock);
-        await superblock.Write(file, NewState(1));
+        var state = NewState(1);
+        await superblock.Write(file, state);
         var pristine = file.Snapshot();
 
-        // Bytes 8..36 are the KCV nonce and tag; flipping any of them must read as a wrong key.
         for (var i = 8; i < 36; i++) {
             file.Restore(pristine);
             file.FlipByte(i);
-            (await superblock.Read(file)).Status.Should().Be(SuperblockStatus.WrongKey, $"header byte {i}");
+            var result = await superblock.Read(file);
+            result.Status.Should().Be(SuperblockStatus.Ok, $"header byte {i}");
+            result.Newest.Should().Be(state, $"header byte {i}");
         }
     }
 

@@ -18,9 +18,9 @@ public enum SuperblockStatus
     // Not a Kvasar superblock, or a different formatVer: wipe and recreate (this is how a
     // KvasarOptions.Version bump takes effect).
     FormatMismatch,
-    // The file is ours and current, but the master key does not match it: throw, never wipe.
+    // A recognized format, but neither its KCV nor any compatible slot authenticates: throw, never wipe.
     WrongKey,
-    // Right key, but neither slot authenticates: genuine corruption, wipe and rebuild.
+    // The current KCV authenticates, but neither slot does: genuine corruption, wipe and rebuild.
     NoValidSlot,
 }
 
@@ -123,13 +123,19 @@ public sealed class Superblock : IDisposable
     private readonly byte[] _key;
     private readonly uint _formatVer;
     private readonly uint _previousFormatVer;
+    private readonly uint _slotLayoutVersion;
 
     public Superblock(
         ReadOnlySpan<byte> masterKey,
         uint formatVer,
         IKeyDerivation? keyDerivation = null,
-        uint previousFormatVer = KvasarConstants.PreviousDataFormatVersion)
+        uint previousFormatVer = KvasarConstants.PreviousDataFormatVersion,
+        uint slotLayoutVersion = KvasarConstants.DataFormatVersion)
     {
+        if (slotLayoutVersion is not KvasarConstants.PreviousDataFormatVersion
+            and not KvasarConstants.DataFormatVersion)
+            throw new ArgumentOutOfRangeException(nameof(slotLayoutVersion));
+
         _key = new byte[KvasarConstants.SuperblockKeySize];
         try {
             (keyDerivation ?? KeyDerivations.HkdfSha256)
@@ -141,6 +147,7 @@ public sealed class Superblock : IDisposable
         }
         _formatVer = formatVer;
         _previousFormatVer = previousFormatVer;
+        _slotLayoutVersion = slotLayoutVersion;
     }
 
     public void Dispose()
@@ -162,7 +169,7 @@ public sealed class Superblock : IDisposable
 
     public ValueTask<SuperblockReadResult> Read(
         IStorageFile file, CancellationToken cancellationToken = default)
-        => ReadCore(file, null, cancellationToken);
+        => ReadCore(file, cancellationToken);
 
     public ValueTask Write(IStorageFile file, SuperblockState state)
     {
@@ -184,73 +191,82 @@ public sealed class Superblock : IDisposable
         return file.Write(SlotOffset(slot), buffer);
     }
 
-    // Protected/internal methods
-
-    internal ValueTask<SuperblockReadResult> ReadWithPreviousFormatCorroboration(
-        IStorageFile file,
-        Func<uint, CancellationToken, ValueTask<bool>> corroboratePreviousFormat,
-        CancellationToken cancellationToken = default)
-        => ReadCore(file, corroboratePreviousFormat, cancellationToken);
-
     // Private methods
 
-    private static long SlotOffset(int slot)
-        => HeaderSize + ((long)slot * SlotSize);
-
     private async ValueTask<SuperblockReadResult> ReadCore(
-        IStorageFile file,
-        Func<uint, CancellationToken, ValueTask<bool>>? corroboratePreviousFormat,
-        CancellationToken cancellationToken)
+        IStorageFile file, CancellationToken cancellationToken)
     {
-        var status = await ReadHeader(file, corroboratePreviousFormat, cancellationToken).ConfigureAwait(false);
-        if (status != SuperblockStatus.Ok)
+        var (status, header) = await ReadHeader(file, cancellationToken).ConfigureAwait(false);
+        if (header is null)
             return new SuperblockReadResult(status, []);
 
-        var buffer = new byte[SlotSize];
-        var state0 = await ReadSlot(file, 0, buffer, cancellationToken).ConfigureAwait(false);
-        var state1 = await ReadSlot(file, 1, buffer, cancellationToken).ConfigureAwait(false);
-        if (state0 is not { } s0)
-            return state1 is { } only1
-                ? new SuperblockReadResult(SuperblockStatus.Ok, [only1])
-                : new SuperblockReadResult(SuperblockStatus.NoValidSlot, []);
-        if (state1 is not { } s1)
-            return new SuperblockReadResult(SuperblockStatus.Ok, [s0]);
+        var storedFormatVer = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(FormatVerOffset, 4));
+        if (storedFormatVer == _formatVer) {
+            var states = await ReadSlots(
+                    file, _formatVer, _slotLayoutVersion, cancellationToken)
+                .ConfigureAwait(false);
+            if (states.Length != 0)
+                return new SuperblockReadResult(SuperblockStatus.Ok, states);
+            if (IsKcvValid(header, _formatVer))
+                return new SuperblockReadResult(SuperblockStatus.NoValidSlot, []);
+            if (IsKcvValid(header, _previousFormatVer))
+                return new SuperblockReadResult(SuperblockStatus.FormatMismatch, []);
 
+            var legacyStates = await ReadSlots(
+                    file,
+                    _previousFormatVer,
+                    KvasarConstants.PreviousDataFormatVersion,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            return new SuperblockReadResult(
+                legacyStates.Length != 0
+                    ? SuperblockStatus.FormatMismatch
+                    : SuperblockStatus.WrongKey,
+                []);
+        }
+        if (storedFormatVer != _previousFormatVer)
+            return new SuperblockReadResult(SuperblockStatus.FormatMismatch, []);
+        if (IsKcvValid(header, _previousFormatVer))
+            return new SuperblockReadResult(SuperblockStatus.FormatMismatch, []);
+        if (IsKcvValid(header, _formatVer))
+            return new SuperblockReadResult(SuperblockStatus.FormatMismatch, []);
+
+        var previousStates = await ReadSlots(
+                file,
+                _previousFormatVer,
+                KvasarConstants.PreviousDataFormatVersion,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (previousStates.Length != 0)
+            return new SuperblockReadResult(SuperblockStatus.FormatMismatch, []);
+
+        var currentStates = await ReadSlots(
+                file, _formatVer, _slotLayoutVersion, cancellationToken)
+            .ConfigureAwait(false);
         return new SuperblockReadResult(
-            SuperblockStatus.Ok,
-            s0.Generation > s1.Generation ? [s0, s1] : [s1, s0]);
+            currentStates.Length != 0
+                ? SuperblockStatus.FormatMismatch
+                : SuperblockStatus.WrongKey,
+            []);
     }
 
-    private async ValueTask<SuperblockStatus> ReadHeader(
-        IStorageFile file,
-        Func<uint, CancellationToken, ValueTask<bool>>? corroboratePreviousFormat,
-        CancellationToken cancellationToken)
+    private static async ValueTask<(SuperblockStatus Status, byte[]? Header)> ReadHeader(
+        IStorageFile file, CancellationToken cancellationToken)
     {
         if (file.Length == 0)
-            return SuperblockStatus.Missing;
+            return (SuperblockStatus.Missing, null);
         if (file.Length < HeaderSize)
-            return SuperblockStatus.FormatMismatch;
+            return (SuperblockStatus.FormatMismatch, null);
 
         var header = new byte[HeaderSize];
         if (!await file.TryReadExact(0, header, cancellationToken).ConfigureAwait(false))
-            return SuperblockStatus.FormatMismatch;
+            return (SuperblockStatus.FormatMismatch, null);
 
         var magic = KvasarConstants.KSupMagic;
         if (!header.AsSpan(MagicOffset, magic.Length).SequenceEqual(magic))
-            return SuperblockStatus.FormatMismatch;
-        var storedFormatVer = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(FormatVerOffset, 4));
-        if (storedFormatVer != _formatVer) {
-            // Format 1 is rebuild-only, but a wrong key must not let that rebuild wipe the original store.
-            if (storedFormatVer == _previousFormatVer
-                && !IsKcvValid(header, storedFormatVer)
-                && corroboratePreviousFormat is not null
-                && await corroboratePreviousFormat(storedFormatVer, cancellationToken).ConfigureAwait(false))
-                return SuperblockStatus.WrongKey;
+            return (SuperblockStatus.FormatMismatch, null);
 
-            return SuperblockStatus.FormatMismatch;
-        }
-
-        return IsKcvValid(header, _formatVer) ? SuperblockStatus.Ok : SuperblockStatus.WrongKey;
+        return (SuperblockStatus.Ok, header);
     }
 
     private bool IsKcvValid(ReadOnlySpan<byte> header, uint formatVer)
@@ -272,23 +288,39 @@ public sealed class Superblock : IDisposable
         aes.Encrypt(nonce, KcvPlaintext, ciphertext, tag, aad);
     }
 
-    private async ValueTask<SuperblockState?> ReadSlot(
-        IStorageFile file, int slot, byte[] buffer, CancellationToken cancellationToken)
+    private async ValueTask<SuperblockState[]> ReadSlots(
+        IStorageFile file,
+        uint formatVer,
+        uint slotLayoutVersion,
+        CancellationToken cancellationToken)
     {
-        var offset = SlotOffset(slot);
-        if (file.Length < offset + SlotSize)
-            return null;
+        var buffer = new byte[SlotSize];
+        var state0 = await ReadSlot(0).ConfigureAwait(false);
+        var state1 = await ReadSlot(1).ConfigureAwait(false);
+        if (state0 is not { } s0)
+            return state1 is { } only1 ? [only1] : [];
+        if (state1 is not { } s1)
+            return [s0];
 
-        return await file.TryReadExact(offset, buffer, cancellationToken).ConfigureAwait(false)
-            ? TryParseSlot(buffer, slot)
-            : null;
+        return s0.Generation > s1.Generation ? [s0, s1] : [s1, s0];
+
+        async ValueTask<SuperblockState?> ReadSlot(int slot) {
+            var offset = SlotOffset(slot);
+            if (file.Length < offset + SlotSize)
+                return null;
+
+            return await file.TryReadExact(offset, buffer, cancellationToken).ConfigureAwait(false)
+                ? TryParseSlot(buffer, slot, formatVer, slotLayoutVersion)
+                : null;
+        }
     }
 
-    private SuperblockState? TryParseSlot(ReadOnlySpan<byte> slot, int slotIndex)
+    private SuperblockState? TryParseSlot(
+        ReadOnlySpan<byte> slot, int slotIndex, uint formatVer, uint slotLayoutVersion)
     {
         Span<byte> plain = stackalloc byte[PlaintextSize];
         Span<byte> aad = stackalloc byte[AadSize];
-        BinaryPrimitives.WriteUInt32LittleEndian(aad, _formatVer);
+        BinaryPrimitives.WriteUInt32LittleEndian(aad, formatVer);
         try {
             using var aes = new AesGcm(_key, KvasarConstants.GcmTagSize);
             aes.Decrypt(
@@ -326,8 +358,7 @@ public sealed class Superblock : IDisposable
         var dataAuthenticationFloor =
             BinaryPrimitives.ReadInt64LittleEndian(plain.Slice(DataAuthenticationFloorOffset, 8));
         var nextKeyId = BinaryPrimitives.ReadUInt64LittleEndian(plain.Slice(NextKeyIdOffset, 8));
-        // This branch is executable documentation of the format-1 slot layout used by test fixtures.
-        if (_formatVer == _previousFormatVer) {
+        if (slotLayoutVersion == KvasarConstants.PreviousDataFormatVersion) {
             dataAuthenticationFloor = KvasarConstants.SegmentHeaderSize;
             nextKeyId = 1;
         }
@@ -365,8 +396,7 @@ public sealed class Superblock : IDisposable
         BinaryPrimitives.WriteInt64LittleEndian(plain.Slice(IndexCommitLengthOffset, 8), state.IndexCommitLength);
         BinaryPrimitives.WriteInt64LittleEndian(plain.Slice(LiveBytesOffset, 8), state.LiveBytes);
         BinaryPrimitives.WriteInt64LittleEndian(plain.Slice(DeadBytesOffset, 8), state.DeadBytes);
-        // This branch is executable documentation of the format-1 slot layout used by test fixtures.
-        if (_formatVer != _previousFormatVer) {
+        if (_slotLayoutVersion == KvasarConstants.DataFormatVersion) {
             BinaryPrimitives.WriteInt64LittleEndian(
                 plain.Slice(DataAuthenticationFloorOffset, 8), state.DataAuthenticationFloor);
             BinaryPrimitives.WriteUInt64LittleEndian(plain.Slice(NextKeyIdOffset, 8), state.NextKeyId);
@@ -382,4 +412,7 @@ public sealed class Superblock : IDisposable
             slot.Slice(TagOffset, KvasarConstants.GcmTagSize),
             aad);
     }
+
+    private static long SlotOffset(int slot)
+        => HeaderSize + ((long)slot * SlotSize);
 }

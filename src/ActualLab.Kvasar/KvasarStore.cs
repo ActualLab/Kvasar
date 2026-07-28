@@ -115,10 +115,11 @@ public sealed class KvasarStore : IAsyncDisposable
                 nameof(options), options.PageCacheBytes, "PageCacheBytes must be positive.");
         if (options.IndexEncryption == IndexEncryption.On)
             throw new NotSupportedException("Encrypted index persistence is not supported.");
-        if (string.IsNullOrEmpty(options.Version)
-            && uint.TryParse(options.FormatVersion, out var requestedFormat)
-            && requestedFormat == KvasarConstants.PreviousDataFormatVersion)
-            throw new NotSupportedException("Data format version 1 cannot be selected for new writes.");
+        var formatVer = ParseFormatVersion(options.FormatVersion, options.Version);
+        var previousFormatVer = ParsePreviousFormatVersion(options.Version);
+        if (formatVer == previousFormatVer)
+            throw new NotSupportedException(
+                "The effective format tag collides with data format version 1 and cannot be selected for new writes.");
 
         // The lock is taken here and held across wipe-and-recreate. Releasing it around the wipe would let
         // another process open a fresh store that we then delete out from under it — on Unix the unlink
@@ -644,10 +645,7 @@ public sealed class KvasarStore : IAsyncDisposable
     private async ValueTask Initialize(CancellationToken cancellationToken)
     {
         _superblockFile = await _storage.Open(_kvsPath, cancellationToken).ConfigureAwait(false);
-        var read = await _superblock
-            .ReadWithPreviousFormatCorroboration(
-                _superblockFile, HasCorroboratingDataHeader, cancellationToken)
-            .ConfigureAwait(false);
+        var read = await _superblock.Read(_superblockFile, cancellationToken).ConfigureAwait(false);
         if (read.Status == SuperblockStatus.WrongKey)
             throw new KvasarKeyException(
                 $"The store '{_options.BasePath}' was created under a different encryption key.");
@@ -867,34 +865,6 @@ public sealed class KvasarStore : IAsyncDisposable
         var header = new byte[KvasarConstants.SegmentHeaderSize];
         await file.ReadExact(0, header, cancellationToken).ConfigureAwait(false);
         return SegmentHeader.Read(header).PageSize;
-    }
-
-    private async ValueTask<bool> HasCorroboratingDataHeader(
-        uint formatVer, CancellationToken cancellationToken)
-    {
-        var header = new byte[KvasarConstants.SegmentHeaderSize];
-        foreach (var path in _kdatPaths) {
-            if (!_storage.Exists(path))
-                continue;
-
-            var file = await _storage.Open(path, cancellationToken).ConfigureAwait(false);
-            try {
-                if (file.Length < header.Length
-                    || !await file.TryReadExact(0, header, cancellationToken).ConfigureAwait(false))
-                    continue;
-
-                try {
-                    if (SegmentHeader.Read(header).FormatVer == formatVer)
-                        return true;
-                }
-                catch (KvasarCorruptException) {
-                }
-            }
-            finally {
-                await file.DisposeAsync().ConfigureAwait(false);
-            }
-        }
-        return false;
     }
 
     private static async ValueTask DisposeFiles(IStorageFile?[] files)

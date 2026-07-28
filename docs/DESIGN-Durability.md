@@ -249,12 +249,15 @@ authentication fails identically for all of them:
 | Condition | Meaning | Action |
 |---|---|---|
 | file absent or zero-length | new store | create |
-| bad magic, or `formatVer` mismatch | deliberate format/`Version` bump | wipe & recreate |
-| header intact, **KCV fails** | **wrong master key** | **throw — never wipe** |
-| KCV passes, neither slot authenticates | genuine corruption | wipe & rebuild |
+| bad magic, or unrelated `formatVer` mismatch | deliberate format/`Version` bump | wipe & recreate |
+| current-format slot authenticates | key is right; KCV may be damaged | recover from authenticated slots |
+| previous-format KCV or slot authenticates | key is right; old format is rebuild-only | wipe & recreate |
+| current-format KCV authenticates, but neither slot does | genuine corruption | wipe & rebuild |
+| recognized current/previous format, but no KCV or compatible slot authenticates | key cannot be established safely | **throw — never wipe** |
 
-The ordering matters: `formatVer` is checked *before* the KCV, so a deliberate `KvasarOptions.Version`
-bump still wipes rather than being reported as a wrong key.
+The ordering matters: unrelated `formatVer` values are rejected before authentication, so a deliberate
+`KvasarOptions.Version` bump still wipes rather than being reported as a wrong key. For the recognized
+current and previous tags, independently authenticated slots corroborate the key when the KCV is damaged.
 
 Without the KCV, "no valid slot" would collapse wrong-key into corruption, and §5.2's "wipe &
 rebuild" would mean **a wrong key silently destroys an intact store** — worse than the I9 bug this

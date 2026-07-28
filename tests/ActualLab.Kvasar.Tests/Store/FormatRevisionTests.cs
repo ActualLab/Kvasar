@@ -140,6 +140,24 @@ public sealed class FormatRevisionTests : IDisposable
     }
 
     [Fact]
+    public async Task EveryCorruptCurrentKcvByteRecoversFromAuthenticatedSlot()
+    {
+        var options = Options();
+        await using (var store = await KvasarStore.Open(options)) {
+            await store.Set("survivor", "value");
+            await store.Flush();
+        }
+        var pristine = File.ReadAllBytes(SuperblockPath);
+
+        for (var i = 8; i < 36; i++) {
+            File.WriteAllBytes(SuperblockPath, pristine);
+            FlipSuperblockByte(i);
+            await using var reopened = await KvasarStore.Open(options);
+            (await reopened.Get("survivor"))!.Value.AsString.Should().Be("value", $"header byte {i}");
+        }
+    }
+
+    [Fact]
     public async Task PreRevisionStoreIsRejectedAndRebuilt()
     {
         await CreateLegacyStore();
@@ -149,6 +167,25 @@ public sealed class FormatRevisionTests : IDisposable
         (await store.Get("legacy-b")).Should().BeNull();
         store.Stats.Entries.Should().Be(0);
         (await ReadFormatVersion()).Should().Be(KvasarConstants.DataFormatVersion);
+    }
+
+    [Fact]
+    public async Task EveryCorruptPreRevisionKcvByteStillRebuilds()
+    {
+        await CreateLegacyStore();
+        string[] paths = [SuperblockPath, .. DataPaths, .. IndexPaths];
+        var snapshots = paths.ToDictionary(x => x, File.ReadAllBytes);
+
+        for (var i = 8; i < 36; i++) {
+            foreach (var path in paths)
+                File.WriteAllBytes(path, snapshots[path]);
+            FlipSuperblockByte(i);
+
+            await using var store = await KvasarStore.Open(Options());
+            (await store.Get("legacy-a")).Should().BeNull($"header byte {i}");
+            store.Stats.Entries.Should().Be(0, $"header byte {i}");
+            (await ReadFormatVersion()).Should().Be(KvasarConstants.DataFormatVersion, $"header byte {i}");
+        }
     }
 
     [Fact]
@@ -171,6 +208,20 @@ public sealed class FormatRevisionTests : IDisposable
 
         foreach (var path in paths)
             File.ReadAllBytes(path).Should().Equal(snapshots[path]);
+    }
+
+    [Fact]
+    public async Task VersionedFormatOneIsRejectedForNewWrites()
+    {
+        var options = Options() with {
+            FormatVersion = "1",
+            Version = "app-v3",
+        };
+
+        var act = async () => {
+            await using var store = await KvasarStore.Open(options);
+        };
+        await act.Should().ThrowAsync<NotSupportedException>();
     }
 
     [Fact]
@@ -277,7 +328,8 @@ public sealed class FormatRevisionTests : IDisposable
         using var superblock = new Superblock(
             _key,
             formatVer,
-            previousFormatVer: formatVer);
+            previousFormatVer: formatVer,
+            slotLayoutVersion: KvasarConstants.PreviousDataFormatVersion);
         await superblock.Initialize(superblockFile);
         await superblock.Write(superblockFile, new SuperblockState(
             1,
@@ -325,6 +377,15 @@ public sealed class FormatRevisionTests : IDisposable
         stream.ReadByte().Should().Be((int)KvasarConstants.DataFormatVersion);
         stream.Position--;
         stream.WriteByte((byte)KvasarConstants.PreviousDataFormatVersion);
+    }
+
+    private void FlipSuperblockByte(int offset)
+    {
+        using var stream = new FileStream(SuperblockPath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read);
+        stream.Position = offset;
+        var value = stream.ReadByte();
+        stream.Position--;
+        stream.WriteByte((byte)(value ^ 0x80));
     }
 
     private void CorruptPage(int slot, long pageId)
