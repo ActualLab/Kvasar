@@ -42,6 +42,7 @@ public sealed class PagedFile : IAsyncDisposable
     // Identifies this file's current incarnation; also the PageCache key, so it must be unique among the
     // files sharing that cache and must change whenever the file is recycled.
     public uint FileId => _incarnation.FileId;
+    internal ReadOnlyMemory<byte> FileSalt => _incarnation.FileSalt;
     public int PageSize { get; }
     // Pages that physically exist (or are staged); equivalently, the next page id to be issued.
     public long PageCount => Volatile.Read(ref _pageCount);
@@ -137,7 +138,10 @@ public sealed class PagedFile : IAsyncDisposable
         _commitLength = commitLength;
         _pendingCapacity = Math.Max(1, MaxPendingBytes / _onDiskPageSize);
         _pending = new byte[_pendingCapacity * _onDiskPageSize];
-        _incarnation = new Incarnation(cacheId ?? header.SegmentId, cipherFactory.Create(header.FileSalt));
+        _incarnation = new Incarnation(
+            cacheId ?? header.SegmentId,
+            header.FileSalt,
+            cipherFactory.Create(header.FileSalt));
         PageSize = header.PageSize;
         ResumePageId = pageCount;
         // Whole pages only: a torn trailing page is present but not readable as a page.
@@ -348,7 +352,7 @@ public sealed class PagedFile : IAsyncDisposable
         Volatile.Write(ref _flushedPageCount, 0);
         Volatile.Write(ref _commitLength, KvasarConstants.SegmentHeaderSize);
         Volatile.Write(ref _pageCount, 0);
-        _incarnation = new Incarnation(fileId, _cipherFactory.Create(header.FileSalt));
+        _incarnation = new Incarnation(fileId, header.FileSalt, _cipherFactory.Create(header.FileSalt));
     }
 
     // Private methods
@@ -447,7 +451,7 @@ public sealed class PagedFile : IAsyncDisposable
             => _incarnation?.ReleaseRead();
     }
 
-    internal sealed record Incarnation(uint FileId, IPageCipher Cipher)
+    internal sealed record Incarnation(uint FileId, byte[] FileSalt, IPageCipher Cipher)
     {
         private readonly TaskCompletionSource _whenDrained =
             new(TaskCreationOptions.RunContinuationsAsynchronously);

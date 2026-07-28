@@ -132,7 +132,9 @@ public static class CrashHarness
         var crashPoints = SelectCrashPoints(operationCount, maxPoints);
         foreach (var crashPoint in crashPoints)
             foreach (var (mode, seed) in variants)
-                await RunCase(workload, verify, crashPoint, mode, seed, wasArmed).ConfigureAwait(false);
+                await RunCase(
+                        new FakeStorageBackend(), workload, verify, crashPoint, mode, seed, wasArmed)
+                    .ConfigureAwait(false);
 
         return new CrashHarnessReport(
             crashPoints.Count * variants.Count,
@@ -141,23 +143,49 @@ public static class CrashHarness
             variants.Count);
     }
 
+    public static async Task<int> CountCrashPoints<TNote>(
+        FakeStorageBackend backend,
+        Func<CrashRun<TNote>, Task> workload)
+    {
+        ArgumentNullException.ThrowIfNull(backend);
+        ArgumentNullException.ThrowIfNull(workload);
+
+        var (operationCount, _) = await Probe(workload, backend.Clone()).ConfigureAwait(false);
+        return operationCount;
+    }
+
     public static async Task RunCase<TNote>(
         Func<CrashRun<TNote>, Task> workload,
         Func<CrashOutcome<TNote>, Task> verify,
         int crashPoint,
         CrashMode? mode,
         int seed)
+        => await RunCase(
+                new FakeStorageBackend(), workload, verify, crashPoint, mode, seed)
+            .ConfigureAwait(false);
+
+    public static async Task RunCase<TNote>(
+        FakeStorageBackend backend,
+        Func<CrashRun<TNote>, Task> workload,
+        Func<CrashOutcome<TNote>, Task> verify,
+        int crashPoint,
+        CrashMode? mode,
+        int seed)
     {
+        ArgumentNullException.ThrowIfNull(backend);
         ArgumentNullException.ThrowIfNull(workload);
         ArgumentNullException.ThrowIfNull(verify);
 
-        var (_, wasArmed) = await Probe(workload).ConfigureAwait(false);
-        await RunCase(workload, verify, crashPoint, mode, seed, wasArmed).ConfigureAwait(false);
+        var (_, wasArmed) = await Probe(workload, backend.Clone()).ConfigureAwait(false);
+        await RunCase(
+                backend, workload, verify, crashPoint, mode, seed, wasArmed)
+            .ConfigureAwait(false);
     }
 
     // Private methods
 
     private static async Task RunCase<TNote>(
+        FakeStorageBackend backend,
         Func<CrashRun<TNote>, Task> workload,
         Func<CrashOutcome<TNote>, Task> verify,
         int crashPoint,
@@ -167,7 +195,6 @@ public static class CrashHarness
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(crashPoint, 1);
 
-        var backend = new FakeStorageBackend();
         var controller = new CrashController(backend, crashPoint, mode, seed, mustWaitForArm);
         var run = new CrashRun<TNote>(backend, controller);
         var outcome = new CrashOutcome<TNote>(backend, run.Notes, crashPoint, mode, seed);
@@ -195,8 +222,12 @@ public static class CrashHarness
 
     private static async Task<(int OperationCount, bool WasArmed)> Probe<TNote>(
         Func<CrashRun<TNote>, Task> workload)
+        => await Probe(workload, new FakeStorageBackend()).ConfigureAwait(false);
+
+    private static async Task<(int OperationCount, bool WasArmed)> Probe<TNote>(
+        Func<CrashRun<TNote>, Task> workload,
+        FakeStorageBackend backend)
     {
-        var backend = new FakeStorageBackend();
         var controller = new CrashController(backend, 0, null, 0, false);
         await workload(new CrashRun<TNote>(backend, controller)).ConfigureAwait(false);
         return (controller.Count, controller.WasArmed);

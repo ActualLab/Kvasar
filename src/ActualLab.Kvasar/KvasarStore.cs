@@ -882,9 +882,15 @@ public sealed class KvasarStore : IAsyncDisposable
         var committedOffset = _data.ActiveCommittedOffset;
         var indexLog = _indexLogs[state.IndexSlot];
         var snapshot = await indexLog
-            .Read(state.IndexCommitLength, state.Generation, cancellationToken)
+            .Read(
+                state.IndexCommitLength,
+                state.Generation,
+                _data.ActiveFileSalt,
+                cancellationToken)
             .ConfigureAwait(false);
-        if (snapshot is { } candidate && !TryRestoreNextKeyId(candidate.Entries))
+        if (snapshot is { } candidate
+            && (!IsIndexSnapshotBoundToDataSlot(candidate, state.DataSlot, committedOffset)
+                || !TryRestoreNextKeyId(candidate.Entries)))
             snapshot = null;
 
         // Only an index at the exact committed extent can be adopted without rotation.
@@ -1183,7 +1189,9 @@ public sealed class KvasarStore : IAsyncDisposable
         // Stamping 0 makes recovery replay the whole committed log; damaged pages are skipped by that
         // best-effort rebuild after the candidate generation has been validated independently.
         var stamp = _mustPersistIndex ? dataStamp : 0L;
-        await _indexLogs[slot].WriteCheckpoint(entries, stamp).ConfigureAwait(false);
+        await _indexLogs[slot]
+            .WriteCheckpoint(entries, stamp, _data.ActiveFileSalt)
+            .ConfigureAwait(false);
         _indexSlot = slot;
         _isSlotSwitchPending = true;
         _mustRotateIndex = false;
@@ -1720,6 +1728,16 @@ public sealed class KvasarStore : IAsyncDisposable
             _index.Add(h, MintKeyId(), loc, recordLength);
         else if (!_index.Set(h, loc, recordLength, old.Locator))
             throw new InvalidOperationException("The loaded index entry changed during recovery.");
+    }
+
+    private static bool IsIndexSnapshotBoundToDataSlot(
+        IndexSnapshot snapshot, int dataSlot, long committedOffset)
+    {
+        if (snapshot.DataCommitLength > committedOffset)
+            return false;
+
+        var fileId = (uint)dataSlot + 1;
+        return snapshot.Entries.All(entry => entry.Locator.FileId == fileId);
     }
 
     private bool TryRestoreNextKeyId(ReadOnlySpan<IndexEntry> entries)

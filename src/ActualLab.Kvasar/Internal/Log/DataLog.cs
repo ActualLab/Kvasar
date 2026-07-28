@@ -62,6 +62,7 @@ public sealed class DataLog : IAsyncDisposable
     // Physical extent, the currency of the superblock and of PagedFile.Open — not a logical offset.
     public long ActiveCommitLength => _active.File.CommitLength;
     public long ActiveCommittedOffset => _active.File.CommittedPageCount * _pagePayloadSize;
+    internal ReadOnlyMemory<byte> ActiveFileSalt => _active.File.FileSalt;
     // Where appending resumes: at or above the physical end, so a torn tail's page id is never re-issued.
     public long ActiveResumeOffset => _active.File.ResumePageId * _pagePayloadSize;
     public long ActiveResumeLength => _active.File.ResumeLength;

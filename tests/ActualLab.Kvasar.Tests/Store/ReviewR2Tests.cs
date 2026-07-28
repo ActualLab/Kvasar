@@ -475,7 +475,13 @@ public sealed class ReviewR2Tests : IDisposable
             await FileStorageBackend.Instance.Open($"{basePath}.{state.IndexSlot}.kidx"),
             KvasarConstants.DataFormatVersion,
             authenticationKey);
-        return (await log.Read(state.IndexCommitLength, state.Generation))!.Value;
+        await using var dataFile = await FileStorageBackend.Instance.Open(
+            $"{basePath}.{state.DataSlot}.kdat");
+        var headerBytes = new byte[KvasarConstants.SegmentHeaderSize];
+        await dataFile.ReadExact(0, headerBytes);
+        var dataHeader = SegmentHeader.Read(headerBytes);
+        return (await log.Read(
+            state.IndexCommitLength, state.Generation, dataHeader.FileSalt))!.Value;
     }
 
     private static string[] DataPaths(string basePath)

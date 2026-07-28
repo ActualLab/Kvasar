@@ -447,8 +447,8 @@ IndexEntry (fixed 32 B, [StructLayout(Sequential, Pack=8, Size=32)]):
 ```
 The `.kidx` v3 header records `magic/formatVer`, entry-layout version, the **data high-water-mark
 (HWM)** the file is consistent up to, and two generation-parity HMAC-SHA256/128 tags. Each tag commits
-the stable header fields plus the checkpoint region and the committed delta range named by its
-superblock generation.
+the active `.kdat` incarnation's `fileSalt`, the stable header fields, the checkpoint region, and the
+committed delta range named by its superblock generation.
 
 **Startup read:**
 1. Validate `.kidx` header and authenticate the superblock-named prefix. An old layout or MAC failure

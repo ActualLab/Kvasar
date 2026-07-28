@@ -352,7 +352,12 @@ public sealed class FormatRevisionTests : IDisposable
             await FileStorageBackend.Instance.Open(IndexPaths[state.IndexSlot]),
             KvasarConstants.DataFormatVersion,
             indexKey);
-        var snapshot = await index.Read(state.IndexCommitLength, state.Generation);
+        await using var dataFile = await FileStorageBackend.Instance.Open(DataPaths[state.DataSlot]);
+        var headerBytes = new byte[KvasarConstants.SegmentHeaderSize];
+        await dataFile.ReadExact(0, headerBytes);
+        var dataHeader = SegmentHeader.Read(headerBytes);
+        var snapshot = await index.Read(
+            state.IndexCommitLength, state.Generation, dataHeader.FileSalt);
         return snapshot!.Value.Entries.Where(x => !x.IsTombstone).ToArray();
     }
 

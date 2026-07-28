@@ -54,6 +54,7 @@ public sealed class IndexLog : IAsyncDisposable
     private readonly byte[] _pending;
     private readonly int _pendingCapacity;
     private IncrementalHash? _mac;
+    private byte[] _authenticationContext = [];
     private int _pendingCount;
     private long _flushedLength;
 
@@ -118,12 +119,13 @@ public sealed class IndexLog : IAsyncDisposable
         finally {
             _mac?.Dispose();
             CryptographicOperations.ZeroMemory(_authenticationKey);
+            CryptographicOperations.ZeroMemory(_authenticationContext);
         }
     }
 
     public ValueTask<IndexSnapshot?> Read(
         ulong generation, CancellationToken cancellationToken = default)
-        => Read(Length, generation, cancellationToken);
+        => Read(Length, generation, _authenticationContext, cancellationToken);
 
     internal async ValueTask<IndexSnapshot?> CommitAndRead(
         long validLength = -1, CancellationToken cancellationToken = default)
@@ -131,11 +133,18 @@ public sealed class IndexLog : IAsyncDisposable
         if (_mac is not null)
             await WriteCommitMac(0).ConfigureAwait(false);
         var end = validLength < 0 ? Length : validLength;
-        return await Read(end, 0, cancellationToken).ConfigureAwait(false);
+        return await Read(end, 0, _authenticationContext, cancellationToken).ConfigureAwait(false);
     }
 
-    public async ValueTask<IndexSnapshot?> Read(
+    public ValueTask<IndexSnapshot?> Read(
         long validLength, ulong generation, CancellationToken cancellationToken = default)
+        => Read(validLength, generation, _authenticationContext, cancellationToken);
+
+    internal async ValueTask<IndexSnapshot?> Read(
+        long validLength,
+        ulong generation,
+        ReadOnlyMemory<byte> authenticationContext,
+        CancellationToken cancellationToken = default)
     {
         // Staged deltas are part of the log's content, so they must be on the file before it is parsed.
         await Flush().ConfigureAwait(false);
@@ -148,9 +157,10 @@ public sealed class IndexLog : IAsyncDisposable
 
         var bytes = new byte[end];
         await _file.ReadExact(0, bytes, cancellationToken).ConfigureAwait(false);
-        var snapshot = Parse(bytes, _formatVer, generation, _authenticationKey);
+        var snapshot = Parse(
+            bytes, _formatVer, generation, _authenticationKey, authenticationContext.Span);
         if (snapshot is not null && end == Length)
-            InitializeMac(bytes);
+            InitializeMac(bytes, authenticationContext.Span);
         return snapshot;
     }
 
@@ -187,7 +197,14 @@ public sealed class IndexLog : IAsyncDisposable
         await _file.Write(offset, hash.AsMemory(0, CommitMacSize)).ConfigureAwait(false);
     }
 
-    public async ValueTask<long> WriteCheckpoint(ReadOnlyMemory<IndexEntry> liveEntries, long dataCommitLength)
+    public ValueTask<long> WriteCheckpoint(
+        ReadOnlyMemory<IndexEntry> liveEntries, long dataCommitLength)
+        => WriteCheckpoint(liveEntries, dataCommitLength, default);
+
+    internal async ValueTask<long> WriteCheckpoint(
+        ReadOnlyMemory<IndexEntry> liveEntries,
+        long dataCommitLength,
+        ReadOnlyMemory<byte> authenticationContext)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(dataCommitLength);
 
@@ -199,18 +216,22 @@ public sealed class IndexLog : IAsyncDisposable
         await _file.Truncate(0).ConfigureAwait(false);
         await _file.Write(0, buffer).ConfigureAwait(false);
         _flushedLength = buffer.Length;
-        InitializeMac(buffer);
+        InitializeMac(buffer, authenticationContext.Span);
         return _flushedLength;
     }
 
     // Private methods
 
     private static IndexSnapshot? Parse(
-        byte[] bytes, uint formatVer, ulong generation, byte[] authenticationKey)
+        byte[] bytes,
+        uint formatVer,
+        ulong generation,
+        byte[] authenticationKey,
+        ReadOnlySpan<byte> authenticationContext)
     {
         if (!TryReadHeader(bytes, formatVer, bytes.Length, out var checkpointCount, out var dataCommitLength))
             return null;
-        if (!IsMacValid(bytes, generation, authenticationKey))
+        if (!IsMacValid(bytes, generation, authenticationKey, authenticationContext))
             return null;
 
         var entrySize = EntrySize;
@@ -236,9 +257,13 @@ public sealed class IndexLog : IAsyncDisposable
     }
 
     private static bool IsMacValid(
-        ReadOnlySpan<byte> bytes, ulong generation, byte[] authenticationKey)
+        ReadOnlySpan<byte> bytes,
+        ulong generation,
+        byte[] authenticationKey,
+        ReadOnlySpan<byte> authenticationContext)
     {
         using var mac = IncrementalHash.CreateHMAC(HashAlgorithmName.SHA256, authenticationKey);
+        mac.AppendData(authenticationContext);
         mac.AppendData(bytes[..CommitMac0Offset]);
         mac.AppendData(bytes[HeaderSize..]);
         var hash = mac.GetCurrentHash();
@@ -282,10 +307,14 @@ public sealed class IndexLog : IAsyncDisposable
         return true;
     }
 
-    private void InitializeMac(ReadOnlySpan<byte> bytes)
+    private void InitializeMac(
+        ReadOnlySpan<byte> bytes, ReadOnlySpan<byte> authenticationContext)
     {
         _mac?.Dispose();
+        CryptographicOperations.ZeroMemory(_authenticationContext);
+        _authenticationContext = authenticationContext.ToArray();
         _mac = IncrementalHash.CreateHMAC(HashAlgorithmName.SHA256, _authenticationKey);
+        _mac.AppendData(authenticationContext);
         _mac.AppendData(bytes[..CommitMac0Offset]);
         _mac.AppendData(bytes[HeaderSize..]);
     }

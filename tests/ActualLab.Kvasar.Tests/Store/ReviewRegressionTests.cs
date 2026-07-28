@@ -187,7 +187,7 @@ public sealed class ReviewRegressionTests : IDisposable
 
         var state = await ReadSuperblock();
         var indexPath = IndexPath(state.IndexSlot);
-        var real = (await ReadIndex(state.IndexSlot, state.IndexCommitLength, state.Generation))!.Value.Entries[0];
+        var real = (await ReadIndex(state))!.Value.Entries[0];
         // A whole entry, so nothing about it is torn: it points at a real record under a hash no key has.
         var fabricated = real;
         fabricated.KeyHash ^= 0xA5A5_A5A5_A5A5_A5A5;
@@ -1095,7 +1095,7 @@ public sealed class ReviewRegressionTests : IDisposable
         }
 
         var state = await ReadSuperblock();
-        var snapshot = await ReadIndex(state.IndexSlot, state.IndexCommitLength, state.Generation);
+        var snapshot = await ReadIndex(state);
         var entries = snapshot!.Value.Entries;
         entries[0].KeyId = ulong.MaxValue;
         var indexKey = new byte[KvasarConstants.IndexMacKeySize];
@@ -1105,7 +1105,9 @@ public sealed class ReviewRegressionTests : IDisposable
             await FileStorageBackend.Instance.Open(IndexPath(state.IndexSlot)),
             FormatVer,
             indexKey)) {
-            indexLength = await index.WriteCheckpoint(entries, snapshot.Value.DataCommitLength);
+            var dataHeader = SegmentHeader.Read(ReadHeader(DataPath(state.DataSlot)));
+            indexLength = await index.WriteCheckpoint(
+                entries, snapshot.Value.DataCommitLength, dataHeader.FileSalt);
             await index.WriteCommitMac(state.Generation + 1);
             await index.WriteCommitMac(state.Generation + 2);
         }
@@ -1165,13 +1167,17 @@ public sealed class ReviewRegressionTests : IDisposable
         return read.Newest!.Value;
     }
 
-    private async Task<IndexSnapshot?> ReadIndex(int slot, long validLength, ulong generation)
+    private async Task<IndexSnapshot?> ReadIndex(SuperblockState state)
     {
         var authenticationKey = new byte[KvasarConstants.IndexMacKeySize];
         KeyDerivations.HkdfSha256.Derive(_key, [], KvasarConstants.IndexMacKeyInfo, authenticationKey);
         await using var log = await IndexLog.Open(
-            await FileStorageBackend.Instance.Open(IndexPath(slot)), FormatVer, authenticationKey);
-        return await log.Read(validLength, generation);
+            await FileStorageBackend.Instance.Open(IndexPath(state.IndexSlot)),
+            FormatVer,
+            authenticationKey);
+        var dataHeader = SegmentHeader.Read(ReadHeader(DataPath(state.DataSlot)));
+        return await log.Read(
+            state.IndexCommitLength, state.Generation, dataHeader.FileSalt);
     }
 
     private static int OnDiskPageSize(bool encrypt)

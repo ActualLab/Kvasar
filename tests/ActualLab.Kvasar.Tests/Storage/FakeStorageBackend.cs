@@ -81,6 +81,18 @@ public sealed class FakeStorageBackend : IStorageBackend
     public void Crash(CrashMode mode, int seed = 0)
         => PowerLoss(mode, seed);
 
+    public FakeStorageBackend Clone()
+    {
+        var clone = new FakeStorageBackend {
+            WriteFailure = WriteFailure,
+            FlushFaultMode = FlushFaultMode,
+        };
+        foreach (var (path, state) in OrderedFiles())
+            lock (state.Lock)
+                clone._files[path] = state.Clone();
+        return clone;
+    }
+
     public byte[] GetDeviceBytes(string path)
     {
         var state = _files[path];
@@ -115,9 +127,13 @@ public sealed class FakeStorageBackend : IStorageBackend
     // Private methods
 
     private FileState[] OrderedStates()
+        => OrderedFiles()
+            .Select(x => x.Value)
+            .ToArray();
+
+    private KeyValuePair<string, FileState>[] OrderedFiles()
         => _files
             .OrderBy(x => x.Key, StringComparer.Ordinal)
-            .Select(x => x.Value)
             .ToArray();
 
     private static void ApplyPowerLoss(Image device, List<Op> pendingOps, CrashMode mode, Random random)
@@ -274,6 +290,17 @@ public sealed class FakeStorageBackend : IStorageBackend
         public Image Device = new([], 0);
         public Image PageCache = new([], 0);
         public int FlushCount;
+
+        public FileState Clone()
+        {
+            var clone = new FileState {
+                Device = Device.Clone(),
+                PageCache = PageCache.Clone(),
+                FlushCount = FlushCount,
+            };
+            clone.PendingOps.AddRange(PendingOps.Select(x => x.Clone()));
+            return clone;
+        }
     }
 
     // Bytes at [Length, capacity) are always zero, which is what makes a sparse write and a re-grown
@@ -325,6 +352,7 @@ public sealed class FakeStorageBackend : IStorageBackend
     private abstract class Op
     {
         public abstract void ApplyTo(Image image);
+        public abstract Op Clone();
     }
 
     private sealed class WriteOp(int offset, byte[] data) : Op
@@ -334,6 +362,9 @@ public sealed class FakeStorageBackend : IStorageBackend
 
         public override void ApplyTo(Image image)
             => image.Write(Offset, Data);
+
+        public override Op Clone()
+            => new WriteOp(Offset, (byte[])Data.Clone());
     }
 
     private sealed class TruncateOp(int length) : Op
@@ -342,5 +373,8 @@ public sealed class FakeStorageBackend : IStorageBackend
 
         public override void ApplyTo(Image image)
             => image.Truncate(Length);
+
+        public override Op Clone()
+            => new TruncateOp(Length);
     }
 }

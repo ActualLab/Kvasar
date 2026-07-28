@@ -351,7 +351,10 @@ instead of O(log). It is outside the durability story, but not outside the authe
 - **It is never flushed.** Not per commit, not ever.
 - **Its committed prefix is authenticated.** The header carries two HMAC-SHA256/128 tags, selected by
   superblock-generation parity, over the stable header fields plus the checkpoint and committed delta
-  range. A missing prefix, old layout, or MAC failure makes the index absent; recovery replays data.
+  range. The HMAC input is prefixed with the active `.kdat` file's `fileSalt`, so an old checkpoint
+  cannot authenticate after compaction recycles that data slot into a new incarnation. A missing
+  prefix, old layout, context-free legacy tag, or MAC failure makes the index absent; recovery replays
+  data.
 
 So a lost, torn, stale, or tampered index costs *replay time at open* and nothing else. This keeps the
 important simplification: no `.kidx` fsync (**I8**), no blocking `.kidx` flush (**I36**), and no
