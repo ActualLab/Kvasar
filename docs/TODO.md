@@ -35,6 +35,37 @@
 > - **X3** — `PagedFile.Recycle` strands the previous page cipher without zeroizing it. Disposing it at
 >   that point races the R1 fix, so it needs refcounting or quiescence tracking.
 >
+> **A round-7 hotspot audit (2026-07-27) then found six more**, all fixed — including two that deleted
+> recoverable data: the superblock's slots were not sector-aligned, so one torn write could invalidate
+> **both** (fixed by format 3 plus last-resort adoption from the authenticated `.kdat` prefix), and the
+> wrong-key guard was bypassed whenever the `.kvs` header could not be read, so a wrong key deleted intact
+> stores. It also explained a long-standing intermittent test failure (a 1-in-256 GCM tag collision in
+> `TornSlotWriteIsAlwaysRejected`, not a store defect).
+>
+> ## The one blocking item before shipping: **ARM validation**
+>
+> **Everything so far has been validated only on x64 Windows, and this ships to phones.** The read paths
+> are deliberately lock-free, and x86's strong memory model hides exactly the reordering bugs ARM will
+> expose. This is the largest remaining unknown — larger than any open finding below.
+>
+> Run on an ARM machine (a Mac Mini also closes **D5**, see below):
+>
+> 1. `dotnet test ActualLab.Kvasar.slnx -c Release -p:UseMultitargeting=true` — full suite, both TFMs.
+> 2. `HighConcurrencyInvariantTests`, several seeds **and** `KVASAR_CONCURRENCY_DEEP=1`. Its
+>    *write-order visibility* invariant leans explicitly on store-store ordering between two independent
+>    index slots; that reasoning was checked against .NET's memory model but never against real hardware,
+>    and this is the test most likely to fail first on ARM.
+> 3. `MultiCycleCrashFuzzTests` and `CrashFuzzTests`, deep mode.
+>
+> Specific places where an x86-only assumption could hide: `ProbeCursor`'s seqlock (`HashIndex`), the
+> `volatile Incarnation` swap and lease/drain protocol in `PagedFile`, `TailSnapshot` publication in
+> `DataLog`, and the `Volatile.Read`/`Write` pairs on `_pageCount` / `_flushedPageCount`.
+>
+> **While on Apple hardware, settle D5 as well** — it is no longer theoretical. `Flushed` now fsyncs the
+> commit record on every commit (783 µs), so if `FlushToDisk` maps to plain `fsync` rather than
+> `fcntl(F_FULLFSYNC)`, that cost is being paid for a guarantee macOS/iOS is not delivering. Confirm
+> against the runtime source *and* measure, then record the answer in `DESIGN.md` either way.
+>
 > Treat the per-item text below as the historical record; where it conflicts with the above, the above
 > is current.
 
