@@ -126,6 +126,21 @@ does not change it. Buffered improves writes materially once values exceed the p
 | 1 KB | 241.7 | 310.2 | 28% |
 | 4 KB, 4 KB pages | 65.0 | 106.4 | 64% |
 
+Data format 3 adds the `.kvs` durability barrier that makes the commit record itself survive under
+`Flushed`. A focused 2026-07-27 measurement used 250 AES-GCM commits per sample, five samples,
+`FlushDelay = 0`, 4 KiB pages, and 128-byte values. The same production store was run through a
+backend wrapper that suppressed only `.kvs` `FlushToDisk`, reproducing the former data-only barrier:
+
+| Per-commit barriers | Median time |
+|---|---:|
+| `.kdat` + `.kvs` | 1,644.2 µs |
+| `.kdat` only | 861.5 µs |
+| **Added `.kvs` barrier** | **782.7 µs** |
+
+The five added-barrier samples imply about 0.78 ms per commit on this Windows machine. This cost is
+why `Buffered` remains the library default; the benchmark CLI deliberately defaults to `Flushed` for
+its durability-matched SQLCipher comparison.
+
 The 4 KB write rows are unstable: AES-GCM ranged from 40.7–70.4 k/s at 4 KB pages and
 75.8–143.3 k/s at 16 KB pages. Startup at 16 KB pages was stable at 333.8–338.4 ms, but the default
 page-size startup ranged from 591.3–975.4 ms. AES-GCM lookup spread was 8% at 128 B, 1% at 1 KB,

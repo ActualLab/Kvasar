@@ -7,9 +7,9 @@ namespace ActualLab.Kvasar;
 /// </summary>
 public enum KvasarDurability
 {
-    // One FlushToDisk on the data file per commit.
+    // FlushToDisk on the data file, then on the superblock after its slot write.
     Flushed = 0,
-    // No FlushToDisk at all; recovery-time authentication substitutes for it. Identical to Flushed
-    // when the process is killed but the OS survives, which is the dominant mobile crash.
+    // No FlushToDisk; recovery-time authentication substitutes for it. Identical to Flushed when the
+    // process is killed but the OS survives, which is the dominant mobile crash.
     Buffered,
 }

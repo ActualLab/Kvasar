@@ -6,30 +6,38 @@ using ActualLab.Kvasar.Internal.Storage;
 namespace ActualLab.Kvasar.Tests.Storage;
 
 /// <summary>
-/// How a <see cref="FakeStorageBackend.Crash"/> disposes of the volatile (unflushed) writes.
+/// How a <see cref="FakeStorageBackend.PowerLoss"/> disposes of page-cache writes or faults the
+/// selected <c>FlushToDisk</c>.
 /// </summary>
 public enum CrashMode
 {
-    // Nothing unflushed survives.
+    // Nothing in the page cache reaches the device.
     LoseAll = 0,
-    // Each write independently applies fully, vanishes, or applies a random prefix of its bytes.
+    // One selected write may tear within a sector; the other writes land whole or vanish.
     Torn,
-    // Writes apply in a shuffled order, and some are dropped.
+    // An arbitrary subset of whole writes reaches the device in a shuffled order.
     Reorder,
+    // FlushToDisk returns success without promoting that file's page cache.
+    LyingFsync,
+    // FlushToDisk throws without promoting that file's page cache.
+    FailingFsync,
 }
 
 /// <summary>
-/// An in-RAM <see cref="IStorageBackend"/> modelling a device with a write cache: writes land in
-/// volatile state, <c>FlushToDisk</c> promotes volatile to stable, and <see cref="Crash"/> discards the
-/// volatile state — optionally tearing or reordering it first (<c>docs/DESIGN-Durability.md</c> §8).
+/// An in-RAM <see cref="IStorageBackend"/> with separate per-file device and OS page-cache images.
+/// Writes change only the page cache; honest <c>FlushToDisk</c> promotes one file to the device.
+/// Process kill preserves both layers, while power loss reconstructs the cache from surviving device
+/// bytes and deterministic mode-selected writes (<c>docs/DESIGN-Durability.md</c> §6).
 /// </summary>
 public sealed class FakeStorageBackend : IStorageBackend
 {
+    private const int SectorSize = 512;
     private const int MaxFileLength = 1 << 26;
 
     private readonly ConcurrentDictionary<string, FileState> _files = new(StringComparer.Ordinal);
 
     public Func<string, long, int, int?>? WriteFailure { get; set; }
+    public CrashMode? FlushFaultMode { get; set; }
 
     public ValueTask<IStorageFile> Open(string path, CancellationToken cancellationToken = default)
     {
@@ -53,41 +61,55 @@ public sealed class FakeStorageBackend : IStorageBackend
 
     public void ProcessKill()
     {
-        // The process dies but the OS (and its page cache) survives, so nothing unflushed is lost.
+        // The process owns neither layer, so killing it changes neither one.
+    }
+
+    public void PowerLoss(CrashMode mode, int seed = 0)
+    {
+        var random = new Random(seed);
         foreach (var state in OrderedStates()) {
             lock (state.Lock) {
-                state.Stable = state.Merged.Clone();
-                state.Ops.Clear();
+                var device = state.Device.Clone();
+                ApplyPowerLoss(device, state.PendingOps, mode, random);
+                state.Device = device;
+                state.PageCache = device.Clone();
+                state.PendingOps.Clear();
             }
         }
     }
 
     public void Crash(CrashMode mode, int seed = 0)
-    {
-        var random = new Random(seed);
-        foreach (var state in OrderedStates()) {
-            lock (state.Lock) {
-                var image = state.Stable.Clone();
-                ApplyCrash(image, state.Ops, mode, random);
-                state.Stable = image;
-                state.Merged = image.Clone();
-                state.Ops.Clear();
-            }
-        }
-    }
+        => PowerLoss(mode, seed);
 
-    public byte[] GetStableBytes(string path)
+    public byte[] GetDeviceBytes(string path)
     {
         var state = _files[path];
         lock (state.Lock)
-            return state.Stable.ToArray();
+            return state.Device.ToArray();
     }
+
+    public byte[] GetStableBytes(string path)
+        => GetDeviceBytes(path);
 
     public byte[] GetBytes(string path)
     {
         var state = _files[path];
         lock (state.Lock)
-            return state.Merged.ToArray();
+            return state.PageCache.ToArray();
+    }
+
+    public int GetFlushCount(string path)
+    {
+        var state = _files[path];
+        lock (state.Lock)
+            return state.FlushCount;
+    }
+
+    public void ResetFlushCounts()
+    {
+        foreach (var state in OrderedStates())
+            lock (state.Lock)
+                state.FlushCount = 0;
     }
 
     // Private methods
@@ -98,21 +120,29 @@ public sealed class FakeStorageBackend : IStorageBackend
             .Select(x => x.Value)
             .ToArray();
 
-    private static void ApplyCrash(Image image, List<Op> ops, CrashMode mode, Random random)
+    private static void ApplyPowerLoss(Image device, List<Op> pendingOps, CrashMode mode, Random random)
     {
         switch (mode) {
             case CrashMode.LoseAll:
+            case CrashMode.LyingFsync:
+            case CrashMode.FailingFsync:
                 return;
             case CrashMode.Torn:
-                foreach (var op in ops)
-                    ApplyTorn(image, op, random);
+                var tornIndex = pendingOps.Count == 0 ? -1 : random.Next(pendingOps.Count);
+                for (var i = 0; i < pendingOps.Count; i++) {
+                    var op = pendingOps[i];
+                    if (i == tornIndex)
+                        ApplyTorn(device, op, random);
+                    else if (random.Next(2) != 0)
+                        op.ApplyTo(device);
+                }
                 return;
             case CrashMode.Reorder:
-                var shuffled = ops.ToList();
+                var shuffled = pendingOps.ToList();
                 Shuffle(shuffled, random);
                 foreach (var op in shuffled) {
                     if (random.Next(4) != 0)
-                        op.ApplyTo(image);
+                        op.ApplyTo(device);
                 }
                 return;
             default:
@@ -120,19 +150,23 @@ public sealed class FakeStorageBackend : IStorageBackend
         }
     }
 
-    private static void ApplyTorn(Image image, Op op, Random random)
+    private static void ApplyTorn(Image device, Op op, Random random)
     {
         var roll = random.Next(3);
         if (roll == 0) {
-            op.ApplyTo(image);
+            op.ApplyTo(device);
             return;
         }
         if (roll == 1)
             return;
 
-        // A partial write lands as a prefix of the buffer; a truncate has no partial form, so it drops.
-        if (op is WriteOp write && write.Data.Length > 1)
-            image.Write(write.Offset, write.Data.AsSpan(0, random.Next(1, write.Data.Length)));
+        if (op is not WriteOp { Data.Length: > 1 } write)
+            return;
+
+        var landedLength = random.Next(1, write.Data.Length);
+        if (landedLength % SectorSize == 0)
+            landedLength += landedLength + 1 < write.Data.Length ? 1 : -1;
+        device.Write(write.Offset, write.Data.AsSpan(0, landedLength));
     }
 
     private static void Shuffle(List<Op> ops, Random random)
@@ -169,7 +203,7 @@ public sealed class FakeStorageBackend : IStorageBackend
         public long Length {
             get {
                 lock (state.Lock)
-                    return state.Merged.Length;
+                    return state.PageCache.Length;
             }
         }
 
@@ -181,7 +215,7 @@ public sealed class FakeStorageBackend : IStorageBackend
             ArgumentOutOfRangeException.ThrowIfNegative(offset);
             cancellationToken.ThrowIfCancellationRequested();
             lock (state.Lock)
-                return new ValueTask<int>(state.Merged.Read(ToInt(offset), buffer.Span));
+                return new ValueTask<int>(state.PageCache.Read(ToInt(offset), buffer.Span));
         }
 
         public ValueTask Write(long offset, ReadOnlyMemory<byte> buffer)
@@ -194,14 +228,14 @@ public sealed class FakeStorageBackend : IStorageBackend
                 ArgumentOutOfRangeException.ThrowIfGreaterThan(landedLength, buffer.Length);
                 lock (state.Lock) {
                     var landed = buffer[..landedLength].ToArray();
-                    state.Ops.Add(new WriteOp(at, landed));
-                    state.Merged.Write(at, landed);
+                    state.PendingOps.Add(new WriteOp(at, landed));
+                    state.PageCache.Write(at, landed);
                 }
                 throw new IOException("Injected write failure.");
             }
             lock (state.Lock) {
-                state.Ops.Add(new WriteOp(at, buffer.ToArray()));
-                state.Merged.Write(at, buffer.Span);
+                state.PendingOps.Add(new WriteOp(at, buffer.ToArray()));
+                state.PageCache.Write(at, buffer.Span);
             }
             return default;
         }
@@ -209,8 +243,14 @@ public sealed class FakeStorageBackend : IStorageBackend
         public ValueTask FlushToDisk()
         {
             lock (state.Lock) {
-                state.Stable = state.Merged.Clone();
-                state.Ops.Clear();
+                state.FlushCount++;
+                if (backend.FlushFaultMode == CrashMode.FailingFsync)
+                    throw new IOException("Injected FlushToDisk failure.");
+                if (backend.FlushFaultMode == CrashMode.LyingFsync)
+                    return default;
+
+                state.Device = state.PageCache.Clone();
+                state.PendingOps.Clear();
             }
             return default;
         }
@@ -220,8 +260,8 @@ public sealed class FakeStorageBackend : IStorageBackend
             ArgumentOutOfRangeException.ThrowIfNegative(length);
             var at = ToInt(length);
             lock (state.Lock) {
-                state.Ops.Add(new TruncateOp(at));
-                state.Merged.Truncate(at);
+                state.PendingOps.Add(new TruncateOp(at));
+                state.PageCache.Truncate(at);
             }
             return default;
         }
@@ -230,9 +270,10 @@ public sealed class FakeStorageBackend : IStorageBackend
     private sealed class FileState
     {
         public readonly Lock Lock = new();
-        public readonly List<Op> Ops = [];
-        public Image Stable = new([], 0);
-        public Image Merged = new([], 0);
+        public readonly List<Op> PendingOps = [];
+        public Image Device = new([], 0);
+        public Image PageCache = new([], 0);
+        public int FlushCount;
     }
 
     // Bytes at [Length, capacity) are always zero, which is what makes a sparse write and a re-grown

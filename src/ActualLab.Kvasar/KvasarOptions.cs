@@ -14,8 +14,8 @@ public sealed record KvasarOptions
     public required string BasePath { get; init; }
     // 32-byte AES-256 master key.
     public required byte[] EncryptionKey { get; init; }
-    // On-disk format version; a mismatch on open ⇒ wipe & recreate.
-    public string FormatVersion { get; init; } = "2";
+    // On-disk format version; a deliberate mismatch on open ⇒ wipe & recreate.
+    public string FormatVersion { get; init; } = "3";
     // The caller's own data version (schema, serializer, cache generation, ...): bump it and the next
     // open wipes & recreates the store. Empty ⇒ unversioned.
     public string Version { get; init; } = "";

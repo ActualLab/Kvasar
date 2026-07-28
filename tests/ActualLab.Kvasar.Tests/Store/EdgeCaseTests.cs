@@ -400,7 +400,7 @@ public class EdgeCaseTests : IDisposable
     [Fact]
     public async Task FormatVersionMismatchWipes()
     {
-        var current = Options() with { FormatVersion = "2" };
+        var current = Options() with { FormatVersion = "3" };
         await using (var store = await KvasarStore.Open(current)) {
             await store.Set(K("a"), K("alpha"));
             await store.Set(K("b"), K("bravo"));
@@ -408,7 +408,7 @@ public class EdgeCaseTests : IDisposable
         }
 
         // Reopen with a different FormatVersion ⇒ store is wiped & regenerated (empty), no throw.
-        var next = Options() with { FormatVersion = "3" };
+        var next = Options() with { FormatVersion = "4" };
         await using var store2 = await KvasarStore.Open(next);
         (await ScanAll(store2)).Should().BeEmpty();
         (await store2.Get(K("a"))).Should().BeNull();
@@ -461,7 +461,7 @@ public class EdgeCaseTests : IDisposable
     {
         // I31: the wipe glob accepted any "<base>.*" ending in .klog, so wiping `store` also deleted
         // a caller's `store.backup.klog` sitting in the same directory.
-        var current = Options() with { FormatVersion = "2" };
+        var current = Options() with { FormatVersion = "3" };
         await using (var store = await KvasarStore.Open(current)) {
             await store.Set(K("a"), K("alpha"));
             await store.Flush();
@@ -472,7 +472,7 @@ public class EdgeCaseTests : IDisposable
         await File.WriteAllTextAsync(neighbour, "not kvasar's");
         await File.WriteAllTextAsync(notes, "also not kvasar's");
 
-        await using var store2 = await KvasarStore.Open(Options() with { FormatVersion = "3" });
+        await using var store2 = await KvasarStore.Open(Options() with { FormatVersion = "4" });
 
         File.Exists(neighbour).Should().BeTrue("a .klog whose suffix isn't a segment id isn't ours");
         (await File.ReadAllTextAsync(neighbour)).Should().Be("not kvasar's");
@@ -484,7 +484,7 @@ public class EdgeCaseTests : IDisposable
     [Fact]
     public async Task WipeLeavesUnownedNumericSlotFilesAlone()
     {
-        var current = Options() with { FormatVersion = "2" };
+        var current = Options() with { FormatVersion = "3" };
         await using (var store = await KvasarStore.Open(current)) {
             await store.Set(K("a"), K("alpha"));
             await store.Flush();
@@ -495,7 +495,7 @@ public class EdgeCaseTests : IDisposable
         await File.WriteAllTextAsync(dataNeighbour, "not kvasar's");
         await File.WriteAllTextAsync(indexNeighbour, "also not kvasar's");
 
-        await using var store2 = await KvasarStore.Open(Options() with { FormatVersion = "3" });
+        await using var store2 = await KvasarStore.Open(Options() with { FormatVersion = "4" });
 
         (await File.ReadAllTextAsync(dataNeighbour)).Should().Be("not kvasar's");
         (await File.ReadAllTextAsync(indexNeighbour)).Should().Be("also not kvasar's");

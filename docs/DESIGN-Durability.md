@@ -46,26 +46,27 @@ the filesystem to order anything for us if we can cryptographically detect what 
 That is why the design needs no native code. We are not trying to buy a cheaper barrier; we are
 avoiding the need for one.
 
-One managed `FlushToDisk` per commit remains, because it makes the proof in §6 unconditional rather
-than probabilistic, and it costs ~one syscall per `FlushDelay` tick. Even that is optional (§5.3).
+Two managed `FlushToDisk` calls per commit remain under `Flushed`: one for the data prefix and one
+for the superblock slot that names it. They make both retention and the proof in §6 unconditional
+rather than probabilistic. Both are optional under `Buffered` (§5.3).
 
 ### The durability setting
 
 `Flush(bool fsync)` goes away — durability is a property of a store, not of a call site. `Flush()`
 means **commit**.
 
-The commit protocol (§5.1) contains exactly one durability call, so there is exactly one knob and
-therefore exactly two levels:
+The commit protocol (§5.1) has one durability policy and therefore exactly two levels:
 
 ```csharp
 public enum KvasarDurability {
-    Flushed = 0,  // default: one FlushToDisk on the data file per commit
-    Buffered,     // no FlushToDisk at all; recovery validates instead (§5.3)
+    Flushed = 0,  // FlushToDisk on the data file and superblock per commit
+    Buffered,     // default: no FlushToDisk; recovery validates instead (§5.3)
 }
 ```
 
-The superblock and the index are never flushed under either level — their correctness comes from
-validation rather than ordering (§3.1, §3.3), so there is no third state to offer.
+The index is never flushed under either level because it is a rebuildable hint (§3.3). The
+superblock is flushed under `Flushed` so the commit record has the same retention promise as the data
+it names; under `Buffered`, its correctness still comes from validation rather than ordering (§3.1).
 
 There is no `PowerLoss` level. On every platform `RandomAccess.FlushToDisk` already does the
 strongest thing .NET offers (`FlushFileBuffers` / `F_FULLFSYNC` on macOS / `fsync` elsewhere), and
@@ -86,8 +87,8 @@ torn state. They differ only in how much recent work survives, and in one asymme
 | Crash kind | `Flushed` | `Buffered` |
 |---|---|---|
 | app / process kill (page cache intact) | last commit | **identical — last commit** |
-| OS crash / kernel panic | last commit, or one back | usually last commit, possibly further back |
-| power loss | last commit or a few back | same, wider window |
+| OS crash / kernel panic | last commit after both flushes return | usually last commit, possibly further back |
+| power loss | last commit on a compliant device; authenticated fallback on a lying device | OS writeback window; authenticated fallback may be much older |
 
 Under `Flushed` everything before the last flush is stable, so no hole can exist below the committed
 extent. Under `Buffered` nothing was ever made stable, so a hole *can* exist below it, and recovery
@@ -131,8 +132,8 @@ tick). At `FlushDelay = 0` they are a superblock write plus a full page per reco
 what `SealOrDefer` already costs today, so not a regression, but it means **`FlushDelay` matters
 more here than it does now, not less.**
 
-Accordingly the superblock slot should be sized for cost, not for atomicity: ~512 B is ample, and a
-torn slot is caught by its MAC, so hardware sector atomicity is not something the design relies on.
+Accordingly each superblock slot is exactly one 512-byte sector and begins at a 512-byte boundary.
+Authentication still detects a torn slot; alignment ensures one torn sector cannot mix both slots.
 
 ### 2.2 What triggers a commit
 
@@ -180,22 +181,22 @@ the store is open.**
 
 | File | Contents | Durability rule |
 |---|---|---|
-| `<base>.kvs` | superblock: two slots, each a complete commit record | never flushed; each slot self-authenticating |
-| `<base>.0.kdat` `<base>.1.kdat` | data; one active, the other free or a compaction target | flushed once per commit; every page self-authenticating |
+| `<base>.kvs` | superblock: two slots, each a complete commit record | flushed after each slot write under `Flushed`; each slot self-authenticating |
+| `<base>.0.kdat` `<base>.1.kdat` | data; one active, the other free or a compaction target | flushed once per commit under `Flushed`; every page self-authenticating |
 | `<base>.0.kidx` `<base>.1.kidx` | index; one active, the other free or a checkpoint target | **never flushed** — derivable from data (§3.3) |
 
 ### 3.1 The superblock — `<base>.kvs`
 
-The file is exactly 1088 bytes:
+The file is exactly 1536 bytes:
 ```
 offset  size  field
 0       4     magic "KSUP"
 4       4     data format version, little-endian uint
 8       12    KCV nonce
 20      16    KCV tag over "kvasar:kcv/v1", AAD = format version
-36      28    reserved, zero
-64      512   slot 0
-576     512   slot 1
+36      476   reserved, zero
+512     512   slot 0
+1024    512   slot 1
 ```
 
 Each slot is a complete authenticated commit record:
@@ -225,7 +226,8 @@ offset  size  field
 `dataAuthenticationFloor` is the lower bound of the page window this generation still needs checked
 when no predecessor slot survives. For an ordinary commit it is the preceding committed extent in the
 same data slot; after a slot switch it is the 64-byte data header. `nextKeyId` is the first identity not
-yet minted. Both fields were added in data format 2 without changing the slot size.
+yet minted. Both fields were added in data format 2 without changing the slot contents. Data format 3
+moves the unchanged slots to sector-aligned offsets.
 
 Slot for generation *G* is `G mod 2`, and this is **checked on read**, not merely followed on write:
 an authenticated blob is position-independent, so a slot byte-copied into the other position would
@@ -235,7 +237,7 @@ A slot is also **range-checked** after it authenticates. A MAC proves integrity,
 a slot written by a buggy writer can authenticate and still name `dataSlot = 7` or a negative
 `dataCommitLength`. Such a slot is treated as invalid, exactly like one that fails its tag.
 
-Ahead of the two slots sits a 64-byte **file header**, written once at store creation:
+Ahead of the two slots sits a 512-byte **file header**, written once at store creation:
 
 ```
 magic "KSUP", formatVer
@@ -248,11 +250,11 @@ authentication fails identically for all of them:
 
 | Condition | Meaning | Action |
 |---|---|---|
-| file absent or zero-length | new store | create |
+| file absent or zero-length, and no current-format `.kdat` header | new store | create |
 | bad magic, or unrelated `formatVer` mismatch | deliberate format/`Version` bump | wipe & recreate |
 | current-format slot authenticates | key is right; KCV may be damaged | recover from authenticated slots |
 | previous-format KCV or slot authenticates | key is right; old format is rebuild-only | wipe & recreate |
-| current-format KCV authenticates, but neither slot does | genuine corruption | wipe & rebuild |
+| current-format KCV authenticates, but neither slot does | damaged commit records | recover from `.kdat` |
 | recognized current/previous format, but no KCV or compatible slot authenticates | key cannot be established safely | **throw — never wipe** |
 
 The ordering matters: unrelated `formatVer` values are rejected before authentication, so a deliberate
@@ -267,10 +269,11 @@ fixed.)
 
 Three further properties come out of the slot design for free:
 
-- **A torn superblock write is self-detecting.** A partially written slot fails its MAC and is
-  discarded. This is why the superblock needs no flush of its own: if the newest slot is lost or
-  torn, recovery falls back to the previous one, which names an earlier *complete* commit — exactly
-  what §1 permits.
+- **A torn superblock write is self-detecting and isolated.** Each slot occupies one aligned sector,
+  so one torn sector cannot mix both slots. A partially written slot fails its MAC and is discarded,
+  while the other remains available. At the final tag bytes, a torn prefix may coincidentally equal
+  the complete new slot (probability 1/256 per stale byte); accepting that byte-identical record is
+  correct. `Flushed` fsyncs the slot for retention, not atomicity.
 - **The wrong master key is caught at the first read**, before anything is trusted — and now
   distinguishably, per the table above. Strictly better than the current "decrypt page 0 of the
   active segment" check, which passes vacuously when that segment is empty (issue **I9**).
@@ -278,16 +281,42 @@ Three further properties come out of the slot design for free:
   is no torn-tail heuristic, no "parse until it stops making sense". Bytes past `dataCommitLength`
   are not data: not read, not parsed, not scanned.
 
-That last point deserves emphasis, because three separate P0/P2 issues (**I2**, **I3**, **I21**) are
-all the same defect — inferring validity from file length. An explicit committed extent makes the
-whole class unrepresentable.
+That last point is the normal recovery rule. There is one deliberately isolated exception: if no
+superblock generation is adoptable, deleting the cache is the only remaining alternative, and
+deletion is strictly worse than salvaging authenticated data. Recovery then examines only
+current-format `.kdat` files with valid headers, authenticates pages from page 0 upward, and adopts
+the longest contiguous authenticating prefix. It rebuilds `.kidx`, rewrites a fresh superblock, and
+increments `KvasarStats.FallbackRecoveries`.
+
+For an unreadable or absent `.kvs`, at least one AES-GCM page must authenticate before this fallback
+may modify anything; one authenticating page proves the supplied master key. If no page proves the
+key, open throws `KvasarKeyException` and leaves the file set untouched. A deliberate `Version` or
+format bump changes the `.kdat` format tag, so those files are not fallback candidates and the cache
+is rebuilt as requested. The fallback may recover less than the last commit, but every page it adopts
+is authentic and every index entry is derived from those pages.
+
+The explicit-extent rule eliminated three separate P0/P2 issues (**I2**, **I3**, **I21**). The
+fallback does not weaken it on the normal path; it is the last alternative before destructive rebuild.
 
 ### 3.2 The data files — `<base>.N.kdat`
 
 Append-only, page-structured, AES-GCM per page with nonce = f(`fileSalt`, `pageId`).
 
-Each file starts with the existing 64-byte plaintext `KVSR` header. Every decrypted `PageSize`-byte
-page then has this data-format-2 layout:
+Each file starts with this 64-byte plaintext `KVSR` header:
+```
+offset  size  field
+0       4     magic "KVSR"
+4       4     effective data format tag
+8       4     plaintext page size
+12      4     advisory file id
+16      16    file salt
+32      4     flags: bit 0 = AES-GCM pages; all other bits zero
+36      28    reserved, zero
+```
+The encryption flag makes an open-time `DisableEncryption` mismatch an explicit configuration error
+instead of letting the wrong page stride reject both generations and reach a wipe.
+
+Every decrypted `PageSize`-byte page has the data-format-2 framing retained by data format 3:
 ```
 offset  size          field
 0       1             flags: bit 0 continuation, bit 1 hasRecordStart
@@ -423,20 +452,22 @@ for v1:
 
 ```
 1. append this commit's data pages to the active .kdat
-2. FlushToDisk(.kdat)                            ← the only durability call
+2. under Flushed: FlushToDisk(.kdat)
 3. write index deltas and the prefix MAC for generation G   (no flush)
-4. write superblock slot (G mod 2) for generation G         (no flush)
+4. write superblock slot (G mod 2) for generation G
+5. under Flushed: FlushToDisk(.kvs)
 ```
 
-One `FlushToDisk` per commit, on one file. Step 3 completes before step 4 is issued so the tag describes
-the exact prefix named by the superblock. Neither index write is flushed: if the prefix or its tag does
-not survive, recovery rejects the index and derives it again from data.
+`Flushed` uses two `FlushToDisk` calls per commit, each on a small append/overwrite window. Step 3
+completes before step 4 is issued so the tag describes the exact prefix named by the superblock. The
+index is not flushed: if its prefix or tag does not survive, recovery rejects it and derives it again
+from data. `Buffered` omits steps 2 and 5.
 
 ### 5.2 Recovery
 
 ```
 1. read both superblock slots; discard any failing its MAC
-   none valid  ⇒  store is absent or unopenable  ⇒  wipe & rebuild
+   none adoptable ⇒ enter the last-resort `.kdat` prefix recovery from §3.1 before any wipe
 2. G* := valid slot with the highest generation
 3. verify the data pages from the candidate's authentication bound through L_G* authenticate
    bound := L_{G*-1} when a same-data-slot predecessor survives
@@ -454,7 +485,7 @@ not survive, recovery rejects the index and derives it again from data.
    the corresponding logical record offset is pageId * (PageSize - 8)
 ```
 
-Step 3 costs one commit window of authentication — bounded by `FlushDelay`, so a few MB at most.
+Step 3 costs one commit window of authentication — bounded by `FlushDelay` and `CommitBytes`.
 The floor carried by each slot preserves that bound when the other superblock slot is unreadable.
 
 Step 6 is the nonce-safety rule and deserves its own statement. A crash mid-append leaves pages
@@ -495,9 +526,11 @@ segment per killed session) both die here, for the same reason.
 
 ### 5.3 The `Buffered` level — zero flushes
 
-Step 2 can be dropped entirely. Recovery step 3 already *verifies* cryptographically what step 2
-merely *arranges*, so the protocol remains sound: a commit whose data did not land fails validation
-and recovery falls back.
+Steps 2 and 5 can be dropped entirely. Recovery step 3 already *verifies* cryptographically what the
+data flush merely *arranges*, so the protocol remains sound: a commit whose data did not land fails
+validation and recovery falls back. The superblock slot may remain only in the OS writeback window,
+so a power loss can lose every commit record that was never written back; last-resort data-prefix
+adoption prevents that from turning intact authenticated data into deletion.
 
 What you lose is the unconditional guarantee in §6(b) — with no flush, a power loss could in
 principle drop an old page while retaining a newer one, and step 3 only validates the newest
@@ -506,7 +539,8 @@ miss, not as garbage.
 
 `Buffered` is genuinely attractive on mobile, where the dominant crash is the OS killing a
 backgrounded app — a case in which the page cache is fully intact and *no* flush was ever needed. It
-is offered, documented, and not the default.
+is the default; callers choose `Flushed` when retaining the latest commit across OS/power loss is
+worth two durability barriers per commit.
 
 Note what `Buffered` does **not** give up: ordering. Nothing in this protocol relies on the
 filesystem ordering anything, at either level — a barrier merely *requests* a behaviour from the
@@ -523,22 +557,24 @@ is the special case where nothing volatile is lost.)
 
 **Given.** Superblock slots and data pages are each individually authenticated under a key the
 attacker/corruption does not control, so a slot or page that is absent, torn, or partially written
-fails its tag with overwhelming probability.
+fails its tag with overwhelming probability. The two superblock slots occupy different aligned
+512-byte sectors, so one torn sector cannot damage both.
 
-**Claim.** After recovery R (§5.2), the store's state equals its state at the completion of some
-commit G\*, and every commit ≤ G\* is fully reflected.
+**Claim.** On the normal superblock-driven path, after recovery R (§5.2), the store's state equals
+its state at the completion of some commit G\*, and every commit ≤ G\* is fully reflected. The
+last-resort no-slot path has the separate, weaker salvage guarantee stated after this proof.
 
 **Proof.**
 
 **(a) G\* names a real commit.** A slot passes its MAC only if written completely and unmodified.
 So step 2 selects a generation that was actually issued, with a well-defined `dataCommitLength`
-L_{G\*}. If no slot passes, step 1 wipes — which is a defined outcome, not a torn state.
+L_{G\*}. If no slot passes, the normal-path proof ends and §3.1's fallback applies.
 
-**(b) The data G\* names is present.** `FlushToDisk(.kdat)` (step 2 of §5.1) *returned* before the
-superblock write for G was *issued*. Everything through L_G was therefore stable at the moment the
-superblock write began, and stable state is never lost. Hence: **if slot G survives, all data
-through L_G survives.** No ordering guarantee from the filesystem is required — the flush's return
-established the ordering by happening first in program order.
+**(b) The data and commit record for G\* are durable under `Flushed`.** `FlushToDisk(.kdat)` (step 2
+of §5.1) *returned* before the superblock write for G was *issued*, and `FlushToDisk(.kvs)` (step 5)
+returned before the commit completed. Everything through L_G and the slot naming it were therefore
+stable. No cross-file ordering guarantee from the filesystem is required — the data flush returned
+before the slot write, and the slot's own flush returned afterward.
 
 **(c) (b) is verified, not assumed.** Recovery step 3 independently authenticates the pages G\*
 added. So the claim holds even where the flush assumption fails — notably on iOS under true power
@@ -571,11 +607,18 @@ ever handed out.
 (a)–(f) apply unchanged. The recycling rule in §3.2 guarantees no file referenced by a surviving
 slot is ever truncated, so the fallback in (c) always finds its data intact. ∎
 
+**Last-resort salvage.** When no generation reaches step 2, recovery cannot prove a commit boundary.
+It therefore makes no claim that the salvaged prefix ends exactly at a completed commit. It proves
+the key with an AES-GCM page, adopts only the longest contiguous prefix whose pages all authenticate,
+and derives the index solely from that prefix. Thus it may retain too little or include authentic
+pages written after the last completed commit, but it cannot serve unauthenticated garbage or destroy
+an intact store merely because `.kvs` was lost.
+
 **What the proof does not cover.** That the most recent commit survives — §1 declines it. And a
 power loss under `Buffered` that drops an *old* page while keeping newer ones: authentication turns
 that into a read failure (a miss), not into garbage, but the store may then reflect a state slightly
 older than G\* for those keys. This is the one gap, it exists only under `Buffered`, and it is the
-reason `Buffered` is not the default.
+accepted tradeoff for the default because Kvasar holds regenerable cache data.
 
 ## 7. Platform notes
 
@@ -699,8 +742,9 @@ is changing anyway).
 
 - **A storage-layer rewrite.** `SegmentSet`, `PagedSegment`, `IndexFile` and `KvasarStore`'s
   open/flush/compact paths all change. Crypto (M1) and the record codec are untouched.
-- **A format change.** Data format 2 adds authenticated page frames and two superblock fields. The
-  format-1 file set is rejected and rebuilt as an empty format-2 cache, like every other mismatch.
+- **Format changes.** Data format 2 added authenticated page frames and two superblock fields. Data
+  format 3 sector-aligns the unchanged 512-byte slots and records the data-file encryption mode. A
+  format-2 file set is rejected and rebuilt as an empty format-3 cache on a deliberate format bump.
 - **Authentication work at open.** The normal path decrypts only the pages between the older and newer
   committed extents; a data-slot switch starts at the data header, and a missing predecessor starts at
   the candidate's persisted authentication floor.
@@ -714,8 +758,8 @@ is changing anyway).
 ## 12. Open questions
 
 1. **Default `CompactionDeadRatio`** — 0.75 as you suggested, or lower to reduce peak disk?
-2. **Default durability** — `Flushed` (one flush) or `Buffered` (zero) on mobile? §5.3 argues
-   `Buffered` is defensible there; I'd still ship `Flushed` as the default.
+2. **Default durability — resolved.** `Buffered` is the default for the regenerable mobile cache;
+   `Flushed` uses two flushes when the caller wants the latest commit retained across power loss.
 3. **File naming** — `<base>.kvs` / `<base>.N.kdat` / `<base>.N.kidx`, or keep `.klog`?
 4. **Is `IStorageFile` public?** Public lets hosts supply a backend; `internal` keeps it unfrozen.
    `internal` for v1 unless you want the extension point.
@@ -773,7 +817,8 @@ once compaction fires on its own trigger.
 load-bearing rather than a remark. Rounding `pageCount` **up** past a torn tail puts burned page ids
 *inside* the file's logical length, so an index entry that predates a truncation resolves to a page that
 can never authenticate. Every read path — `Get`, `Scan` and compaction's copy loop — has to treat
-`KvasarCorruptException` from a page decrypt as a miss. Only `Open` may still read it as "wipe".
+`KvasarCorruptException` from a page decrypt as a miss. `Open` rejects that candidate and tries an
+older generation or the last-resort authenticated-prefix fallback.
 
 ### 14.4 Adoption authentication is separate from best-effort replay
 
@@ -782,7 +827,7 @@ the candidate's added window `(L_previous, L_candidate]`. A page failure rejects
 tries the older superblock. If the candidates name **different data slots** — the first open after a
 compaction switch — the pass authenticates the candidate's whole committed extent instead: that slot was
 truncated to its header by `BeginCompaction` and restarted under a fresh salt, so no burned page can lie
-below its extent and all of it is checkable. Data format 2 also persists
+below its extent and all of it is checkable. Data format 2, retained by format 3, also persists
 `dataAuthenticationFloor` in every superblock slot. If there is **no older candidate at all**, adoption
 authenticates from that floor through the candidate extent. The ordinary writer records the preceding
 same-slot committed extent; a slot switch records the data header. Thus losing the predecessor no longer

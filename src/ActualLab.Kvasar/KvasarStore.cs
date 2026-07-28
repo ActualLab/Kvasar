@@ -37,6 +37,7 @@ public sealed class KvasarStore : IAsyncDisposable
     private readonly string _kvsPath;
     private readonly string[] _kdatPaths;
     private readonly string[] _kidxPaths;
+    private readonly bool _didSuperblockExist;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private readonly StoreLock _lock;
     private readonly TimeSpan _flushDelay;
@@ -73,13 +74,19 @@ public sealed class KvasarStore : IAsyncDisposable
     private volatile TaskCompletionSource _whenDirty = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _isDisposeStarted;
     private bool _isDisposed;
+    private long _fallbackRecoveries;
 
     public KvasarStats Stats {
         get {
             // Best-effort snapshot: read without taking the write lock, so a concurrent writer may shift
             // the numbers mid-read. They're advisory (compaction/diagnostics), never used for correctness.
             ThrowIfDisposed();
-            return new(_index.Count, _data.LiveBytes, _data.DeadBytes, _data.FileBytes);
+            return new(
+                _index.Count,
+                _data.LiveBytes,
+                _data.DeadBytes,
+                _data.FileBytes,
+                _fallbackRecoveries);
         }
     }
 
@@ -152,7 +159,7 @@ public sealed class KvasarStore : IAsyncDisposable
             await store.Initialize(cancellationToken).ConfigureAwait(false);
             return store;
         }
-        catch {
+        catch (Exception error) {
             // Release what this attempt opened, but leave the lock to Open — it stays held across the
             // wipe-and-retry, and a throw here must not strand it.
             try {
@@ -160,6 +167,14 @@ public sealed class KvasarStore : IAsyncDisposable
             }
             finally {
                 store.DisposeKeyMaterial();
+            }
+            if (error is KvasarKeyException && !store._didSuperblockExist) {
+                try {
+                    store._storage.Delete(store._kvsPath);
+                }
+                catch {
+                    // Preserve the key error; the created file contains no authenticated store state.
+                }
             }
             throw;
         }
@@ -172,6 +187,7 @@ public sealed class KvasarStore : IAsyncDisposable
         _kdatPaths = [options.BasePath + ".0.kdat", options.BasePath + ".1.kdat"];
         _kidxPaths = [options.BasePath + ".0.kidx", options.BasePath + ".1.kidx"];
         _storage = options.StorageBackend ?? FileStorageBackend.Instance;
+        _didSuperblockExist = _storage.Exists(_kvsPath);
 
         var kdf = options.Kdf ?? KeyDerivations.HkdfSha256;
         _hasher = options.Hasher ?? KeyHashers.SipHash24;
@@ -646,9 +662,6 @@ public sealed class KvasarStore : IAsyncDisposable
     {
         _superblockFile = await _storage.Open(_kvsPath, cancellationToken).ConfigureAwait(false);
         var read = await _superblock.Read(_superblockFile, cancellationToken).ConfigureAwait(false);
-        if (read.Status == SuperblockStatus.WrongKey)
-            throw new KvasarKeyException(
-                $"The store '{_options.BasePath}' was created under a different encryption key.");
 
         var isAdopted = false;
         if (read.Status == SuperblockStatus.Ok) {
@@ -662,8 +675,22 @@ public sealed class KvasarStore : IAsyncDisposable
             }
         }
         if (!isAdopted) {
-            // Missing (a new store), FormatMismatch (a deliberate FormatVersion/Version bump) or nothing
-            // adoptable (genuine corruption) — all three rebuild from scratch (§3.1).
+            var fallback = await FindDataFallback(cancellationToken).ConfigureAwait(false);
+            var isKeyProven = read.Status is SuperblockStatus.Ok or SuperblockStatus.NoValidSlot
+                || _options.DisableEncryption
+                || fallback.HasAuthenticatedPage;
+            if (fallback.State is { } fallbackState && isKeyProven) {
+                await _superblock.Initialize(_superblockFile).ConfigureAwait(false);
+                isAdopted = await TryAdopt(fallbackState, null, cancellationToken).ConfigureAwait(false);
+                if (isAdopted)
+                    _fallbackRecoveries++;
+            }
+            if (!isAdopted && (read.Status == SuperblockStatus.WrongKey
+                || fallback.HasCurrentHeader && !isKeyProven))
+                throw new KvasarKeyException(
+                    $"The store '{_options.BasePath}' was created under a different encryption key.");
+        }
+        if (!isAdopted) {
             await CloseFiles().ConfigureAwait(false);
             WipeFiles();
             await CreateFresh(cancellationToken).ConfigureAwait(false);
@@ -689,6 +716,124 @@ public sealed class KvasarStore : IAsyncDisposable
         }
     }
 
+    private async ValueTask<DataFallback> FindDataFallback(CancellationToken cancellationToken)
+    {
+        var candidates = new List<DataFallbackCandidate>(DataLog.SlotCount);
+        for (var slot = 0; slot < _kdatPaths.Length; slot++) {
+            var candidate = await ReadDataFallbackCandidate(slot, cancellationToken).ConfigureAwait(false);
+            if (candidate is { } c)
+                candidates.Add(c);
+        }
+        if (candidates.Count == 0)
+            return default;
+
+        var matching = candidates
+            .Where(x => (_options.PageSize <= 0 || x.Header.PageSize == _options.PageSize)
+                && IsEncrypted(x.Header) == !_options.DisableEncryption)
+            .ToArray();
+        if (matching.Length == 0) {
+            if (_options.PageSize > 0 && candidates.All(x => x.Header.PageSize != _options.PageSize))
+                throw new KvasarConfigurationException(
+                    "PageSize does not match the existing store.");
+
+            throw new KvasarConfigurationException(
+                "DisableEncryption does not match the existing store.");
+        }
+
+        var bestSlot = matching[0].Slot;
+        var bestCommitLength = (long)KvasarConstants.SegmentHeaderSize;
+        var hasAuthenticatedPage = false;
+        foreach (var candidate in matching) {
+            var probe = await ProbeDataPrefix(candidate, cancellationToken).ConfigureAwait(false);
+            hasAuthenticatedPage |= probe.HasAuthenticatedPage;
+            if (probe.CommitLength <= bestCommitLength)
+                continue;
+
+            bestSlot = candidate.Slot;
+            bestCommitLength = probe.CommitLength;
+        }
+
+        var state = new SuperblockState(
+            0,
+            (byte)bestSlot,
+            bestCommitLength,
+            0,
+            0,
+            -1,
+            -1);
+        return new DataFallback(state, true, hasAuthenticatedPage);
+    }
+
+    private async ValueTask<DataFallbackCandidate?> ReadDataFallbackCandidate(
+        int slot, CancellationToken cancellationToken)
+    {
+        var path = _kdatPaths[slot];
+        if (!_storage.Exists(path))
+            return null;
+
+        var file = await _storage.Open(path, cancellationToken).ConfigureAwait(false);
+        try {
+            if (file.Length < KvasarConstants.SegmentHeaderSize)
+                return null;
+
+            var bytes = new byte[KvasarConstants.SegmentHeaderSize];
+            if (!await file.TryReadExact(0, bytes, cancellationToken).ConfigureAwait(false))
+                return null;
+
+            SegmentHeader header;
+            try {
+                header = SegmentHeader.Read(bytes);
+            }
+            catch (KvasarCorruptException) {
+                return null;
+            }
+            if (header.FormatVer != _formatVer
+                || header.PageSize < KvasarConstants.MinPageSize
+                || header.PageSize > KvasarConstants.MaxPageSize
+                || (header.PageSize & (header.PageSize - 1)) != 0
+                || (header.Flags & ~KvasarConstants.EncryptedDataFileFlag) != 0)
+                return null;
+
+            return new DataFallbackCandidate(slot, header);
+        }
+        finally {
+            await file.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    private async ValueTask<DataPrefixProbe> ProbeDataPrefix(
+        DataFallbackCandidate candidate, CancellationToken cancellationToken)
+    {
+        var file = await _storage.Open(_kdatPaths[candidate.Slot], cancellationToken).ConfigureAwait(false);
+        var pagedFile = await PagedFile.Open(
+                file,
+                _cipherFactory,
+                _formatVer,
+                new PageCache(_options.PageCacheBytes),
+                cancellationToken: cancellationToken)
+            .ConfigureAwait(false);
+        await using (pagedFile.ConfigureAwait(false)) {
+            var prefixPageCount = 0L;
+            var isPrefixOpen = true;
+            var hasAuthenticatedPage = false;
+            for (var pageId = 0L; pageId < pagedFile.CommittedPageCount; pageId++) {
+                try {
+                    _ = await pagedFile.GetPage(pageId, cancellationToken).ConfigureAwait(false);
+                    hasAuthenticatedPage = true;
+                    if (isPrefixOpen)
+                        prefixPageCount++;
+                }
+                catch (KvasarCorruptException) {
+                    isPrefixOpen = false;
+                }
+            }
+
+            var onDiskPageSize = candidate.Header.PageSize + _cipherFactory.Overhead;
+            var commitLength = KvasarConstants.SegmentHeaderSize + (prefixPageCount * onDiskPageSize);
+            return new DataPrefixProbe(commitLength, hasAuthenticatedPage);
+        }
+    }
+
     private ValueTask AuthenticateCommitWindow(
         SuperblockState state, SuperblockState? previousState, CancellationToken cancellationToken)
     {
@@ -698,8 +843,6 @@ public sealed class KvasarStore : IAsyncDisposable
             && previous.DataCommitLength >= KvasarConstants.SegmentHeaderSize
             && previous.DataCommitLength <= state.DataCommitLength)
             floor = Math.Max(floor, previous.DataCommitLength);
-        else if (previousState is { } other && other.DataSlot != state.DataSlot)
-            floor = Math.Max(floor, KvasarConstants.SegmentHeaderSize);
 
         var fromPageId = GetPageCount(floor);
         var toPageId = GetPageCount(state.DataCommitLength);
@@ -714,7 +857,8 @@ public sealed class KvasarStore : IAsyncDisposable
             // different one — the alternative is silently reading the store at the wrong geometry.
             var pageSize = await ReadPageSize(dataFiles[state.DataSlot], cancellationToken).ConfigureAwait(false);
             if (_options.PageSize > 0 && _options.PageSize != pageSize)
-                throw new KvasarCorruptException("PageSize does not match the existing store.");
+                throw new KvasarConfigurationException(
+                    "PageSize does not match the existing store.");
 
             _pageSize = pageSize;
             _cache = new PageCache(_options.PageCacheBytes);
@@ -740,13 +884,15 @@ public sealed class KvasarStore : IAsyncDisposable
         var snapshot = await indexLog
             .Read(state.IndexCommitLength, state.Generation, cancellationToken)
             .ConfigureAwait(false);
+        if (snapshot is { } candidate && !TryRestoreNextKeyId(candidate.Entries))
+            snapshot = null;
+
         // Only an index at the exact committed extent can be adopted without rotation.
         var isIndexComplete = snapshot is not null
             && _mustPersistIndex && indexLog.Length == state.IndexCommitLength;
         var replayFrom = 0L;
         if (snapshot is { } s) {
             _index.BulkLoad(s.Entries);
-            RestoreNextKeyId(s.Entries);
             // Anything shorter (a tail lost to a crash, or an index that never carried entries at all)
             // falls back to the checkpoint's own stamp, which §5.2.1 keeps above every burned page.
             replayFrom = isIndexComplete ? committedOffset : s.DataCommitLength;
@@ -774,7 +920,7 @@ public sealed class KvasarStore : IAsyncDisposable
             await indexLog.WriteCommitMac(generation).ConfigureAwait(false);
         else
             confirmedState = confirmedState with { IndexCommitLength = 0 };
-        await _superblock.Write(_superblockFile!, confirmedState).ConfigureAwait(false);
+        await WriteSuperblock(confirmedState).ConfigureAwait(false);
         _generation = generation;
         _committedDataSlot = state.DataSlot;
         _committedDataLength = state.DataCommitLength;
@@ -990,10 +1136,10 @@ public sealed class KvasarStore : IAsyncDisposable
                 _committedDataLength,
                 _data.BurnedBytes > 0 ? _data.ActiveResumeLength : _committedDataLength)
             : KvasarConstants.SegmentHeaderSize;
-        await _superblock.Write(_superblockFile!, new SuperblockState(
-            generation, (byte)_data.ActiveSlot, dataCommitLength,
-            (byte)_indexSlot, indexLog.Length, _data.ActiveLiveBytes, _data.ActiveDeadBytes,
-            dataAuthenticationFloor, _nextKeyId))
+        await WriteSuperblock(new SuperblockState(
+                generation, (byte)_data.ActiveSlot, dataCommitLength,
+                (byte)_indexSlot, indexLog.Length, _data.ActiveLiveBytes, _data.ActiveDeadBytes,
+                dataAuthenticationFloor, _nextKeyId))
             .ConfigureAwait(false);
         _generation = generation;
         _committedDataSlot = _data.ActiveSlot;
@@ -1003,6 +1149,13 @@ public sealed class KvasarStore : IAsyncDisposable
             _slotSwitchGeneration = _generation;
             _isSlotSwitchPending = false;
         }
+    }
+
+    private async ValueTask WriteSuperblock(SuperblockState state)
+    {
+        await _superblock.Write(_superblockFile!, state).ConfigureAwait(false);
+        if (_options.Durability == KvasarDurability.Flushed)
+            await _superblockFile!.FlushToDisk().ConfigureAwait(false);
     }
 
     private bool MustRotateIndex()
@@ -1569,16 +1722,19 @@ public sealed class KvasarStore : IAsyncDisposable
             throw new InvalidOperationException("The loaded index entry changed during recovery.");
     }
 
-    private void RestoreNextKeyId(ReadOnlySpan<IndexEntry> entries)
+    private bool TryRestoreNextKeyId(ReadOnlySpan<IndexEntry> entries)
     {
+        foreach (var entry in entries)
+            if (entry.KeyId == ulong.MaxValue)
+                return false;
+
         foreach (var entry in entries) {
             if (entry.KeyId < _nextKeyId)
                 continue;
-            if (entry.KeyId == ulong.MaxValue)
-                throw new KvasarCorruptException("The persisted key identity space is exhausted.");
 
             _nextKeyId = entry.KeyId + 1;
         }
+        return true;
     }
 
     private ulong MintKeyId()
@@ -1651,6 +1807,9 @@ public sealed class KvasarStore : IAsyncDisposable
             : pagePayloadSize;
     }
 
+    private static bool IsEncrypted(SegmentHeader header)
+        => (header.Flags & KvasarConstants.EncryptedDataFileFlag) != 0;
+
     private static uint ParseFormatVersion(string formatVersion, string? version)
     {
         // The app-level Version folds into the same on-disk tag as FormatVersion: both are bound into the
@@ -1682,6 +1841,13 @@ public sealed class KvasarStore : IAsyncDisposable
     {
         public static readonly ValueRead Retry = new(null, true);
     }
+
+    private readonly record struct DataFallback(
+        SuperblockState? State,
+        bool HasCurrentHeader,
+        bool HasAuthenticatedPage);
+    private readonly record struct DataFallbackCandidate(int Slot, SegmentHeader Header);
+    private readonly record struct DataPrefixProbe(long CommitLength, bool HasAuthenticatedPage);
 
     private readonly record struct CompactionCopy(
         IndexEntry Entry, RecordView View, bool IsCorrupt, bool IsCopy);

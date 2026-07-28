@@ -37,7 +37,7 @@ public class FakeStorageTests
             await file.FlushToDisk();
             await file.Write(32, unflushed);
         }
-        backend.Crash(CrashMode.LoseAll);
+        backend.PowerLoss(CrashMode.LoseAll);
 
         backend.GetStableBytes(PathA).Should().Equal(flushed);
         await using var reopened = await backend.Open(PathA);
@@ -62,10 +62,16 @@ public class FakeStorageTests
             await fileB.Write(0, unflushed);
         backend.ProcessKill();
 
-        backend.GetStableBytes(PathA).Should().Equal(flushed.Concat(unflushed));
-        backend.GetStableBytes(PathB).Should().Equal(unflushed);
+        backend.GetDeviceBytes(PathA).Should().Equal(flushed);
+        backend.GetDeviceBytes(PathB).Should().BeEmpty();
+        backend.GetBytes(PathA).Should().Equal(flushed.Concat(unflushed));
+        backend.GetBytes(PathB).Should().Equal(unflushed);
         await using var reopened = await backend.Open(PathA);
         reopened.Length.Should().Be(64);
+
+        backend.PowerLoss(CrashMode.LoseAll);
+        backend.GetBytes(PathA).Should().Equal(flushed);
+        backend.GetBytes(PathB).Should().BeEmpty();
     }
 
     [Fact]
@@ -79,7 +85,7 @@ public class FakeStorageTests
         }
         await using (var fileB = await backend.Open(PathB))
             await fileB.Write(0, MakeBytes(16, 8));
-        backend.Crash(CrashMode.LoseAll);
+        backend.PowerLoss(CrashMode.LoseAll);
 
         backend.GetStableBytes(PathA).Should().HaveCount(16);
         backend.GetStableBytes(PathB).Should().BeEmpty();
@@ -99,7 +105,7 @@ public class FakeStorageTests
                 await file.FlushToDisk();
                 await file.Write(0, Enumerable.Repeat((byte)0xFF, writeLength).ToArray());
             }
-            backend.Crash(CrashMode.Torn, seed);
+            backend.PowerLoss(CrashMode.Torn, seed);
 
             var bytes = backend.GetStableBytes(PathA);
             bytes.Should().HaveCount(stableLength);
@@ -127,7 +133,7 @@ public class FakeStorageTests
                 await file.Write(0, new byte[] { 0xAA, 0xAA, 0xAA, 0xAA });
                 await file.Write(0, new byte[] { 0xBB, 0xBB, 0xBB, 0xBB });
             }
-            backend.Crash(CrashMode.Reorder, seed);
+            backend.PowerLoss(CrashMode.Reorder, seed);
 
             var bytes = backend.GetStableBytes(PathA);
             bytes.Should().HaveCount(8);
@@ -159,9 +165,42 @@ public class FakeStorageTests
                 await file.Truncate(64);
                 await file.Write(64, MakeBytes(16, 200));
             }
-            backend.Crash(mode, 12345);
+            backend.PowerLoss(mode, 12345);
             return backend.GetStableBytes(PathA);
         }
+    }
+
+    [Fact]
+    public async Task LyingFsyncReturnsWithoutPromotingPageCache()
+    {
+        var backend = new FakeStorageBackend { FlushFaultMode = CrashMode.LyingFsync };
+        var data = MakeBytes(64, 10);
+        await using var file = await backend.Open(PathA);
+        await file.Write(0, data);
+        await file.FlushToDisk();
+
+        backend.GetDeviceBytes(PathA).Should().BeEmpty();
+        backend.GetBytes(PathA).Should().Equal(data);
+
+        backend.PowerLoss(CrashMode.LyingFsync);
+        backend.GetBytes(PathA).Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task FailingFsyncThrowsWithoutPromotingPageCache()
+    {
+        var backend = new FakeStorageBackend { FlushFaultMode = CrashMode.FailingFsync };
+        var data = MakeBytes(64, 11);
+        await using var file = await backend.Open(PathA);
+        await file.Write(0, data);
+
+        var flush = async () => await file.FlushToDisk();
+        await flush.Should().ThrowAsync<IOException>();
+        backend.GetDeviceBytes(PathA).Should().BeEmpty();
+        backend.GetBytes(PathA).Should().Equal(data);
+
+        backend.PowerLoss(CrashMode.FailingFsync);
+        backend.GetBytes(PathA).Should().BeEmpty();
     }
 
     [Fact]
@@ -178,7 +217,7 @@ public class FakeStorageTests
             (await file.Read(40, new byte[8])).Should().Be(0);
             backend.GetStableBytes(PathA).Should().HaveCount(100);
         }
-        backend.Crash(CrashMode.LoseAll);
+        backend.PowerLoss(CrashMode.LoseAll);
 
         backend.GetStableBytes(PathA).Should().Equal(data);
         await using var reopened = await backend.Open(PathA);

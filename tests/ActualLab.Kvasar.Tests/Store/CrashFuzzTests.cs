@@ -156,7 +156,11 @@ public sealed class CrashFuzzTests : IDisposable
             AssertNoWrongData(contents, model, because);
             await AssertGetReturnsOnlyKnownValues(store, model, because);
             await AssertScanAgreesWithGet(store, contents, because);
-            AssertLossIsASuffix(contents, model, because);
+            if (store.Stats.FallbackRecoveries == 0)
+                AssertLossIsASuffix(contents, model, because);
+            else
+                contents.Should().NotBeEmpty(
+                    "authenticated-prefix fallback must recover data instead of deleting the store");
             if (fault is not (FaultKind.TruncateActiveLog or FaultKind.CorruptLogHeader
                 or FaultKind.TruncateSuperblockSlot))
                 AssertFlushedDataSurvives(contents, model, because);

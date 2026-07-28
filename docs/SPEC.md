@@ -145,14 +145,14 @@ public sealed record KvasarOptions
 {
     public required string BasePath { get; init; }                       // -> fixed .kvs/.N.kdat/.N.kidx/.lock set
     public required byte[] EncryptionKey { get; init; }                  // 32 bytes (AES-256)
-    public string FormatVersion { get; init; } = "2";                    // on-disk format; mismatch => wipe & recreate (§11)
+    public string FormatVersion { get; init; } = "3";                    // on-disk format; mismatch => wipe & recreate (§11)
     public string Version { get; init; } = "";                           // caller's data version; mismatch => wipe & recreate
     public int  PageSize { get; init; } = 0;                             // 0 => probe FS cluster size (fallback 4 KiB)
     public long PageCacheBytes { get; init; } = 16 * 1024 * 1024;        // decrypted-page LRU budget
     public int  MaxValueBytes { get; init; } = 8 * 1024 * 1024;
     public int  MaxInlineValueBytes { get; init; } = 0;                 // 0 => PageSize - 8; ≤ this may stay single-page (§5.2)
     public KvasarDurability Durability { get; init; } = KvasarDurability.Buffered;
-    public TimeSpan FlushDelay { get; init; } = TimeSpan.FromSeconds(0.5); // 0 => every Set durable on return
+    public TimeSpan FlushDelay { get; init; } = TimeSpan.FromSeconds(0.5); // 0 => every Set commits on return
     public long CommitBytes { get; init; } = 8 * 1024 * 1024;
     // Pluggable crypto — secure defaults (§5.3)
     public IKeyHasher      Hasher { get; init; } = KeyHashers.SipHash24;      // keyed PRF (default)
@@ -268,6 +268,20 @@ Encryption is a KV-agnostic hook; the KV logic never sees ciphertext.
 | `<base>.0.kidx`, `<base>.1.kidx` | matching rebuildable index slots (§6.5) |
 | `<base>.lock` | single-writer advisory lock |
 
+The data-format-3 superblock is exactly 1536 bytes:
+```
+offset  size  field
+0       4     magic "KSUP"
+4       4     effective data format tag
+8       12    KCV nonce
+20      16    KCV tag
+36      476   reserved, zero
+512     512   authenticated slot 0
+1024    512   authenticated slot 1
+```
+The slot contents remain the 512-byte layout in `DESIGN-Durability.md` §3.1. Sector alignment means
+one torn 512-byte sector cannot damage both commit records.
+
 ### 5.1 Layer 1 — encrypted paged store  **[core abstraction]**
 Knows only fixed-size pages, nothing about keys/records.
 
@@ -336,8 +350,20 @@ value     : recordLen - (…) bytes   (absent for tombstone)
   small-entry case is always zero-copy.
 
 ### 5.3 File header & key privacy
-File header (plaintext, non-secret): `magic "KVSR"`, `formatVer`, `pageSize`, `fileSalt(16)`,
-`flags`. A magic/version/pageSize mismatch on open ⇒ wipe and recreate. The superblock KCV
+The 64-byte data-file header is plaintext and non-secret:
+```
+offset  size  field
+0       4     magic "KVSR"
+4       4     effective data format tag
+8       4     pageSize
+12      4     advisory file id
+16      16    fileSalt
+32      4     flags: bit 0 = AES-GCM pages
+36      28    reserved, zero
+```
+A caller-requested `PageSize` or `DisableEncryption` mismatch throws
+`KvasarConfigurationException` without wiping. A deliberate format/`Version` mismatch rebuilds the
+regenerable cache. The superblock KCV, or one authenticating data page when `.kvs` is unreadable,
 distinguishes a wrong master key and throws without wiping.
 
 **Key privacy:** keys live inside the encrypted `.kdat` pages (§5.2), so nothing about a key is
@@ -491,16 +517,19 @@ ms, scaling with index size not data size** (vs. ~15–30 ms to decrypt-scan a 2
   cache; decrypted pages are immutable & GC-managed, so zero-copy results stay valid (§6.3).
 
 ## 8. Durability, recovery & corruption
-- Relaxed by design (regenerable cache). `Flush(false)` = bytes to OS cache (survives app
-  crash); `fsync` on graceful `DisposeAsync`/compaction.
+- Relaxed by design (regenerable cache). `Buffered` is the default and uses the OS page cache with no
+  fsync. `Flushed` fsyncs the active `.kdat`, writes the superblock slot, then fsyncs `.kvs`.
 - **Recovery scan:** adoption strictly authenticates the candidate generation's newly committed page
   window and falls back to the older superblock on failure. Each slot persists its own authentication
   floor, so the same bounded check applies when no older slot survives. A cache rebuild is separately
   best-effort: it skips a page that fails GCM authentication, then resumes only at record starts named
   by authenticated page frames. It never probes continuation bytes.
-- **Corruption** (bad magic/version, global auth failure, unreadable index) ⇒ the adapter
-  (§13) deletes the file set and recreates. A wrong master key is distinct and throws without
-  touching the files. *Isolated* single-record issue ⇒ drop that key, keep the store.
+- **Last-resort adoption:** if no superblock generation is adoptable, current-format `.kdat` pages are
+  authenticated from page 0 upward and the longest authenticating prefix is adopted. The index is
+  rebuilt and `KvasarStats.FallbackRecoveries` increments. If `.kvs` cannot prove the key, at least one
+  AES-GCM page must do so before any file is modified; otherwise open throws `KvasarKeyException`.
+- **Corruption** with no authenticated fallback ⇒ the adapter (§13) may recreate the cache.
+  *Isolated* single-record issue ⇒ drop that key, keep the store.
 
 ## 9. Compaction (segment GC — *not* LSM leveling)
 
@@ -554,22 +583,23 @@ Overwrites and deletes leave dead records; we reclaim them with **Bitcask-style 
 1. Acquire `<base>.lock` (advisory; single-process ⇒ fail-fast on contention).
 2. Missing `.kvs` ⇒ create the fixed five-file store. Validate the superblock and data headers.
 3. Load `.kidx` fast path, else scan-rebuild (§6.5). Compact if triggered.
-`DisposeAsync`: `Flush(fsync:true)`, write `.kidx`, release lock/handles.
+`DisposeAsync`: commit under the configured durability level, then release lock/handles.
 
 ## 11. Versioning
-Data format **2** adds authenticated page framing plus the superblock authentication floor and
-never-reused key-id counter. A format-1 store is rejected and rebuilt as an empty format-2 store,
-exactly like other format mismatches; there is no in-place migration. A wrong encryption key is reported
-before that rebuild and never wipes the format-1 files. Format 1 cannot be selected for new writes.
+Data format **2** added authenticated page framing plus the superblock authentication floor and
+never-reused key-id counter. Data format **3** keeps those slot contents, moves the slots to offsets
+512 and 1024, expands the header to 512 bytes, and defines the data-header encryption flag. A
+format-2 store is rejected and rebuilt as an empty format-3 store after the key is established;
+there is no in-place migration. Format 2 cannot be selected for new writes.
 
 `FormatVersion` (the on-disk format) and `Version` (the caller's own data version — schema,
 serializer, cache generation) fold into the single on-disk `formatVer` tag stamped into every
-segment header; that plus `pageSize`, any mismatch ⇒ wipe & recreate (safe: cache). This mirrors
+segment header; a deliberate tag mismatch ⇒ wipe & recreate (safe: cache). This mirrors
 what the SQLite backend did with its `(version)` row, minus the reserved key.
-An effective current tag equal to the corresponding format-1 tag is rejected before opening files;
+An effective current tag equal to the corresponding format-2 tag is rejected before opening files;
 the slot layout version is selected independently, so a caller-derived tag can never enable legacy writes.
 This is also the migration story **from SQLite** — first launch finds no `.kvs`, starts empty,
-caches repopulate. `.kidx` has its own **layout version 3**, distinct from data format 2; it is always
+caches repopulate. `.kidx` has its own **layout version 3**, distinct from data format 3; it is always
 rebuildable and may be discarded across either version boundary.
 
 ## 12. Error model
@@ -579,6 +609,9 @@ rebuildable and may be discarded across either version boundary.
   the key kept serving data the caller had already replaced, permanently and undetectably (I16). Under
   §Priority a miss costs one upstream lookup while stale data has no downstream defence, so the write
   degrades to a delete rather than to a no-op.
+- Wrong master key ⇒ `KvasarKeyException`; no store file is deleted or rewritten.
+- Existing-store `PageSize` / `DisableEncryption` mismatch ⇒ `KvasarConfigurationException`
+  (an `ArgumentException`); no store file is deleted or rewritten.
 - Unrecoverable state ⇒ a single `KvasarCorruptException` the adapter catches to wipe & recreate.
 
 ## 13. ActualChat integration
@@ -587,7 +620,7 @@ rebuildable and may be discarded across either version boundary.
   `Clear`→`Clear`. `string` keys convert to `KvasarKey` implicitly (UTF-8), and the adapter turns
   `KvasarValue` back into `byte[]` — the store itself stays pure binary. Pass the cache generation
   as `KvasarOptions.Version` (the `(version)` row's replacement) and wrap init in the existing
-  delete-and-retry safety net. Format-1 cache files are rejected and repopulated, not migrated.
+  delete-and-retry safety net. Format-2 cache files are rejected and repopulated, not migrated.
 - `MauiModule` swaps the SQLite-backed cache/KVAS for Kvasar-backed ones; `BasePath` from
   `FileSystem.CacheDirectory & "CCC"` / `AppDataDirectory & "LocalSettings"`; `EncryptionKey`
   from `MauiPreferences.DbEncryptionKey`.
@@ -597,14 +630,14 @@ rebuildable and may be discarded across either version boundary.
 ## 14. Testing
 - **Unit:** get/set/remove/overwrite/list/clear; positional `GetMany`; duplicate-in-batch; miss
   semantics; oversized value; hash-collision path (inject colliding keys).
-- **Encryption:** wrong key ⇒ corrupt (no plaintext leak); tamper a byte ⇒ GCM auth fails.
+- **Encryption:** wrong key ⇒ `KvasarKeyException` without mutation; tamper a byte ⇒ GCM auth fails.
 - **Crash/torn-tail:** truncate `.kdat` mid-record ⇒ recovery drops the tail, earlier data intact;
   interrupted compaction (`.tmp`) recovered on open.
 - **Framed replay:** damage a multi-page record's header page and plant record-shaped continuation
   bytes, including a complete record followed by zero padding to the page end; replay recovers later
   framed starts and never indexes the planted key.
 - **Identity/floor/version rejection:** delete/reinsert under an all-colliding hasher never reuses
-  `KeyId`; predecessorless adoption authenticates from its persisted floor; format-1 fixtures rebuild,
+  `KeyId`; predecessorless adoption authenticates from its persisted floor; format-2 fixtures rebuild,
   while a wrong key throws without wiping.
 - **Concurrency:** N readers + 1 writer ⇒ no torn reads, no lost committed writes.
 - **Property-based:** random op sequences vs. an in-memory `Dictionary` oracle; reopen & re-verify.

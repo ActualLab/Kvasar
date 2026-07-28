@@ -41,7 +41,7 @@ public class SuperblockTests
         var superblock = NewSuperblock();
         var file = await NewFile(superblock);
 
-        file.Length.Should().Be(1088);
+        file.Length.Should().Be(1536);
         Superblock.FileSize.Should().Be(Superblock.HeaderSize + (2 * Superblock.SlotSize));
         var result = await superblock.Read(file);
         result.Status.Should().Be(SuperblockStatus.NoValidSlot);
@@ -146,8 +146,8 @@ public class SuperblockTests
         var file = await NewFile(superblock);
         await superblock.Write(file, NewState(1));
         await superblock.Write(file, NewState(2));
-        file.FlipByte(Superblock.HeaderSize + Superblock.SlotSize - 1);  // slot 0 tag
-        file.FlipByte(Superblock.HeaderSize + Superblock.SlotSize);      // slot 1 nonce
+        file.FlipByte(SlotOffset(0) + Superblock.SlotSize - 1);
+        file.FlipByte(SlotOffset(1));
 
         var result = await superblock.Read(file);
         result.Status.Should().Be(SuperblockStatus.NoValidSlot);
@@ -155,7 +155,7 @@ public class SuperblockTests
     }
 
     [Fact]
-    public async Task TornSlotWriteIsAlwaysRejected()
+    public async Task TornSlotWriteYieldsTheOldStateOrACompleteNewSlot()
     {
         var superblock = NewSuperblock();
         var file = await NewFile(superblock);
@@ -166,15 +166,93 @@ public class SuperblockTests
 
         var scratch = await NewFile(superblock);
         await superblock.Write(scratch, NewState(4)); // slot 0
-        var slot4 = scratch.Snapshot().AsMemory(Superblock.HeaderSize, Superblock.SlotSize);
+        var slot4 = scratch.Snapshot().AsMemory(SlotOffset(0), Superblock.SlotSize);
 
         for (var n = 0; n <= Superblock.SlotSize; n++) {
             file.Restore(pristine);
-            await file.Write(Superblock.HeaderSize, slot4[..n]);
+            await file.Write(SlotOffset(0), slot4[..n]);
             var result = await superblock.Read(file);
-            var expected = n == Superblock.SlotSize ? 4ul : 3ul;
             result.Status.Should().Be(SuperblockStatus.Ok, $"{n} bytes of generation 4 landed");
-            result.Newest!.Value.Generation.Should().Be(expected, $"{n} bytes of generation 4 landed");
+            result.Newest!.Value.Generation.Should().BeOneOf(3ul, 4ul);
+            if (result.Newest.Value.Generation == 4)
+                file.Snapshot().AsSpan(SlotOffset(0), Superblock.SlotSize)
+                    .SequenceEqual(slot4.Span).Should().BeTrue(
+                        $"{n} bytes produced an accepted generation 4 slot");
+        }
+    }
+
+    [Fact]
+    public async Task MatchingStaleTagByteProducesACompleteAcceptedNewSlot()
+    {
+        var superblock = NewSuperblock();
+        var file = await NewFile(superblock);
+        await superblock.Write(file, NewState(1));
+        await superblock.Write(file, NewState(2));
+        await superblock.Write(file, NewState(3));
+        var oldTagByte = file.Snapshot()[SlotOffset(0) + Superblock.SlotSize - 1];
+
+        var scratch = await NewFile(superblock);
+        byte[]? slot4 = null;
+        for (var attempt = 0; attempt < 4096; attempt++) {
+            await superblock.Write(scratch, NewState(4));
+            var candidate = scratch.Snapshot()
+                .AsSpan(SlotOffset(0), Superblock.SlotSize)
+                .ToArray();
+            if (candidate[^1] == oldTagByte) {
+                slot4 = candidate;
+                break;
+            }
+        }
+        slot4.Should().NotBeNull();
+
+        await file.Write(SlotOffset(0), slot4.AsMemory(0, Superblock.SlotSize - 1));
+        var result = await superblock.Read(file);
+        result.Newest!.Value.Generation.Should().Be(4);
+        file.Snapshot().AsSpan(SlotOffset(0), Superblock.SlotSize)
+            .SequenceEqual(slot4).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task EveryOldNewSectorSpliceLeavesAnAdoptableSlot()
+    {
+        const int sectorSize = 512;
+        var superblock = NewSuperblock();
+        var file = await NewFile(superblock);
+        await superblock.Write(file, NewState(1));
+        await superblock.Write(file, NewState(2));
+        var oldBytes = file.Snapshot();
+        await superblock.Write(file, NewState(3));
+        await superblock.Write(file, NewState(4));
+        var newBytes = file.Snapshot();
+
+        for (var sectorOffset = 0; sectorOffset < Superblock.FileSize; sectorOffset += sectorSize) {
+            var sectorLength = Math.Min(sectorSize, Superblock.FileSize - sectorOffset);
+            for (var split = 0; split <= sectorLength; split++) {
+                await AssertSplice(oldBytes, newBytes, sectorOffset, split);
+                await AssertSplice(newBytes, oldBytes, sectorOffset, split);
+            }
+        }
+        return;
+
+        async Task AssertSplice(
+            byte[] prefixSource,
+            byte[] suffixSource,
+            int sectorOffset,
+            int split)
+        {
+            var sectorLength = Math.Min(sectorSize, Superblock.FileSize - sectorOffset);
+            var mixed = oldBytes.ToArray();
+            prefixSource.AsSpan(sectorOffset, split).CopyTo(mixed.AsSpan(sectorOffset));
+            suffixSource.AsSpan(sectorOffset + split, sectorLength - split)
+                .CopyTo(mixed.AsSpan(sectorOffset + split));
+            file.Restore(mixed);
+
+            var result = await superblock.Read(file);
+            result.Status.Should().Be(
+                SuperblockStatus.Ok,
+                $"sector {sectorOffset / sectorSize}, split {split}, "
+                + $"{ReferenceEquals(prefixSource, oldBytes)} old-prefix");
+            result.Newest!.Value.Generation.Should().BeOneOf(1ul, 2ul, 3ul, 4ul);
         }
     }
 
@@ -385,7 +463,7 @@ public class SuperblockTests
         before.AsSpan(0, Math.Min(before.Length, padded.Length)).CopyTo(padded);
         var result = new List<int>();
         for (var slot = 0; slot < Superblock.SlotCount; slot++) {
-            var offset = Superblock.HeaderSize + (slot * Superblock.SlotSize);
+            var offset = SlotOffset(slot);
             if (offset + Superblock.SlotSize > padded.Length)
                 continue;
             if (!padded.AsSpan(offset, Superblock.SlotSize).SequenceEqual(after.AsSpan(offset, Superblock.SlotSize)))
@@ -393,6 +471,9 @@ public class SuperblockTests
         }
         return result;
     }
+
+    private static int SlotOffset(int slot)
+        => Superblock.HeaderSize + (slot * Superblock.SlotSize);
 
     // Nested types
 

@@ -13,14 +13,14 @@ public enum SuperblockStatus
 {
     // At least one slot authenticated; States holds the candidates, newest first.
     Ok = 0,
-    // No superblock file yet: create the store.
+    // No readable superblock file: inspect current-format data before deciding this is a new store.
     Missing,
-    // Not a Kvasar superblock, or a different formatVer: wipe and recreate (this is how a
-    // KvasarOptions.Version bump takes effect).
+    // Not a Kvasar superblock, or a different formatVer: current-format data distinguishes damage
+    // from a deliberate KvasarOptions.Version bump.
     FormatMismatch,
     // A recognized format, but neither its KCV nor any compatible slot authenticates: throw, never wipe.
     WrongKey,
-    // The current KCV authenticates, but neither slot does: genuine corruption, wipe and rebuild.
+    // The current KCV authenticates, but neither slot does: recover from authenticated data.
     NoValidSlot,
 }
 
@@ -50,15 +50,15 @@ public readonly record struct SuperblockReadResult(SuperblockStatus Status, Supe
     public SuperblockState? Newest => States.Length == 0 ? null : States[0];
 }
 
-// File layout: [64B header][512B slot 0][512B slot 1] = 1088 bytes.
+// File layout: [512B header][512B slot 0][512B slot 1] = 1536 bytes.
 //
-// Header — written once, by Initialize, and never rewritten:
+// Header — written by Initialize at creation or last-resort recovery, never by an ordinary commit:
 //   off size field
 //    0    4  Magic       "KSUP"
 //    4    4  FormatVer   uint
 //    8   12  KcvNonce    random, fixed for the life of the file
 //   20   16  KcvTag      AES-GCM tag over the fixed KcvPlaintext constant, AAD = formatVer(4 LE)
-//   36   28  Reserved    zero
+//   36  476  Reserved    zero
 //
 // Slot — written alternately, slot = generation mod 2:
 //   off size field
@@ -86,17 +86,17 @@ public readonly record struct SuperblockReadResult(SuperblockStatus Status, Supe
 /// <summary>
 /// The <c>&lt;base&gt;.kvs</c> commit record: a key check value in the header, then two 512-byte slots
 /// written alternately, each independently authenticated. A torn or tampered slot is simply "not a
-/// valid slot" and never an exception, which is what lets the superblock skip fsync entirely
-/// (<c>docs/DESIGN-Durability.md</c> §3.1, §5). <see cref="Initialize"/> creates the file; the first
-/// <see cref="Write"/> assumes it already exists.
+/// valid slot" and never an exception. <see cref="Initialize"/> creates the file; the first
+/// <see cref="Write"/> assumes it already exists (<c>docs/DESIGN-Durability.md</c> §3.1, §5).
 /// </summary>
 public sealed class Superblock : IDisposable
 {
-    public const int HeaderSize = 64;
+    public const int HeaderSize = 512;
     public const int SlotSize = 512;
     public const int SlotCount = 2;
     public const int FileSize = HeaderSize + (SlotSize * SlotCount);
 
+    private const int PreviousHeaderSize = 64;
     private const int MagicOffset = 0;
     private const int FormatVerOffset = 4;
     private const int KcvNonceOffset = 8;
@@ -124,6 +124,7 @@ public sealed class Superblock : IDisposable
     private readonly uint _formatVer;
     private readonly uint _previousFormatVer;
     private readonly uint _slotLayoutVersion;
+    private readonly int _headerSize;
 
     public Superblock(
         ReadOnlySpan<byte> masterKey,
@@ -148,23 +149,25 @@ public sealed class Superblock : IDisposable
         _formatVer = formatVer;
         _previousFormatVer = previousFormatVer;
         _slotLayoutVersion = slotLayoutVersion;
+        _headerSize = HeaderSizeFor(slotLayoutVersion);
     }
 
     public void Dispose()
         => CryptographicOperations.ZeroMemory(_key);
 
-    public ValueTask Initialize(IStorageFile file)
+    public async ValueTask Initialize(IStorageFile file)
     {
-        // Both slots are left zeroed, so a store killed between creation and its first commit reads
-        // back as NoValidSlot — an empty store, which is what wipe-and-rebuild would produce anyway.
-        var buffer = new byte[FileSize];
-        var header = buffer.AsSpan(0, HeaderSize);
+        // Both slots are left zeroed, so a store killed between initialization and its first commit
+        // returns to the data-prefix fallback or an empty new store.
+        var buffer = new byte[_headerSize + (SlotSize * SlotCount)];
+        var header = buffer.AsSpan(0, _headerSize);
         KvasarConstants.KSupMagic.CopyTo(header[MagicOffset..]);
         BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(FormatVerOffset, 4), _formatVer);
         var kcvNonce = header.Slice(KcvNonceOffset, KvasarConstants.GcmNonceSize);
         RandomNumberGenerator.Fill(kcvNonce);
         ComputeKcvTag(kcvNonce, header.Slice(KcvTagOffset, KvasarConstants.GcmTagSize), _formatVer);
-        return file.Write(0, buffer);
+        await file.Truncate(0).ConfigureAwait(false);
+        await file.Write(0, buffer).ConfigureAwait(false);
     }
 
     public ValueTask<SuperblockReadResult> Read(
@@ -188,7 +191,7 @@ public sealed class Superblock : IDisposable
         var slot = (int)(state.Generation % SlotCount);
         var buffer = new byte[SlotSize];
         FormatSlot(buffer, state);
-        return file.Write(SlotOffset(slot), buffer);
+        return file.Write(SlotOffset(slot, _slotLayoutVersion), buffer);
     }
 
     // Private methods
@@ -255,10 +258,10 @@ public sealed class Superblock : IDisposable
     {
         if (file.Length == 0)
             return (SuperblockStatus.Missing, null);
-        if (file.Length < HeaderSize)
+        if (file.Length < PreviousHeaderSize)
             return (SuperblockStatus.FormatMismatch, null);
 
-        var header = new byte[HeaderSize];
+        var header = new byte[PreviousHeaderSize];
         if (!await file.TryReadExact(0, header, cancellationToken).ConfigureAwait(false))
             return (SuperblockStatus.FormatMismatch, null);
 
@@ -305,7 +308,7 @@ public sealed class Superblock : IDisposable
         return s0.Generation > s1.Generation ? [s0, s1] : [s1, s0];
 
         async ValueTask<SuperblockState?> ReadSlot(int slot) {
-            var offset = SlotOffset(slot);
+            var offset = SlotOffset(slot, slotLayoutVersion);
             if (file.Length < offset + SlotSize)
                 return null;
 
@@ -358,7 +361,7 @@ public sealed class Superblock : IDisposable
         var dataAuthenticationFloor =
             BinaryPrimitives.ReadInt64LittleEndian(plain.Slice(DataAuthenticationFloorOffset, 8));
         var nextKeyId = BinaryPrimitives.ReadUInt64LittleEndian(plain.Slice(NextKeyIdOffset, 8));
-        if (slotLayoutVersion == KvasarConstants.PreviousDataFormatVersion) {
+        if (slotLayoutVersion < KvasarConstants.PreviousDataFormatVersion) {
             dataAuthenticationFloor = KvasarConstants.SegmentHeaderSize;
             nextKeyId = 1;
         }
@@ -396,7 +399,7 @@ public sealed class Superblock : IDisposable
         BinaryPrimitives.WriteInt64LittleEndian(plain.Slice(IndexCommitLengthOffset, 8), state.IndexCommitLength);
         BinaryPrimitives.WriteInt64LittleEndian(plain.Slice(LiveBytesOffset, 8), state.LiveBytes);
         BinaryPrimitives.WriteInt64LittleEndian(plain.Slice(DeadBytesOffset, 8), state.DeadBytes);
-        if (_slotLayoutVersion == KvasarConstants.DataFormatVersion) {
+        if (_slotLayoutVersion >= KvasarConstants.PreviousDataFormatVersion) {
             BinaryPrimitives.WriteInt64LittleEndian(
                 plain.Slice(DataAuthenticationFloorOffset, 8), state.DataAuthenticationFloor);
             BinaryPrimitives.WriteUInt64LittleEndian(plain.Slice(NextKeyIdOffset, 8), state.NextKeyId);
@@ -413,6 +416,11 @@ public sealed class Superblock : IDisposable
             aad);
     }
 
-    private static long SlotOffset(int slot)
-        => HeaderSize + ((long)slot * SlotSize);
+    private static long SlotOffset(int slot, uint slotLayoutVersion)
+        => HeaderSizeFor(slotLayoutVersion) + ((long)slot * SlotSize);
+
+    private static int HeaderSizeFor(uint slotLayoutVersion)
+        => slotLayoutVersion >= KvasarConstants.DataFormatVersion
+            ? HeaderSize
+            : PreviousHeaderSize;
 }

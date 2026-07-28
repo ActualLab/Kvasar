@@ -28,9 +28,10 @@ public sealed class CrashSignalException : Exception
 /// </summary>
 public sealed record CrashHarnessOptions
 {
-    public static readonly CrashMode[] AllModes = [CrashMode.LoseAll, CrashMode.Torn, CrashMode.Reorder];
+    public static readonly CrashMode[] AllModes = Enum.GetValues<CrashMode>();
+    public static readonly CrashMode[] DefaultModes = [CrashMode.LoseAll, CrashMode.Torn, CrashMode.Reorder];
 
-    public IReadOnlyList<CrashMode> Modes { get; init; } = AllModes;
+    public IReadOnlyList<CrashMode> Modes { get; init; } = DefaultModes;
     public int SeedCount { get; init; } = 3;
     public bool MustTestProcessKill { get; init; } = true;
     public int MaxCases { get; init; } = 3000;
@@ -40,7 +41,11 @@ public sealed record CrashHarnessOptions
 /// What a <see cref="CrashHarness"/> run actually executed. <see cref="CaseCount"/> is the number that
 /// matters: a harness silently degenerating to a handful of cases is the failure mode to watch for.
 /// </summary>
-public sealed record CrashHarnessReport(int CaseCount, int CrashPointCount, int OperationCount);
+public sealed record CrashHarnessReport(
+    int CaseCount,
+    int CrashPointCount,
+    int OperationCount,
+    int VariantCount);
 
 /// <summary>
 /// One execution of a workload against a fake device: the <see cref="IStorageBackend"/> to use, a place
@@ -94,6 +99,7 @@ public sealed class CrashOutcome<TNote>(
     public CrashMode? Mode { get; } = mode;
     public int Seed { get; } = seed;
     public bool IsProcessKill => Mode is null;
+    public bool HasFsyncFailure { get; internal set; }
 
     public override string ToString()
         => $"crashPoint={CrashPoint}, mode={ModeName}, seed={Seed}";
@@ -128,7 +134,11 @@ public static class CrashHarness
             foreach (var (mode, seed) in variants)
                 await RunCase(workload, verify, crashPoint, mode, seed, wasArmed).ConfigureAwait(false);
 
-        return new CrashHarnessReport(crashPoints.Count * variants.Count, crashPoints.Count, operationCount);
+        return new CrashHarnessReport(
+            crashPoints.Count * variants.Count,
+            crashPoints.Count,
+            operationCount,
+            variants.Count);
     }
 
     public static async Task RunCase<TNote>(
@@ -171,6 +181,7 @@ public static class CrashHarness
             if (!controller.IsCrashed)
                 throw new InvalidOperationException("The workload ended before reaching its crash point.");
 
+            outcome.HasFsyncFailure = controller.HasFsyncFailure;
             await verify(outcome).ConfigureAwait(false);
         }
         catch (Exception e) {
@@ -198,7 +209,9 @@ public static class CrashHarness
             variants.Add((null, 0));
         foreach (var mode in options.Modes) {
             // LoseAll drops every volatile write unconditionally, so extra seeds would repeat one case.
-            var seedCount = mode == CrashMode.LoseAll ? 1 : Math.Max(1, options.SeedCount);
+            var seedCount = mode is CrashMode.LoseAll or CrashMode.LyingFsync or CrashMode.FailingFsync
+                ? 1
+                : Math.Max(1, options.SeedCount);
             for (var seed = 0; seed < seedCount; seed++)
                 variants.Add((mode, seed));
         }
@@ -239,6 +252,7 @@ internal sealed class CrashController
     private int _count;
 
     public bool IsCrashed { get; private set; }
+    public bool HasFsyncFailure { get; private set; }
     public bool WasArmed { get; private set; }
     public int Count => _count;
 
@@ -267,13 +281,35 @@ internal sealed class CrashController
             throw new CrashSignalException();
     }
 
+    public void PrepareFlushToDisk()
+    {
+        if (!_isArmed || _count + 1 != _crashPoint)
+            return;
+        if (_mode is CrashMode.LyingFsync or CrashMode.FailingFsync)
+            _backend.FlushFaultMode = _mode;
+    }
+
+    public bool IsSelectedFailingFsync()
+        => _isArmed && _count + 1 == _crashPoint && _mode == CrashMode.FailingFsync;
+
+    public void OnFlushToDiskFailure(IOException error)
+    {
+        _count++;
+        _backend.FlushFaultMode = null;
+        _backend.PowerLoss(CrashMode.FailingFsync, _seed);
+        HasFsyncFailure = true;
+        IsCrashed = true;
+        throw new CrashSignalException("FlushToDisk failed at the selected crash point.", error);
+    }
+
     public void OnOperation()
     {
         if (!_isArmed || ++_count != _crashPoint)
             return;
 
+        _backend.FlushFaultMode = null;
         if (_mode is { } crashMode)
-            _backend.Crash(crashMode, _seed);
+            _backend.PowerLoss(crashMode, _seed);
         else
             _backend.ProcessKill();
         IsCrashed = true;
@@ -326,7 +362,16 @@ internal sealed class CrashStorageFile(IStorageFile file, CrashController contro
     public async ValueTask FlushToDisk()
     {
         controller.ThrowIfCrashed();
-        await file.FlushToDisk().ConfigureAwait(false);
+        controller.PrepareFlushToDisk();
+        try {
+            await file.FlushToDisk().ConfigureAwait(false);
+        }
+        catch (IOException e) {
+            if (!controller.IsSelectedFailingFsync())
+                throw;
+
+            controller.OnFlushToDiskFailure(e);
+        }
         controller.OnOperation();
     }
 

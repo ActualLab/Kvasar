@@ -65,7 +65,8 @@ public sealed class PagedFile : IAsyncDisposable
             throw new ArgumentOutOfRangeException(nameof(pageSize));
 
         try {
-            var header = new SegmentHeader(formatVer, pageSize, fileId);
+            var flags = cipherFactory.Overhead == 0 ? 0u : KvasarConstants.EncryptedDataFileFlag;
+            var header = new SegmentHeader(formatVer, pageSize, fileId, flags);
             await WriteHeader(file, header).ConfigureAwait(false);
             return new PagedFile(file, cipherFactory, cache, header, 0, KvasarConstants.SegmentHeaderSize);
         }
@@ -340,7 +341,8 @@ public sealed class PagedFile : IAsyncDisposable
         if (fileId != oldIncarnation.FileId)
             _cache.DropSegment(fileId);
 
-        var header = new SegmentHeader(_formatVer, PageSize, fileId);
+        var flags = _cipherFactory.Overhead == 0 ? 0u : KvasarConstants.EncryptedDataFileFlag;
+        var header = new SegmentHeader(_formatVer, PageSize, fileId, flags);
         await WriteHeader(_file, header).ConfigureAwait(false);
         ResumePageId = 0;
         Volatile.Write(ref _flushedPageCount, 0);
@@ -364,6 +366,12 @@ public sealed class PagedFile : IAsyncDisposable
             throw new KvasarCorruptException("Data file page size is out of range.");
         if (expectedPageSize > 0 && header.PageSize != expectedPageSize)
             throw new KvasarCorruptException("Data file page size does not match the store's.");
+        if ((header.Flags & ~KvasarConstants.EncryptedDataFileFlag) != 0)
+            throw new KvasarCorruptException("Data file flags are invalid.");
+        var isEncrypted = (header.Flags & KvasarConstants.EncryptedDataFileFlag) != 0;
+        if (isEncrypted != (cipherFactory.Overhead != 0))
+            throw new KvasarConfigurationException(
+                "DisableEncryption does not match the existing store.");
 
         var onDiskPageSize = header.PageSize + cipherFactory.Overhead;
         var bodyLength = Math.Max(0, file.Length - KvasarConstants.SegmentHeaderSize);

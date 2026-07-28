@@ -134,9 +134,10 @@ public sealed class FormatRevisionTests : IDisposable
         CorruptSuperblockSlot((int)(older.Generation % Superblock.SlotCount));
 
         await using var reopened = await KvasarStore.Open(options);
-        (await reopened.Get("first")).Should().BeNull();
+        (await reopened.Get("first"))!.Value.AsString.Should().Be("value-1");
         (await reopened.Get("second")).Should().BeNull();
-        reopened.Stats.Entries.Should().Be(0);
+        reopened.Stats.Entries.Should().Be(1);
+        reopened.Stats.FallbackRecoveries.Should().Be(1);
     }
 
     [Fact]
@@ -211,10 +212,10 @@ public sealed class FormatRevisionTests : IDisposable
     }
 
     [Fact]
-    public async Task VersionedFormatOneIsRejectedForNewWrites()
+    public async Task VersionedPreviousFormatIsRejectedForNewWrites()
     {
         var options = Options() with {
-            FormatVersion = "1",
+            FormatVersion = "2",
             Version = "app-v3",
         };
 
@@ -225,7 +226,7 @@ public sealed class FormatRevisionTests : IDisposable
     }
 
     [Fact]
-    public async Task CorruptCurrentFormatTagThatLooksPreRevisionRebuilds()
+    public async Task CorruptCurrentFormatTagThatLooksPreRevisionRecoversFromData()
     {
         var options = Options();
         await using (var store = await KvasarStore.Open(options)) {
@@ -235,8 +236,9 @@ public sealed class FormatRevisionTests : IDisposable
         CorruptCurrentFormatVersionToPrevious();
 
         await using var reopened = await KvasarStore.Open(options);
-        (await reopened.Get("before")).Should().BeNull();
-        reopened.Stats.Entries.Should().Be(0);
+        (await reopened.Get("before"))!.Value.AsString.Should().Be("value");
+        reopened.Stats.Entries.Should().Be(1);
+        reopened.Stats.FallbackRecoveries.Should().Be(1);
         (await ReadFormatVersion()).Should().Be(KvasarConstants.DataFormatVersion);
     }
 

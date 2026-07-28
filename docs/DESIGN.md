@@ -32,6 +32,17 @@ layers work in the logical stream formed by concatenating the remaining
 header, times `PageSize+Overhead`) is **private to the paging layer**. `Locator.Offset` is such a
 logical offset. This keeps records independent of the on-disk header size and of `Overhead`.
 
+The data-format-3 superblock `<base>.kvs` is exactly 1536 bytes:
+```
+offset  size  field
+0       36    magic, format tag, KCV nonce and KCV tag
+36      476   reserved, zero
+512     512   authenticated commit slot 0
+1024    512   authenticated commit slot 1
+```
+Slot contents are unchanged from data format 2. The 512-byte header sector separates the two slot
+sectors, so one torn sector cannot damage both.
+
 ### Zero-copy read path
 Decrypted pages are cached as immutable `byte[]`. A value that fits within a single page is returned
 as a `ReadOnlyMemory<byte>` **slice into the cached page buffer** — no copy. Cache eviction just
@@ -84,7 +95,8 @@ Implements the three crypto interfaces + factories + default singletons.
 
 ### M2 — Paging / Layer 1 (`Paging/`)
 - `SegmentHeader` formats and validates the 64-byte plaintext header: magic, data format, page size,
-  file salt, and flags.
+  file salt, and flags. Data format 3 defines flag bit 0 as AES-GCM pages; every other bit is zero.
+  A requested encryption mode that disagrees with this flag is a configuration error, not corruption.
 - `PageCache` stores immutable decrypted `PageSize`-byte pages by the store-assigned
   `(fileId, pageId)` incarnation key.
 - `PagedFile` owns one fixed `.N.kdat` slot. Its physical page mapping is
@@ -137,7 +149,7 @@ Publication remains a release write of the packed locator; readers take a single
 acquire-read the locator. Resize is copy-on-write.
 
 ### M5 — Index persistence `.kidx` (`Index/`)
-The index layout version remains independently versioned at **3**. Data format 2 does not change it.
+The index layout version remains independently versioned at **3**. Data format 3 does not change it.
 Each persisted `IndexEntry` is exactly 32 bytes:
 ```
 offset  size  field
@@ -158,6 +170,10 @@ Invalid, stale, absent, or unauthenticated index data is discarded and rebuilt f
 - Resolving option defaults (`Hasher ??= KeyHashers.SipHash24`, `Kdf ??= KeyDerivations.HkdfSha256`).
 - Lock file, open/lifecycle, Get/GetMany/Set/SetMany/Scan/Clear/Flush/Compact/DisposeAsync, Stats.
 - Wiring the background compactor.
+- Normal open adopts authenticated superblock generations only. If none is adoptable, the last-resort
+  path proves the key with a current-format `.kdat` page, adopts the longest contiguous authenticating
+  prefix, rebuilds the index, rewrites the superblock, and records `KvasarStats.FallbackRecoveries`.
+  A wrong key or caller-requested page/encryption geometry mismatch must escape without reaching wipe.
 
 ## Async I/O model
 

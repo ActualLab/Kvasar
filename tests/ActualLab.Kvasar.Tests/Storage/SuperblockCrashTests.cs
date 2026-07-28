@@ -58,6 +58,22 @@ public class SuperblockCrashTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public async Task TwoUnflushedSlotOverwritesCannotInvalidateBothDeviceSlots()
+    {
+        var report = await CrashHarness.Run<SuperblockEvent>(
+            WriteTwoUnflushedSlotOverwrites,
+            VerifyADeviceSlotSurvives,
+            new CrashHarnessOptions {
+                Modes = [CrashMode.Torn],
+                SeedCount = 64,
+                MustTestProcessKill = false,
+            });
+
+        output.WriteLine($"{report}");
+        report.CaseCount.Should().Be(128);
+    }
+
+    [Fact]
     public async Task WrongKeyIsStillWrongKeyAfterAnyCrash()
     {
         // Corruption and a wrong key must never be confusable: one wipes the store, the other must not.
@@ -90,6 +106,31 @@ public class SuperblockCrashTests(ITestOutputHelper output)
             run.Note(SuperblockEvent.Flushed);
             await file.FlushToDisk();
         }
+    }
+
+    private static async Task WriteTwoUnflushedSlotOverwrites(CrashRun<SuperblockEvent> run)
+    {
+        var superblock = NewSuperblock();
+        await using var file = await run.Storage.Open(Path);
+        await superblock.Initialize(file);
+        await superblock.Write(file, NewState(1));
+        await superblock.Write(file, NewState(2));
+        await file.FlushToDisk();
+        run.ArmCrashPoints();
+
+        run.Note(SuperblockEvent.Wrote(NewState(3)));
+        await superblock.Write(file, NewState(3));
+        run.Note(SuperblockEvent.Wrote(NewState(4)));
+        await superblock.Write(file, NewState(4));
+    }
+
+    private static async Task VerifyADeviceSlotSurvives(CrashOutcome<SuperblockEvent> outcome)
+    {
+        var result = await Read(outcome, MasterKey);
+        result.Status.Should().Be(
+            SuperblockStatus.Ok,
+            "the device held two valid slots before the un-fsynced overwrites, so one must remain adoptable");
+        result.States.Should().NotBeEmpty();
     }
 
     private static async Task VerifyRecoveredState(CrashOutcome<SuperblockEvent> outcome)

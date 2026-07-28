@@ -10,7 +10,7 @@ using ActualLab.Kvasar.Tests.Storage;
 namespace ActualLab.Kvasar.Tests.Store;
 
 /// <summary>
-/// Regression tests for review findings against the v2 (superblock) store. Where the redesign made a
+/// Regression tests for review findings against the superblock store. Where the redesign made a
 /// defect unrepresentable, the test pins the structural property that prevents it.
 /// </summary>
 public sealed class ReviewRegressionTests : IDisposable
@@ -980,6 +980,152 @@ public sealed class ReviewRegressionTests : IDisposable
             + "to the intact older one, rather than adopting it unvalidated and serving misses");
     }
 
+    [Fact]
+    public async Task WrongKeyWithAnUnreadableSuperblockNeverWipesAuthenticData()
+    {
+        const int count = 30;
+        var options = Options();
+        await using (var store = await KvasarStore.Open(options)) {
+            for (var i = 0; i < count; i++)
+                await store.Set(K(i), V(i, 200));
+            await store.Flush();
+        }
+        var paths = new[] { KvsPath, DataPath(0), DataPath(1), IndexPath(0), IndexPath(1) };
+        var snapshots = paths.ToDictionary(x => x, File.ReadAllBytes);
+        var wrongKey = Enumerable.Range(101, 32).Select(x => (byte)x).ToArray();
+        var cases = new (string Name, Action Damage)[] {
+            ("deleted", () => File.Delete(KvsPath)),
+            ("empty", () => File.WriteAllBytes(KvsPath, [])),
+            ("bad magic", () => FlipFileByte(KvsPath, 0)),
+        };
+
+        foreach (var testCase in cases) {
+            foreach (var path in paths)
+                File.WriteAllBytes(path, snapshots[path]);
+            testCase.Damage();
+            var filesBefore = paths.ToDictionary(
+                x => x,
+                x => File.Exists(x) ? File.ReadAllBytes(x) : null);
+
+            var open = async () => {
+                await using var store = await KvasarStore.Open(options with { EncryptionKey = wrongKey });
+            };
+            await open.Should().ThrowAsync<KvasarKeyException>(testCase.Name);
+            foreach (var (path, bytes) in filesBefore) {
+                File.Exists(path).Should().Be(bytes is not null, testCase.Name);
+                if (bytes is not null)
+                    File.ReadAllBytes(path).Should().Equal(bytes, testCase.Name);
+            }
+
+            await using var recovered = await KvasarStore.Open(options);
+            for (var i = 0; i < count; i++)
+                (await recovered.Get(K(i))).Should().NotBeNull($"{testCase.Name}, key {i}");
+        }
+    }
+
+    [Fact]
+    public async Task FlushedCommitFlushesTheSuperblockAfterWritingItsSlot()
+    {
+        var backend = new FakeStorageBackend();
+        var options = Options() with {
+            StorageBackend = backend,
+            Durability = KvasarDurability.Flushed,
+        };
+        await using var store = await KvasarStore.Open(options);
+        backend.ResetFlushCounts();
+
+        await store.Set(K(1), V(1, 200));
+
+        backend.GetFlushCount(KvsPath).Should().Be(1);
+        (backend.GetFlushCount(DataPath(0)) + backend.GetFlushCount(DataPath(1)))
+            .Should().BeGreaterThan(0);
+    }
+
+    [Fact]
+    public async Task ExplicitPageSizeMismatchIsRejectedWithoutWiping()
+    {
+        var options = Options();
+        await using (var store = await KvasarStore.Open(options)) {
+            await store.Set(K(1), V(1, 200));
+            await store.Flush();
+        }
+        var snapshots = DataPaths().ToDictionary(x => x, File.ReadAllBytes);
+
+        var open = async () => {
+            await using var store = await KvasarStore.Open(options with { PageSize = PageSize * 2 });
+        };
+        await open.Should().ThrowAsync<ArgumentException>();
+        foreach (var (path, bytes) in snapshots)
+            File.ReadAllBytes(path).Should().Equal(bytes);
+
+        await using var recovered = await KvasarStore.Open(options);
+        (await recovered.Get(K(1))).Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task EncryptionModeMismatchIsRejectedWithoutWiping()
+    {
+        var options = Options();
+        await using (var store = await KvasarStore.Open(options)) {
+            await store.Set(K(1), V(1, 200));
+            await store.Flush();
+        }
+        var snapshots = DataPaths().ToDictionary(x => x, File.ReadAllBytes);
+
+        var open = async () => {
+            await using var store = await KvasarStore.Open(options with { DisableEncryption = true });
+        };
+        await open.Should().ThrowAsync<ArgumentException>();
+        foreach (var (path, bytes) in snapshots)
+            File.ReadAllBytes(path).Should().Equal(bytes);
+
+        await using var recovered = await KvasarStore.Open(options);
+        (await recovered.Get(K(1))).Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task ExhaustedKeyIdentityInAdvisoryIndexFallsBackToReplay()
+    {
+        const int count = 20;
+        var options = Options();
+        await using (var store = await KvasarStore.Open(options)) {
+            for (var i = 0; i < count; i++)
+                await store.Set(K(i), V(i, 200));
+            await store.Flush();
+        }
+
+        var state = await ReadSuperblock();
+        var snapshot = await ReadIndex(state.IndexSlot, state.IndexCommitLength, state.Generation);
+        var entries = snapshot!.Value.Entries;
+        entries[0].KeyId = ulong.MaxValue;
+        var indexKey = new byte[KvasarConstants.IndexMacKeySize];
+        KeyDerivations.HkdfSha256.Derive(_key, [], KvasarConstants.IndexMacKeyInfo, indexKey);
+        long indexLength;
+        await using (var index = await IndexLog.Open(
+            await FileStorageBackend.Instance.Open(IndexPath(state.IndexSlot)),
+            FormatVer,
+            indexKey)) {
+            indexLength = await index.WriteCheckpoint(entries, snapshot.Value.DataCommitLength);
+            await index.WriteCommitMac(state.Generation + 1);
+            await index.WriteCommitMac(state.Generation + 2);
+        }
+        await using (var file = await FileStorageBackend.Instance.Open(KvsPath)) {
+            using var superblock = new Superblock(_key, FormatVer);
+            await superblock.Write(file, state with {
+                Generation = state.Generation + 1,
+                IndexCommitLength = indexLength,
+            });
+            await superblock.Write(file, state with {
+                Generation = state.Generation + 2,
+                IndexCommitLength = indexLength,
+            });
+        }
+
+        await using var recovered = await KvasarStore.Open(options);
+        for (var i = 0; i < count; i++)
+            (await recovered.Get(K(i))).Should().NotBeNull($"key {i}");
+    }
+
     // Private methods
 
     private string BasePath => Path.Combine(_dir, "store");
@@ -1070,6 +1216,15 @@ public sealed class ReviewRegressionTests : IDisposable
     {
         using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.None);
         fs.Write(bytes);
+    }
+
+    private static void FlipFileByte(string path, long offset)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        fs.Position = offset;
+        var value = fs.ReadByte();
+        fs.Position--;
+        fs.WriteByte((byte)(value ^ 0x80));
     }
 
     private static void Truncate(string path, long length)
