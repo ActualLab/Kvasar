@@ -238,7 +238,7 @@ public sealed class PagedFile : IAsyncDisposable
                 return;
 
             var byteLength = count * _onDiskPageSize;
-            var buffer = ArrayPool<byte>.Shared.Rent(byteLength);
+            var buffer = ArrayPools.SharedBytePool.Rent(byteLength);
             try {
                 await _file.ReadExact(PagePosition(firstPageId), buffer.AsMemory(0, byteLength), cancellationToken)
                     .ConfigureAwait(false);
@@ -255,7 +255,7 @@ public sealed class PagedFile : IAsyncDisposable
                 }
             }
             finally {
-                ArrayPool<byte>.Shared.Return(buffer);
+                ArrayPools.SharedBytePool.Return(buffer);
             }
         }
         catch (OperationCanceledException) {
@@ -414,7 +414,7 @@ public sealed class PagedFile : IAsyncDisposable
         Incarnation inc, long pageId, CancellationToken cancellationToken)
     {
         var filePos = PagePosition(pageId);
-        var onDisk = ArrayPool<byte>.Shared.Rent(_onDiskPageSize);
+        var onDisk = ArrayPools.SharedBytePool.Rent(_onDiskPageSize);
         try {
             await _file.ReadExact(filePos, onDisk.AsMemory(0, _onDiskPageSize), cancellationToken)
                 .ConfigureAwait(false);
@@ -423,7 +423,7 @@ public sealed class PagedFile : IAsyncDisposable
             return page;
         }
         finally {
-            ArrayPool<byte>.Shared.Return(onDisk);
+            ArrayPools.SharedBytePool.Return(onDisk);
         }
     }
 

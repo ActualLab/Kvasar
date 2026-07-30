@@ -524,7 +524,7 @@ public sealed class DataLog : IAsyncDisposable
         if (st.TailFill > 0)
             await SealTail(st).ConfigureAwait(false);
         var offset = st.File.PageCount * _pagePayloadSize;
-        var buf = ArrayPool<byte>.Shared.Rent(recordLength);
+        var buf = ArrayPools.SharedBytePool.Rent(recordLength);
         try {
             RecordCodec.Encode(buf, flags, valueKind, key.Span, value.Span, isTombstone);
             var pos = 0;
@@ -552,7 +552,7 @@ public sealed class DataLog : IAsyncDisposable
             PublishTail(st);
         }
         finally {
-            ArrayPool<byte>.Shared.Return(buf, clearArray: true);
+            ArrayPools.SharedBytePool.Return(buf, clearArray: true);
         }
         st.LiveBytes += recordLength;
         return new Locator(FileIdOf(st.Slot), offset);
@@ -583,7 +583,7 @@ public sealed class DataLog : IAsyncDisposable
         bool isContinuation,
         int firstRecordOffset)
     {
-        var page = ArrayPool<byte>.Shared.Rent(_pageSize);
+        var page = ArrayPools.SharedBytePool.Rent(_pageSize);
         try {
             var framed = page.AsMemory(0, _pageSize);
             framed.Span.Clear();
@@ -592,7 +592,7 @@ public sealed class DataLog : IAsyncDisposable
             await st.File.AppendPage(framed).ConfigureAwait(false);
         }
         finally {
-            ArrayPool<byte>.Shared.Return(page, clearArray: true);
+            ArrayPools.SharedBytePool.Return(page, clearArray: true);
         }
     }
 
