@@ -445,10 +445,15 @@ IndexEntry (fixed 32 B, [StructLayout(Sequential, Pack=8, Size=32)]):
   length        : u32  — encoded record length
   flags         : u8   — tombstone, etc.; remaining 3 bytes are padding
 ```
-The `.kidx` v3 header records `magic/formatVer`, entry-layout version, the **data high-water-mark
+The `.kidx` v4 header records `magic/formatVer`, entry-layout version, the **data high-water-mark
 (HWM)** the file is consistent up to, and two generation-parity HMAC-SHA256/128 tags. Each tag commits
 the active `.kdat` incarnation's `fileSalt`, the stable header fields, the checkpoint region, and the
 committed delta range named by its superblock generation.
+
+The tag is **block-chained**: the body is cut into fixed 16 KiB blocks, each block's one-shot HMAC
+covering the previous block's chain value, and the tag closes over the open trailing block. Committing
+therefore hashes at most one block regardless of index size, and nothing ever peeks a running digest —
+which Android's `Mac` cannot do. See DESIGN.md § M5.
 
 **Startup read:**
 1. Validate `.kidx` header and authenticate the superblock-named prefix. An old layout or MAC failure
@@ -473,7 +478,7 @@ ms, scaling with index size not data size** (vs. ~15–30 ms to decrypt-scan a 2
   (offsets change ⇒ index rewritten anyway).
 - **Consistency:** write data → write the `.kidx` delta and committed-prefix MAC → publish the
   superblock. The index still needs **no fsync of its own**: a lost prefix or tag fails authentication
-  and triggers data replay.
+  and triggers data replay. The MAC costs one bounded HMAC per commit, not one per stored byte.
 
 **[DECISION]** checkpoint form: blittable full array (fastest load, ~43 % empty-slot waste,
 *recommended* for startup) vs compact live-list (smaller read, re-insert on load).

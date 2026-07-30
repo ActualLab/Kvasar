@@ -351,10 +351,14 @@ instead of O(log). It is outside the durability story, but not outside the authe
 - **It is never flushed.** Not per commit, not ever.
 - **Its committed prefix is authenticated.** The header carries two HMAC-SHA256/128 tags, selected by
   superblock-generation parity, over the stable header fields plus the checkpoint and committed delta
-  range. The HMAC input is prefixed with the active `.kdat` file's `fileSalt`, so an old checkpoint
-  cannot authenticate after compaction recycles that data slot into a new incarnation. A missing
-  prefix, old layout, context-free legacy tag, or MAC failure makes the index absent; recovery replays
-  data.
+  range. The MAC input binds the active `.kdat` file's `fileSalt`, so an old checkpoint cannot
+  authenticate after compaction recycles that data slot into a new incarnation. A missing prefix, old
+  layout, context-free legacy tag, or MAC failure makes the index absent; recovery replays data.
+- **The tag is block-chained, not rolling.** Index layout 4 cuts the body into fixed 16 KiB blocks and
+  chains them — block *N*'s step covers block *N−1*'s chain value — so committing is one one-shot HMAC
+  over the open trailing block instead of one over the whole index. See DESIGN.md § M5 for the step
+  layout and for the Android constraint that forced it: `Mac` cannot be cloned there, so a rolling
+  digest that must be *peeked* at every commit is not portable.
 
 So a lost, torn, stale, or tampered index costs *replay time at open* and nothing else. This keeps the
 important simplification: no `.kidx` fsync (**I8**), no blocking `.kidx` flush (**I36**), and no
@@ -752,8 +756,9 @@ is changing anyway).
   committed extents; a data-slot switch starts at the data header, and a missing predecessor starts at
   the candidate's persisted authentication floor.
   Index MAC verification is folded into the index read already required at open.
-- **One small index write per commit.** The rolling HMAC avoids rescanning the index; committing writes
-  one 16-byte generation-parity tag in its header.
+- **One small index write per commit.** The block-chained HMAC avoids rescanning the index — a commit
+  hashes at most one 16 KiB block, whatever the store's size — and then writes one 16-byte
+  generation-parity tag in its header.
 - **Peak disk 1.25× store size** during compaction at the default threshold.
 - **Compaction writes more per pass**, in exchange for running far less often and for not producing
   the segment-lifecycle bug family.

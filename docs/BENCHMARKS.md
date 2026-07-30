@@ -45,6 +45,24 @@ median was 342.0k Set/s and 7,058.5k Get/s, with 0.9 µs p50 and 3.2 µs p99. Th
 ranged from 6,665.7k to 9,329.0k Get/s, so this confirms the guarded path remains fast but is too noisy
 to assign a precise cost to the added checks.
 
+### Block-chained index MAC spot check
+
+Index layout 4 replaced the rolling index HMAC with the block-chained construction (DESIGN.md § M5).
+Repeating the same 20k-key/128-byte spot check — 4 KiB pages, 8 lookup threads, 200k lookups, `Flushed`,
+three samples each, `HEAD` vs the change on one machine back to back:
+
+| | Set k/s (median) | Open ms (median) |
+|---|--:|--:|
+| rolling HMAC | 327.7 | 31.6 |
+| block-chained | 337.6 | 31.1 |
+
+**Read this as "no regression", not as a win.** The 3% Set/s gap is inside this configuration's sample
+spread (Set/s spanned 318.5–342.8 across the six runs; Get/s spanned 6,703–9,309 and is useless at this
+sample count). More importantly, the spot check cannot show the property the change was made for: a
+20k-key index is ~640 KB, so even rehashing the *whole* index per commit would be cheap here. The
+scaling claim — commit cost bounded by one 16 KiB block rather than growing with the store — is
+structural, and the motivating constraint was Android portability, not throughput on this machine.
+
 ## Final verification (post-audit, format 3)
 
 Measured 2026-07-27 at `0adf362` on an idle machine (CPU < 8% before each run), AMD Ryzen 9 9950X3D,

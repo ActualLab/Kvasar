@@ -18,8 +18,8 @@ public readonly record struct IndexSnapshot(IndexEntry[] Entries, long DataCommi
 //   12    4  LayoutVersion     uint  — .kidx entry-layout version
 //   16    8  CheckpointCount   long  — # of IndexEntry in the checkpoint region
 //   24    8  DataCommitLength  long  — the .kdat extent this index is consistent up to
-//   32   16  CommitMac0        HMAC-SHA256/128 for even superblock generations
-//   48   16  CommitMac1        HMAC-SHA256/128 for odd superblock generations
+//   32   16  CommitMac0        block-chained HMAC-SHA256/128 for even superblock generations
+//   48   16  CommitMac1        block-chained HMAC-SHA256/128 for odd superblock generations
 // Checkpoint/delta entries are cast straight to/from bytes with no byte-swapping, so the file is only
 // portable across identical-endianness (little-endian) devices — acceptable for a single-device store (§2).
 //
@@ -32,7 +32,7 @@ public readonly record struct IndexSnapshot(IndexEntry[] Entries, long DataCommi
 public sealed class IndexLog : IAsyncDisposable
 {
     public const int HeaderSize = 64;
-    public const uint LayoutVersion = 3;
+    public const uint LayoutVersion = 4;
 
     // Header field offsets.
     private const int MagicOffset = 0;
@@ -42,7 +42,7 @@ public sealed class IndexLog : IAsyncDisposable
     private const int CheckpointCountOffset = 16;
     private const int DataCommitLengthOffset = 24;
     private const int CommitMac0Offset = 32;
-    private const int CommitMacSize = 16;
+    private const int CommitMacSize = IndexMac.TagSize;
 
     // Deltas are staged here and written in one I/O: a Write per entry costs orders of magnitude more than
     // the memcpy, which is why v1 kept a FileStream open for the whole store's life.
@@ -52,8 +52,9 @@ public sealed class IndexLog : IAsyncDisposable
     private readonly uint _formatVer;
     private readonly byte[] _authenticationKey;
     private readonly byte[] _pending;
+    private readonly byte[] _commitMac = new byte[CommitMacSize];
     private readonly int _pendingCapacity;
-    private IncrementalHash? _mac;
+    private IndexMac? _mac;
     private byte[] _authenticationContext = [];
     private int _pendingCount;
     private long _flushedLength;
@@ -170,7 +171,7 @@ public sealed class IndexLog : IAsyncDisposable
             "The index must be loaded or checkpointed before appending.");
         var entryBytes = _pending.AsSpan(_pendingCount * EntrySize, EntrySize);
         MemoryMarshal.Write(entryBytes, in entry);
-        mac.AppendData(entryBytes);
+        mac.Append(entryBytes);
         _pendingCount++;
         return _pendingCount == _pendingCapacity ? Flush() : default;
     }
@@ -192,9 +193,9 @@ public sealed class IndexLog : IAsyncDisposable
         var mac = _mac ?? throw new InvalidOperationException(
             "The index must be loaded or checkpointed before it can be committed.");
         await Flush().ConfigureAwait(false);
-        var hash = mac.GetCurrentHash();
+        mac.ComputeTag(_commitMac);
         var offset = CommitMac0Offset + ((int)(generation % Superblock.SlotCount) * CommitMacSize);
-        await _file.Write(offset, hash.AsMemory(0, CommitMacSize)).ConfigureAwait(false);
+        await _file.Write(offset, _commitMac).ConfigureAwait(false);
     }
 
     public ValueTask<long> WriteCheckpoint(
@@ -262,14 +263,13 @@ public sealed class IndexLog : IAsyncDisposable
         byte[] authenticationKey,
         ReadOnlySpan<byte> authenticationContext)
     {
-        using var mac = IncrementalHash.CreateHMAC(HashAlgorithmName.SHA256, authenticationKey);
-        mac.AppendData(authenticationContext);
-        mac.AppendData(bytes[..CommitMac0Offset]);
-        mac.AppendData(bytes[HeaderSize..]);
-        var hash = mac.GetCurrentHash();
+        // Verification runs the writer's own chain forward over the whole prefix, so the two can't diverge.
+        using var mac = new IndexMac(authenticationKey, bytes[..CommitMac0Offset], authenticationContext);
+        mac.Append(bytes[HeaderSize..]);
+        Span<byte> tag = stackalloc byte[CommitMacSize];
+        mac.ComputeTag(tag);
         var offset = CommitMac0Offset + ((int)(generation % Superblock.SlotCount) * CommitMacSize);
-        return CryptographicOperations.FixedTimeEquals(
-            hash.AsSpan(0, CommitMacSize), bytes.Slice(offset, CommitMacSize));
+        return CryptographicOperations.FixedTimeEquals(tag, bytes.Slice(offset, CommitMacSize));
     }
 
     private static bool TryReadHeader(
@@ -313,10 +313,8 @@ public sealed class IndexLog : IAsyncDisposable
         _mac?.Dispose();
         CryptographicOperations.ZeroMemory(_authenticationContext);
         _authenticationContext = authenticationContext.ToArray();
-        _mac = IncrementalHash.CreateHMAC(HashAlgorithmName.SHA256, _authenticationKey);
-        _mac.AppendData(authenticationContext);
-        _mac.AppendData(bytes[..CommitMac0Offset]);
-        _mac.AppendData(bytes[HeaderSize..]);
+        _mac = new IndexMac(_authenticationKey, bytes[..CommitMac0Offset], authenticationContext);
+        _mac.Append(bytes[HeaderSize..]);
     }
 
     private static byte[] BuildCheckpoint(

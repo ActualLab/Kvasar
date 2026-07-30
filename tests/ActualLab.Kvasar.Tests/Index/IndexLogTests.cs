@@ -7,7 +7,14 @@ namespace ActualLab.Kvasar.Tests.Index;
 public sealed class IndexLogTests
 {
     private const uint FormatVer = 7;
+    // IndexEntry is a fixed 32 bytes, so this is a const and can reach [InlineData].
+    private const int EntriesPerMacBlock = IndexMac.BlockSize / 32;
+
     private static readonly byte[] MacKey = Enumerable.Range(0, KvasarConstants.IndexMacKeySize).Select(i => (byte)(i * 7 + 1)).ToArray();
+
+    [Fact]
+    public void EntrySizeIsTheThirtyTwoBytesTheMacBlockMathAssumes()
+        => IndexLog.EntrySize.Should().Be(32);
 
     [Fact]
     public async Task CheckpointRoundTrip()
@@ -335,6 +342,99 @@ public sealed class IndexLogTests
         snapshot.Should().NotBeNull();
         snapshot!.Value.DataCommitLength.Should().Be(555);
         snapshot.Value.Entries.Select(e => e.KeyHash).Should().BeEquivalentTo([1UL, 2UL, 3UL]);
+    }
+
+    [Fact]
+    public async Task IndexSpanningManyMacBlocksRoundTrips()
+    {
+        const int checkpointCount = 3 * EntriesPerMacBlock;
+        const int deltaCount = (2 * EntriesPerMacBlock) + 7;
+        var file = new IndexLogTestFile();
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
+        await log.WriteCheckpoint(
+            Enumerable.Range(0, checkpointCount).Select(i => Entry((ulong)i, 1, i * 64, 64)).ToArray(),
+            1 << 20);
+        for (var i = 0; i < deltaCount; i++)
+            await log.AppendDelta(Entry((ulong)(checkpointCount + i), 2, i * 64, 32));
+
+        var snapshot = await log.CommitAndRead();
+
+        snapshot.Should().NotBeNull();
+        snapshot!.Value.Entries.Should().HaveCount(checkpointCount + deltaCount);
+        snapshot.Value.DataCommitLength.Should().Be(1 << 20);
+    }
+
+    [Fact]
+    public async Task EveryCommitAcrossAMacBlockBoundaryAuthenticates()
+    {
+        // The delta that completes a MAC block folds it into the chain; the next one opens a fresh block.
+        // A commit landing on either side of that seam must still authenticate at its own length.
+        var file = new IndexLogTestFile();
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
+        await log.WriteCheckpoint(Array.Empty<IndexEntry>(), 0);
+
+        var generation = 0UL;
+        for (var i = 0; i < EntriesPerMacBlock + 4; i++) {
+            await log.AppendDelta(Entry((ulong)i, 1, i * 64, 32));
+            var committedLength = log.Length;
+            await log.WriteCommitMac(++generation);
+            var snapshot = await log.Read(committedLength, generation);
+            snapshot.Should().NotBeNull($"commit after delta {i} must authenticate");
+            snapshot!.Value.Entries.Should().HaveCount(i + 1);
+        }
+    }
+
+    [Fact]
+    public async Task ReopeningMidMacBlockContinuesTheChain()
+    {
+        // A reopened log rebuilds its chain from the file, so it must land on the same folded-block count
+        // and the same partially filled trailing block the writer had.
+        const int firstCount = EntriesPerMacBlock + 5;
+        var file = new IndexLogTestFile();
+        await using (var log = await IndexLog.Open(file, FormatVer, MacKey)) {
+            await log.WriteCheckpoint(new[] { Entry(1, 1, 100, 10) }, 777);
+            for (var i = 0; i < firstCount; i++)
+                await log.AppendDelta(Entry((ulong)(100 + i), 1, i * 64, 32));
+            await log.WriteCommitMac(0);
+        }
+
+        await using var reopened = await IndexLog.Open(file, FormatVer, MacKey);
+        (await reopened.Read(reopened.Length, 0)).Should().NotBeNull();
+        for (var i = 0; i < EntriesPerMacBlock; i++)
+            await reopened.AppendDelta(Entry((ulong)(1_000 + i), 2, i * 64, 32));
+
+        var snapshot = await reopened.CommitAndRead();
+        snapshot.Should().NotBeNull();
+        snapshot!.Value.DataCommitLength.Should().Be(777);
+        snapshot.Value.Entries.Should().HaveCount(1 + firstCount + EntriesPerMacBlock);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(EntriesPerMacBlock - 1)]
+    [InlineData(EntriesPerMacBlock)]
+    [InlineData(EntriesPerMacBlock + 1)]
+    [InlineData(2 * EntriesPerMacBlock)]
+    public async Task TamperingInsideAnyMacBlockIsDetected(int entryIndex)
+    {
+        var file = new IndexLogTestFile();
+        await using var log = await IndexLog.Open(file, FormatVer, MacKey);
+        await log.WriteCheckpoint(
+            Enumerable.Range(0, (2 * EntriesPerMacBlock) + 10)
+                .Select(i => Entry((ulong)i, 1, i * 64, 64))
+                .ToArray(),
+            4096);
+        var committedLength = log.Length;
+        await log.WriteCommitMac(0);
+        (await log.Read(committedLength, 0)).Should().NotBeNull();
+
+        // Retarget one checkpoint entry's locator: structurally valid, so only the MAC can catch it.
+        await file.Write(
+            IndexLog.HeaderSize + (entryIndex * IndexLog.EntrySize) + 8,
+            BitConverter.GetBytes(new Locator(1, 0x4242).Packed));
+
+        (await log.Read(committedLength, 0)).Should().BeNull();
     }
 
     // Private methods

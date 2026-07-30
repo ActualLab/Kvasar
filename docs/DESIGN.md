@@ -149,8 +149,8 @@ Publication remains a release write of the packed locator; readers take a single
 acquire-read the locator. Resize is copy-on-write.
 
 ### M5 — Index persistence `.kidx` (`Index/`)
-The index layout version remains independently versioned at **3**. Data format 3 does not change it.
-Each persisted `IndexEntry` is exactly 32 bytes:
+The index layout is independently versioned; it is at **4**, which introduced the block-chained commit
+MAC below. Data format 3 does not change it. Each persisted `IndexEntry` is exactly 32 bytes:
 ```
 offset  size  field
 0       8     KeyHash
@@ -163,6 +163,27 @@ offset  size  field
 The 64-byte index header carries magic, data format, index layout version, entry count, data commit
 length, and two generation-parity HMAC slots. A checkpoint is followed by fixed-size deltas.
 Invalid, stale, absent, or unauthenticated index data is discarded and rebuilt from `.kdat`.
+
+`IndexMac` computes those tags as a **block-chained HMAC-SHA256** (`Index/IndexMac.cs`): the body — the
+checkpoint region plus the committed delta tail — is cut into fixed 16 KiB blocks, and each block's step
+is a one-shot HMAC over a 48-byte typed prefix (step kind, payload length, block index, previous chain
+value) followed by that block's bytes. The commit tag is a third step kind over the chain value and the
+open trailing block, truncated to 16 bytes. Three properties fall out of that shape:
+
+- **Committing is bounded work.** A tag covers at most one block, so commit cost stops scaling with the
+  index — the whole point, since commits run under the store's single write lock. Load still costs one
+  pass over the prefix, paying only the per-block HMAC restart.
+- **No running digest is ever peeked.** Android's `Mac` cannot be cloned, so `IncrementalHash`'s
+  `GetCurrentHash` — a "hash so far without ending the computation" — is not portable there. Every step
+  here is one-shot, which is also the fastest path on every other platform.
+- **Per-entry work stays managed.** Appending a delta memcpy's 32 bytes into the open block; the crypto
+  call happens once per 16 KiB. On Android that turns one JNI round-trip per cached key into one per
+  ~500 keys.
+
+The verifier is the writer: `IsMacValid` builds an `IndexMac` and runs the same `Append` over the whole
+committed prefix, so the two paths cannot drift apart. Each tag binds the authentication context (the
+active `.kdat` incarnation's `fileSalt`), the stable header fields, block position, and the exact
+committed length — a truncated, extended, reordered or edited prefix fails.
 
 ## Integration points (owned by KvasarStore, not these modules)
 - Deriving page key + hash key from the master key via `IKeyDerivation` and the `KvasarConstants`
