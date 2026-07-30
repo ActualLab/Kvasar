@@ -1,5 +1,33 @@
 # Kvasar — outstanding items
 
+## Found 2026-07-29 by the widened crash fuzzer — open
+
+**P1: a corrupted `.kdat` header can make `Open` throw instead of falling back.** `CorruptLogHeader`
+flips one byte in the active data file's 64-byte plaintext header. When it lands in `PageSize`
+(offset 8–11, so ~6% of cases) `OpenLogs` sees a valid-but-different geometry and raises
+`KvasarConfigurationException`; `TryAdopt` catches only `KvasarCorruptException`, so it escapes `Open`.
+That violates §12 ("Open recovers or wipes-and-recreates; it must never propagate an exception").
+
+Reproduce by making `CrashFuzzTests.AllFaults` include `CorruptIndexInteriorEntries` again — the extra
+member re-deals `AllFaults[(seed + round) % Length]` and seed 10 round 0 then lands on this fault with an
+RNG that hits the `PageSize` field. The member is deliberately excluded from that array today so the
+seed-rotating tests keep the coverage they were validated on.
+
+This is **pre-existing** and independent of the index MAC work. The fix is not a one-liner, because the
+header is *unauthenticated plaintext* and a genuine caller-requested geometry mismatch must still throw
+(DESIGN.md integration points). Distinguishing them needs an authenticated source for the page size —
+either probing whether page 0 authenticates at the header's geometry before trusting it, or moving page
+size into the superblock slot's reserved space (a format change). Decide which before fixing.
+
+**P3: 34 MB is allocated per 25 MB chat cold start**, ~16 KB per read — one page buffer per page-cache
+miss. Roughly half is the cache legitimately filling; the other half is evicted buffers becoming
+garbage. They cannot simply be pooled: `DataLog.TryReadAt`'s single-page fast path returns
+`firstPage.Slice(...)`, a zero-copy slice into the cache-owned array, and the read lease is already
+released by then, so a caller can hold a `KvasarValue` over a page the cache later evicts. Recycling
+evicted pages therefore needs either refcounting or a copy-out on read — a real trade against the
+0.8 µs lookup, not an oversight. `ArrayPool<byte>.Shared` is already used where lifetimes *are* bounded
+(`DataLog`'s multi-page assembly).
+
 > **Round-2 review (2026-07-27) closed most of what was still open here.** See
 > [`REVIEW-R2.md`](REVIEW-R2.md) for the findings and the fix commits for the work. In particular:
 >

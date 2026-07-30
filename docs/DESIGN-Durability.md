@@ -862,6 +862,10 @@ adoptable.
   after recovery would clobber the generation below the one just adopted. Re-writing the adopted state
   as generation *G+1* (same extents, one 512-byte write) invalidates it first and makes both free slots
   immediately recyclable — cheaper than carrying a "which slot is still referenced" rule through open.
+  That write is **deliberately not flushed, even under `Flushed`**: it names the extents recovery just
+  adopted, so losing it simply means the next open re-adopts the same generation and re-confirms it, and
+  no user data depends on it. Flushing it made every graceful open pay a durability barrier — 2.1 ms of a
+  5.4 ms open in the chat measurement (BENCHMARKS.md), and more on a phone.
 - **`Clear` is the one place that unlinks.** Recycling a slot would leave the cleared data on disk under
   a store whose caller just asked for it to be gone. A crash mid-`Clear` reads back as an uninitialized
   store, which §3.4 already accepts as a defined outcome.

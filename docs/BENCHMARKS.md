@@ -45,6 +45,64 @@ median was 342.0k Set/s and 7,058.5k Get/s, with 0.9 µs p50 and 3.2 µs p99. Th
 ranged from 6,665.7k to 9,329.0k Get/s, so this confirms the guarded path remains fast but is too noisy
 to assign a precise cost to the added checks.
 
+### Chat cold-start profile (2026-07-29)
+
+Where the 25 MB cold start actually goes, measured by instrumenting the phases rather than sampling — a
+CPU profile is useless here, 94% of on-stack time is `UNMANAGED_CODE_TIME` because the workload is
+I/O-bound. Config B, AES-GCM, `plain` stack, milliseconds:
+
+| phase | `Flushed` | `Buffered` |
+|---|--:|--:|
+| `OpenLogs` | 0.5 | 0.5 |
+| `AuthenticateCommitWindow` | 0.16 | 0.14 |
+| read + verify the 1.27 MB `.kidx` | 1.9 | 1.9 |
+| `HashIndex.BulkLoad` (39,800 entries) | 0.5 | 0.5 |
+| confirm-adoption superblock write | **2.1** | 0.03 |
+| 2,000 reads over 8 threads | 6.5 | 6.0 |
+| final commit | 4.7 | 0.3 |
+
+Two things that table settled, both since fixed:
+
+- **The confirm-adoption write was flushed**, so every graceful open under `Flushed` paid a durability
+  barrier for a record carrying nothing new (§14.5). It is now written unflushed.
+- **The `.kidx` was hashed twice at open** — once to verify the tag, once to rebuild the appender's
+  running chain over the identical bytes. Verification now hands its chain over.
+
+`.kidx` reading itself is *not* the cost: the 1.27 MB read is 0.08 ms. `Parse` is ~1.2 ms of it —
+about 0.53 ms MAC (irreducible; that is the authentication) and ~0.65 ms resolving 40k entries through a
+`Dictionary`. That resolution is load-bearing (`HashIndex.BulkLoad` skips tombstones, so an unresolved
+delete would resurrect), but it is still open to a cheaper comparer than the default `(ulong, ulong)`
+tuple one.
+
+Also worth recording: the index in this workload is **all delta tail, no checkpoint** — 39,800 deltas and
+`checkpointCount = 0`. `MustRotateIndex` only fires once the tail exceeds 2× the checkpoint it would
+produce, which a write-once population never reaches, so SPEC §6.5's blittable near-memcpy load path is
+never exercised here. SPEC also lists "graceful `DisposeAsync` (always)" as a checkpoint trigger; the
+implementation has only the tail heuristic.
+
+**Same-session A/B** for the two fixes (three runs each, medians; a cross-session comparison would be
+meaningless — this machine's fsync cost drifted ~2× between sessions, moving the final commit from 4.7 to
+2.1 ms with no code change at all):
+
+| | Open ms | TOTAL ms |
+|---|--:|--:|
+| baseline | 4.8 | 13.0 |
+| + single-pass index MAC | 4.6 | 13.3 |
+| + unflushed confirm write | **3.5** | **12.6** |
+
+So ~1.6 ms off Open, ~10% off the `Flushed` total *on this machine*. The single-pass MAC is worth 0.53 ms
+by direct measurement but does not separate from run-to-run noise at this scale. The confirm-write fix
+should matter **more** on a phone, where a durability barrier costs far more than on desktop NVMe; it is
+worth nothing under `Buffered`, which is the library default.
+
+Page size was checked and 16 KiB is already right: chat cold start at 4 KiB / 8 KiB / 16 KiB is
+11.7 / 10.7 / 9.9 ms, and p50 read latency is 22 / 22 / 3.6 µs — smaller pages make more tiles span
+pages, and the multi-page assembly path is far more expensive than the zero-copy single-page one.
+
+Allocation profile: **34 MB per cold start**, ~16 KB per read. See TODO.md P3 — it is the page cache
+filling and evicting, and it is not freely poolable because reads hand out zero-copy slices into
+cache-owned buffers. Re-measure with `GC.GetTotalAllocatedBytes(true)` around the cold-start window.
+
 ### Block-chained index MAC spot check
 
 Index layout 4 replaced the rolling index HMAC with the block-chained construction (DESIGN.md § M5).

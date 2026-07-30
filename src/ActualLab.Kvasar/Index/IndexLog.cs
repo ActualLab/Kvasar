@@ -158,11 +158,24 @@ public sealed class IndexLog : IAsyncDisposable
 
         var bytes = new byte[end];
         await _file.ReadExact(0, bytes, cancellationToken).ConfigureAwait(false);
-        var snapshot = Parse(
-            bytes, _formatVer, generation, _authenticationKey, authenticationContext.Span);
-        if (snapshot is not null && end == Length)
-            InitializeMac(bytes, authenticationContext.Span);
-        return snapshot;
+
+        // Verifying already walks the chain over the whole prefix, which is exactly the running state an
+        // appender needs — so it's handed over rather than rebuilt. Rebuilding it doubled the HMAC work at
+        // open, and on a multi-megabyte index that was the single largest part of it.
+        var mac = new IndexMac(
+            _authenticationKey, bytes.AsSpan(0, CommitMac0Offset), authenticationContext.Span);
+        try {
+            var snapshot = Parse(bytes, _formatVer, generation, mac);
+            if (snapshot is null || end != Length)
+                return snapshot;
+
+            AdoptMac(mac, authenticationContext.Span);
+            mac = null;
+            return snapshot;
+        }
+        finally {
+            mac?.Dispose();
+        }
     }
 
     public ValueTask AppendDelta(IndexEntry entry)
@@ -224,15 +237,11 @@ public sealed class IndexLog : IAsyncDisposable
     // Private methods
 
     private static IndexSnapshot? Parse(
-        byte[] bytes,
-        uint formatVer,
-        ulong generation,
-        byte[] authenticationKey,
-        ReadOnlySpan<byte> authenticationContext)
+        byte[] bytes, uint formatVer, ulong generation, IndexMac mac)
     {
         if (!TryReadHeader(bytes, formatVer, bytes.Length, out var checkpointCount, out var dataCommitLength))
             return null;
-        if (!IsMacValid(bytes, generation, authenticationKey, authenticationContext))
+        if (!IsMacValid(bytes, generation, mac))
             return null;
 
         var entrySize = EntrySize;
@@ -257,14 +266,11 @@ public sealed class IndexLog : IAsyncDisposable
         return new IndexSnapshot(entries, dataCommitLength);
     }
 
-    private static bool IsMacValid(
-        ReadOnlySpan<byte> bytes,
-        ulong generation,
-        byte[] authenticationKey,
-        ReadOnlySpan<byte> authenticationContext)
+    // Advances `mac` — started over this prefix's header — across the body, so a valid result leaves it
+    // ready to accept the next delta. Verification therefore runs the writer's own chain, and the two
+    // cannot diverge.
+    private static bool IsMacValid(ReadOnlySpan<byte> bytes, ulong generation, IndexMac mac)
     {
-        // Verification runs the writer's own chain forward over the whole prefix, so the two can't diverge.
-        using var mac = new IndexMac(authenticationKey, bytes[..CommitMac0Offset], authenticationContext);
         mac.Append(bytes[HeaderSize..]);
         Span<byte> tag = stackalloc byte[CommitMacSize];
         mac.ComputeTag(tag);
@@ -310,11 +316,20 @@ public sealed class IndexLog : IAsyncDisposable
     private void InitializeMac(
         ReadOnlySpan<byte> bytes, ReadOnlySpan<byte> authenticationContext)
     {
-        _mac?.Dispose();
+        var mac = new IndexMac(_authenticationKey, bytes[..CommitMac0Offset], authenticationContext);
+        mac.Append(bytes[HeaderSize..]);
+        AdoptMac(mac, authenticationContext);
+    }
+
+    private void AdoptMac(IndexMac mac, ReadOnlySpan<byte> authenticationContext)
+    {
+        // Callers may hand back _authenticationContext itself, so the copy has to precede the zeroing —
+        // otherwise the stored context, and every tag computed from it, would silently become zeros.
+        var context = authenticationContext.ToArray();
         CryptographicOperations.ZeroMemory(_authenticationContext);
-        _authenticationContext = authenticationContext.ToArray();
-        _mac = new IndexMac(_authenticationKey, bytes[..CommitMac0Offset], authenticationContext);
-        _mac.Append(bytes[HeaderSize..]);
+        _authenticationContext = context;
+        _mac?.Dispose();
+        _mac = mac;
     }
 
     private static byte[] BuildCheckpoint(

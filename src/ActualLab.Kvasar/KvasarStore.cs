@@ -926,7 +926,10 @@ public sealed class KvasarStore : IAsyncDisposable
             await indexLog.WriteCommitMac(generation).ConfigureAwait(false);
         else
             confirmedState = confirmedState with { IndexCommitLength = 0 };
-        await WriteSuperblock(confirmedState).ConfigureAwait(false);
+        // Deliberately not flushed, even under Flushed: this slot names the extents recovery just adopted,
+        // so losing it means the next open re-adopts the same generation and re-confirms it. Flushing it
+        // made every graceful open pay a durability barrier for a record that carries nothing new.
+        await WriteSuperblock(confirmedState, mustFlush: false).ConfigureAwait(false);
         _generation = generation;
         _committedDataSlot = state.DataSlot;
         _committedDataLength = state.DataCommitLength;
@@ -1157,10 +1160,10 @@ public sealed class KvasarStore : IAsyncDisposable
         }
     }
 
-    private async ValueTask WriteSuperblock(SuperblockState state)
+    private async ValueTask WriteSuperblock(SuperblockState state, bool mustFlush = true)
     {
         await _superblock.Write(_superblockFile!, state).ConfigureAwait(false);
-        if (_options.Durability == KvasarDurability.Flushed)
+        if (mustFlush && _options.Durability == KvasarDurability.Flushed)
             await _superblockFile!.FlushToDisk().ConfigureAwait(false);
     }
 

@@ -20,10 +20,22 @@ public sealed class CrashFuzzTests : IDisposable
     private const int KeyPoolSize = 80;
     private const int OpsPerRound = 45;
     private const int RoundsPerSeed = 4;
+    // Three passes over this pool leave the .kidx several IndexMac blocks long (512 entries per block).
+    private const int MultiBlockKeyPoolSize = 1500;
 
     // 0, sub-page, exactly one page and several pages — so single-page and multi-page runs both occur.
     private static readonly int[] ValueSizes = [0, 1, 40, 700, 4000, 4096, 4097, 9000];
-    private static readonly FaultKind[] AllFaults = Enum.GetValues<FaultKind>();
+    // Listed rather than Enum.GetValues: the seed-rotating tests index this by (seed + round), so adding a
+    // member would re-deal every case and silently retire the coverage the existing seeds were validated on.
+    private static readonly FaultKind[] AllFaults = [
+        FaultKind.None,
+        FaultKind.TruncateActiveLog,
+        FaultKind.CorruptLogHeader,
+        FaultKind.TruncateIndex,
+        FaultKind.PartialIndexDelta,
+        FaultKind.GarbageIndexDelta,
+        FaultKind.TruncateSuperblockSlot,
+    ];
 
     private readonly string _root = Path.Combine(Path.GetTempPath(), "kvasar-crashfuzz-" + Guid.NewGuid().ToString("N"));
     private readonly byte[] _key = new byte[32];
@@ -100,6 +112,63 @@ public sealed class CrashFuzzTests : IDisposable
             model.Resync(contents);
             dir = next;
         }
+    }
+
+    [Theory]
+    [InlineData(FaultKind.None)]
+    [InlineData(FaultKind.TruncateIndex)]
+    [InlineData(FaultKind.PartialIndexDelta)]
+    [InlineData(FaultKind.GarbageIndexDelta)]
+    [InlineData(FaultKind.CorruptIndexInteriorEntries)]
+    [InlineData(FaultKind.TruncateSuperblockSlot)]
+    public async Task MultiBlockIndexRecovers(FaultKind fault)
+    {
+        // Every other case here keeps the .kidx body under one IndexMac block, so the block-fold path is
+        // never crash-tested: a fault inside a *folded* block is a different code path from one in the open
+        // trailing block, which is all a small store has.
+        var rnd = new Random(7000 + (int)fault);
+        var model = new Model();
+        var liveDir = Path.Combine(_root, $"multiblock-{fault}");
+        var snapshotDir = liveDir + "-snap";
+        Directory.CreateDirectory(liveDir);
+
+        long indexLength;
+        await using (var store = await OpenOrFail(
+            Options(BaseIn(liveDir), encrypt: true), $"multi-block live store, fault {fault}")) {
+            // Written in batches so each SetMany is one commit: per-key commits would pay two fsyncs each.
+            // Three passes over the pool force a rotation, so both shapes span blocks — a multi-block
+            // checkpoint region and, after it, a multi-block delta tail.
+            for (var pass = 0; pass < 3; pass++)
+                for (var start = 0; start < MultiBlockKeyPoolSize; start += 250)
+                    await ApplyBatch(store, model, rnd, start, Math.Min(250, MultiBlockKeyPoolSize - start));
+            await store.Flush();
+            model.OnFlush();
+            indexLength = IndexLengthIn(liveDir);
+            Snapshot(liveDir, snapshotDir);
+        }
+
+        var foldedBlocks = (indexLength - IndexLog.HeaderSize) / IndexMac.BlockSize;
+        foldedBlocks.Should().BeGreaterThanOrEqualTo(2,
+            "the fixture is pointless unless the index actually spans several MAC blocks");
+
+        ApplyFault(snapshotDir, fault, rnd);
+        var options = Options(BaseIn(snapshotDir), encrypt: true);
+        var because = $"a {foldedBlocks}-block index hit fault {fault}";
+
+        Dictionary<string, byte[]> contents;
+        await using (var recovered = await OpenOrFail(options, because)) {
+            contents = await ScanToMap(recovered);
+            AssertNoWrongData(contents, model, because);
+            await AssertScanAgreesWithGet(recovered, contents, because);
+            // No index fault can lose data: the index is derived from the .kdat, which none of these
+            // faults touch. A rejected index costs replay time and nothing else (§3.3).
+            if (fault != FaultKind.TruncateSuperblockSlot)
+                AssertFlushedDataSurvives(contents, model, because);
+            await recovered.Flush();
+        }
+
+        await using var reopened = await OpenOrFail(options, because + ", reopened");
+        (await ScanToMap(reopened)).Should().BeEquivalentTo(contents, because);
     }
 
     [Fact]
@@ -318,6 +387,33 @@ public sealed class CrashFuzzTests : IDisposable
             }
             break;
         }
+        case FaultKind.CorruptIndexInteriorEntries: {
+            // Structurally valid edits spread through the *folded* MAC blocks — a different path from a
+            // fault in the open trailing block, which is all a single-block index has. Every edit retargets
+            // a locator, so if the chain failed to cover a folded block the adopted index would resolve
+            // those keys to the wrong records and the data assertions would fail instead of this being a
+            // silent no-op. The whole index is rejected when the chain works, costing only replay time.
+            foreach (var path in IndexPaths(dir)) {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+                var entryCount = (fs.Length - IndexLog.HeaderSize) / IndexLog.EntrySize;
+                var foldedEntries = Math.Min(
+                    entryCount, (fs.Length - IndexLog.HeaderSize) / IndexMac.BlockSize
+                        * (IndexMac.BlockSize / IndexLog.EntrySize));
+                if (foldedEntries <= 0)
+                    continue;
+
+                var step = Math.Max(1, foldedEntries / 64);
+                for (var entry = rnd.NextInt64(0, step); entry < foldedEntries; entry += step) {
+                    // Byte 8 is the low byte of PackedLocator, so the edit always changes where the entry
+                    // points — never a padding or hint byte that could be harmless.
+                    fs.Seek(IndexLog.HeaderSize + (entry * IndexLog.EntrySize) + 8, SeekOrigin.Begin);
+                    var b = fs.ReadByte();
+                    fs.Seek(-1, SeekOrigin.Current);
+                    fs.WriteByte((byte)(b ^ 0x5A));
+                }
+            }
+            break;
+        }
         case FaultKind.TruncateSuperblockSlot: {
             // The newest slot is lost but the older one survives: recovery must fall back to it rather
             // than wipe, which is the whole point of writing the two slots alternately (§3.1).
@@ -348,6 +444,28 @@ public sealed class CrashFuzzTests : IDisposable
         using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.None);
         fs.Write(bytes, 0, bytes.Length);
     }
+
+    private static async Task ApplyBatch(
+        KvasarStore store, Model model, Random rnd, int start, int count)
+    {
+        // Small values: this fixture is about index length, and big records would only slow it down.
+        var batch = new List<(KvasarKey Key, KvasarValue? Value)>(count);
+        var values = new List<(string Key, byte[]? Value)>(count);
+        for (var i = 0; i < count; i++) {
+            var key = $"m{start + i:D5}";
+            var value = rnd.Next(12) == 0 ? null : new byte[rnd.Next(1, 64)];
+            if (value is not null)
+                rnd.NextBytes(value);
+            batch.Add((Utf8(key), Val(value)));
+            values.Add((key, value));
+        }
+        await store.SetMany(batch);
+        foreach (var (key, value) in values)
+            model.OnSet(key, value);
+    }
+
+    private static long IndexLengthIn(string dir)
+        => IndexPaths(dir).Select(x => new FileInfo(x).Length).DefaultIfEmpty(0).Max();
 
     private static async Task ApplyOps(KvasarStore store, Model model, Random rnd, int count)
     {
@@ -450,7 +568,7 @@ public sealed class CrashFuzzTests : IDisposable
 
     // Nested types
 
-    private enum FaultKind
+    public enum FaultKind
     {
         None = 0,
         TruncateActiveLog,
@@ -458,6 +576,7 @@ public sealed class CrashFuzzTests : IDisposable
         TruncateIndex,
         PartialIndexDelta,
         GarbageIndexDelta,
+        CorruptIndexInteriorEntries,
         TruncateSuperblockSlot,
     }
 

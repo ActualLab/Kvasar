@@ -180,10 +180,12 @@ open trailing block, truncated to 16 bytes. Three properties fall out of that sh
   call happens once per 16 KiB. On Android that turns one JNI round-trip per cached key into one per
   ~500 keys.
 
-The verifier is the writer: `IsMacValid` builds an `IndexMac` and runs the same `Append` over the whole
-committed prefix, so the two paths cannot drift apart. Each tag binds the authentication context (the
-active `.kdat` incarnation's `fileSalt`), the stable header fields, block position, and the exact
-committed length — a truncated, extended, reordered or edited prefix fails.
+The verifier is the writer: `IsMacValid` runs the same `Append` over the whole committed prefix, so the
+two paths cannot drift apart — and because that walk *is* the running state an appender needs, `Read`
+adopts the verifier's `IndexMac` instead of rebuilding it. Rebuilding hashed a multi-megabyte index twice
+per open. Each tag binds the authentication context (the active `.kdat` incarnation's `fileSalt`), the
+stable header fields, block position, and the exact committed length — a truncated, extended, reordered
+or edited prefix fails.
 
 ## Integration points (owned by KvasarStore, not these modules)
 - Deriving page key + hash key from the master key via `IKeyDerivation` and the `KvasarConstants`
