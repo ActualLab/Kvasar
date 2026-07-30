@@ -95,9 +95,37 @@ by direct measurement but does not separate from run-to-run noise at this scale.
 should matter **more** on a phone, where a durability barrier costs far more than on desktop NVMe; it is
 worth nothing under `Buffered`, which is the library default.
 
-Page size was checked and 16 KiB is already right: chat cold start at 4 KiB / 8 KiB / 16 KiB is
-11.7 / 10.7 / 9.9 ms, and p50 read latency is 22 / 22 / 3.6 µs — smaller pages make more tiles span
-pages, and the multi-page assembly path is far more expensive than the zero-copy single-page one.
+#### Page size on the chat workload — 32 KiB beats 16 KiB
+
+Going *down* is clearly wrong: chat cold start at 4 / 8 / 16 KiB is 11.7 / 10.7 / 9.9 ms with p50 read
+latency 22 / 22 / 3.6 µs, because smaller pages make more tiles span pages and the multi-page assembly
+path copies into a fresh buffer instead of returning a zero-copy slice.
+
+Going *up* to 32 KiB wins, modestly but consistently. Medians of three interleaved runs per cell (the two
+page sizes alternated inside one session, so machine drift can't favour either):
+
+| | 16 KiB | 32 KiB |
+|---|--:|--:|
+| A (12 MB) total ms, `Buffered` | 4.7 | 4.7 |
+| A total ms, `Flushed` | 6.9 | **6.2** |
+| B (25 MB) total ms, `Buffered` | 9.7 | **8.8** |
+| B total ms, `Flushed` | **11.7** | 12.1 |
+| B read ms, `Buffered` | 5.7 | **4.9** |
+| B p50 µs | 4.6 | **2.4** |
+| B p99 µs | **75–87** | 82–104 |
+| B file size | 30.6 MB | **28.4 MB** |
+
+The **7% smaller file** is the strongest signal — byte-identical across all three rounds, where every
+timing cell has visible spread. The mechanism is not established; per-page overhead (16 B tag + 8 B frame)
+only accounts for ~0.08%, so something else — most likely fewer page-spanning records — dominates. Worth
+confirming before leaning on it.
+
+The one cell that disagrees is B under `Flushed`, which is also the noisiest (two fsyncs dominate it).
+p99 is genuinely worse at 32 KiB: a bigger page is a bigger worst-case read-and-decrypt.
+
+Caveat on the cache: `PageCacheBytes` is fixed at 16 MB in this scenario, so 32 KiB halves the number of
+resident pages (512 vs 1024). This workload reads every key exactly once, so it misses either way; a
+workload with real page locality could invert the result.
 
 Allocation profile: **34 MB per cold start**, ~16 KB per read. See TODO.md P3 — it is the page cache
 filling and evicting, and it is not freely poolable because reads hand out zero-copy slices into
