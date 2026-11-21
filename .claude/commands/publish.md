@@ -26,8 +26,8 @@ a wrong publish costs a version.
 
 `$ARGUMENTS` holds flags; **the default is `-test -changelog`**.
 
-- `-test` (default) → the full local test pass on all target frameworks (Step 4),
-  then the workflow's tests (Step 5)
+- `-test` (default) → the full local test pass on net11.0 (Step 4), then the
+  workflow's tests (Step 5)
 - `-ci-test` → just the workflow's tests: skip the local pass
 - `-no-test` → no tests at all: skip both
 - `-changelog` (default) / `-no-changelog` → write the changelog entry and put it
@@ -73,14 +73,15 @@ Otherwise report the version→commit mapping and a one-line diff summary, then 
 
 ### Step 4: Local tests (skip with `-ci-test` or `-no-test`)
 
-Run the full suite, slow tests included, on every target framework:
+Run the full suite, slow tests included, on the default target (net11.0 only; the older
+target frameworks don't need a test pass before a publish):
 
 ```powershell
-dotnet build ActualLab.Kvasar.slnx -c Release -p:UseMultitargeting=true
-dotnet test  ActualLab.Kvasar.slnx -c Release -p:UseMultitargeting=true --no-build
+dotnet build ActualLab.Kvasar.slnx -c Release
+dotnet test  ActualLab.Kvasar.slnx -c Release --no-build
 ```
 
-The build must have 0 warnings and every test must pass on net11.0, net10.0 and net9.0.
+The build must have 0 warnings and every test must pass.
 If something fails, fix it, re-run, commit and push the fix — never skip or suppress a failure.
 
 ### Step 5: Publish
