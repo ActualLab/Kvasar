@@ -4,7 +4,7 @@ This document freezes the internal architecture so modules can be built independ
 without rework. Read it together with `docs/SPEC.md` (the product spec). Where this doc and SPEC
 disagree on an internal detail, **this doc wins** (SPEC wins on externally-visible behavior).
 
-Targets: **net10.0** by default and **net10.0;net9.0** with `UseMultitargeting=true`, pure managed,
+Targets: **net11.0** by default and **net11.0;net10.0;net9.0** with `UseMultitargeting=true`, pure managed,
 no native deps. Namespace root `ActualLab.Kvasar`.
 Coding style: follow the ActualLab conventions (file-scoped namespaces, `var`, expression-bodied
 members, mixed brace style — Allman for types/methods/ctors, K&R everywhere else, 4-space indent,

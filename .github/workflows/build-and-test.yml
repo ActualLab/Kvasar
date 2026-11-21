@@ -61,5 +61,5 @@ jobs:
         if: ${{ inputs.run-slow-tests }}
         run: dotnet test ActualLab.Kvasar.slnx -c Release --no-build
 
-# CI builds net10.0 only. net9.0 is still a supported target via -p:UseMultitargeting=true, but
+# CI builds net11.0 only. net10.0 and net9.0 are still supported targets via -p:UseMultitargeting=true, but
 # validating it on every push isn't worth the runtime; run it locally when touching TFM-conditional code.

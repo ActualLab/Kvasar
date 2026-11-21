@@ -139,7 +139,7 @@ three 16 KB-page samples still beat all three 4 KB-page samples.
 
 ## Status
 
-Working and tested — not yet released. The library multi-targets **net10.0** (default) and
+Working and tested — not yet released. The library multi-targets **net11.0** (default), **net10.0** and
 **net9.0**, is AOT- and trimming-safe, and depends on exactly one package (`System.IO.Hashing`).
 
 **Durability:** Kvasar buys **atomicity, not durability** — after any crash it reopens at the state
@@ -161,7 +161,7 @@ it stalls writers for the length of the copy.
 Build.cmd                          # or: dotnet build ActualLab.Kvasar.slnx -c Release
 Run-Tests.cmd                      # full suite
 Run-Benchmarks.cmd                 # vs SQLCipher; run on an idle machine
-Build.cmd -p:UseMultitargeting=true # validate net10.0 and net9.0
+Build.cmd -p:UseMultitargeting=true # validate net11.0, net10.0 and net9.0
 ```
 
 ## Layout

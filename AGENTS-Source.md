@@ -74,21 +74,22 @@ belongs in a shared `Internal/` location rather than a single call site.
 The library multi-targets via the `UseMultitargeting` MSBuild property (defined in
 the root `Directory.Build.props`):
 
-- **Default** (`UseMultitargeting` unset/false): single-target **net10.0**.
-- **`-p:UseMultitargeting=true`**: multi-target **net10.0;net9.0**.
+- **Default** (`UseMultitargeting` unset/false): single-target **net11.0**.
+- **`-p:UseMultitargeting=true`**: multi-target **net11.0;net10.0;net9.0**.
 
-net10.0 is the default/primary target; net9.0 is the floor. Any code you add must
-compile on both — guard newer-BCL usage with `#if NET10_0_OR_GREATER` when needed,
-following Fusion's conditional-compilation patterns.
+net11.0 is the default/primary target; net9.0 is the floor. Any code you add must
+compile on all three — guard newer-BCL usage with `#if NET10_0_OR_GREATER` or
+`#if NET11_0_OR_GREATER` when needed, following Fusion's conditional-compilation
+patterns.
 
 # Building & testing
 
 ```bash
-# Default: single-target net10.0
+# Default: single-target net11.0
 dotnet build ActualLab.Kvasar.slnx -c Release
 dotnet test  ActualLab.Kvasar.slnx -c Release
 
-# Validate both target frameworks
+# Validate all target frameworks
 dotnet build ActualLab.Kvasar.slnx -c Release -p:UseMultitargeting=true
 dotnet test  ActualLab.Kvasar.slnx -c Release -p:UseMultitargeting=true
 ```

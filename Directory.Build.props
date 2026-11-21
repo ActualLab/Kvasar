@@ -9,11 +9,11 @@
     <Copyright>Copyright Alex Yakunin, Actual Chat, Inc.</Copyright>
   </PropertyGroup>
 
-  <!-- Multitargeting: single-target net10.0 by default; net10.0;net9.0 when UseMultitargeting=true -->
+  <!-- Multitargeting: single-target net11.0 by default; net11.0;net10.0;net9.0 when UseMultitargeting=true -->
   <PropertyGroup Condition="'$(UseMultitargeting)' == ''">
     <UseMultitargeting>false</UseMultitargeting>
 <!--    <UseMultitargeting>true</UseMultitargeting>-->
-    <TargetFramework Condition="!$(UseMultitargeting)">net10.0</TargetFramework>
+    <TargetFramework Condition="!$(UseMultitargeting)">net11.0</TargetFramework>
   </PropertyGroup>
 
   <!-- Common properties -->
