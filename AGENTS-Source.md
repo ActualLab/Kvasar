@@ -98,6 +98,19 @@ Keep the build **warning-free** (`AnalysisMode=AllEnabledByDefault`; the curated
 `<NoWarn>` list lives in `Directory.Build.props`). Add a suppression only with a
 one-line comment explaining why, matching the existing entries.
 
+# Publishing
+
+Use the `/publish` command; publish only when the user asks. It runs
+`Publish.cmd [-no-test]`, which starts `.github/workflows/Publish.yml` on GitHub for
+the current `main` commit (it must match `origin/main`). The workflow waits for a
+`release` environment reviewer to approve it, runs the tests, packs the
+multi-target package, pushes it to nuget.org via trusted publishing (no API key
+anywhere), creates the `v<version>` GitHub release, and mirrors the package to
+GitHub Packages. Then `/publish` adds the release's entry to
+[`docs/CHANGELOG.md`](docs/CHANGELOG.md) (via `/changelog-update`) and copies it
+into the GitHub release notes. The version comes from Nerdbank.GitVersioning
+(`version.json`).
+
 # Async I/O
 
 SQLite is synchronous for historical reasons; Kvasar should **not** be. Prefer
