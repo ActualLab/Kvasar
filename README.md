@@ -1,11 +1,14 @@
 # ActualLab.Kvasar
 
+[![NuGet](https://img.shields.io/nuget/v/ActualLab.Kvasar)](https://www.nuget.org/packages/ActualLab.Kvasar/)
+[![Changelog](https://img.shields.io/badge/Changelog-4A4A4A)](docs/CHANGELOG.md)
+
 **Kvasar** is a small, embedded, **encrypted key-value store for .NET** — pure managed, with
 **zero native dependencies**. It follows the *fastest-path Bitcask model*: an in-RAM hash index over
 an append-only, encrypted, paged log.
 
-It exists to replace SQLite + SQLCipher as the on-device persistence engine for ActualChat's
-client-side caches. Two reasons:
+It replaced SQLite + SQLCipher as the on-device persistence engine for the client-side caches of
+[Voxt](https://voxt.ai) (formerly ActualChat). Two reasons:
 
 1. **No native library treadmill.** SQLCipher is a native dependency, and native dependencies mean
    Google Play's 16 KB page-size mandate, NDK upgrades, alignment rules, and macOS notarization —
@@ -63,7 +66,7 @@ significant figure.
 
 Three layers, each independently testable:
 
-- **Paging** (`Paging/`) — the `.klog` segment files: a plaintext 64-byte header followed by
+- **Paging** (`Paging/`) — the `.kdat` data files: a plaintext 64-byte header followed by
   AES-256-GCM encrypted pages, with a sharded byte-budgeted LRU cache of decrypted pages. Reads are
   zero-copy slices into those cached, immutable pages.
 - **Log** (`Internal/Log/`) — records appended to the active `.kdat` slot. Values that fit a page
@@ -86,28 +89,38 @@ allocation and no thread hop.
 
 ## Durability and crash recovery
 
-`Set` returns only after the record's bytes have reached the OS, so anything acknowledged survives a
-process kill. The `.kidx` index is a lazily-written *hint*, never the source of truth: on open, the
-store loads the checkpoint and replays the log past its high-water mark, so a stale or torn index
-costs a little startup time, never data.
+Kvasar buys **atomicity, not durability**: after any crash — process kill, OS crash, torn write,
+power loss — it reopens at the state of some commit that completed, never at a partial or mixed one.
+It does *not* promise that the most recent commit survives; for a regenerable cache a lost write
+costs one upstream lookup, while a torn state costs correctness. That trade is what lets the whole
+design work with no native code and at most one `fsync` per commit.
 
-Everything else degrades to wipe-and-recreate rather than an exception, because the store backs a
-*regenerable* cache: a wrong key, a format-version mismatch, or unreadable state discards the files
-and starts clean. A torn trailing page from an interrupted write is truncated away, and that segment
-is never appended to again (its page nonces must not be reused).
+Writes are visible to readers as soon as `Set` returns, and are committed in batches: a commit
+follows `FlushDelay` (0.5 s by default) after the first uncommitted write, or comes earlier once
+`CommitBytes` accumulate. A process kill keeps everything up to the last commit, so with the default
+delay it can lose up to the last half-second of writes; `FlushDelay = TimeSpan.Zero` commits every
+write. `Durability` (`Buffered` by default, or `Flushed`) only decides how much survives an OS crash
+or power loss.
+
+The `.kidx` index is a *hint*, never the source of truth: on open, the store loads the checkpoint
+and replays the log past it, so a stale, torn or tampered index costs a little startup time, never
+data. Everything else degrades to wipe-and-recreate rather than an exception, because the store backs
+a *regenerable* cache: a wrong key, a version mismatch, or unreadable state discards the files and
+starts clean. See [`docs/DESIGN-Durability.md`](docs/DESIGN-Durability.md) for the commit protocol
+and its proof.
 
 This is tested by killing a real child process mid-write at randomized points and asserting every
 acknowledged record comes back — see `tests/.../Store/ProcessCrashRecoveryTests.cs` — plus randomized
-fault injection over truncated logs, torn index tails, and leftover temp files.
+crash fuzzing and fault injection over torn data, superblock and index writes.
 
 ## Security model
 
 AES-256-GCM per page under a caller-supplied 32-byte master key, with per-store subkeys derived via
-HKDF-SHA256 and a fresh random salt per segment file. Every page is authenticated, so tampering is
+HKDF-SHA256 and a fresh random salt per data file. Every page is authenticated, so tampering is
 detected on read. Keys are hashed with keyed SipHash-2-4 so the `.kidx` leaks nothing about them.
 
-What it does **not** defend against: an attacker who can replace a whole segment file with an older
-copy of itself (nothing binds a segment to the store — see the limitations in
+What it does **not** defend against: an attacker who can put back an older copy of the store's files
+(a rollback to a state the store really had authenticates fine — see the limitations in
 [`docs/DESIGN.md`](docs/DESIGN.md)), or anyone who has the master key.
 
 ## API
@@ -139,15 +152,16 @@ three 16 KB-page samples still beat all three 4 KB-page samples.
 
 ## Status
 
-Working and tested — not yet released. The library multi-targets **net11.0** (default), **net10.0** and
-**net9.0**, is AOT- and trimming-safe, and depends on exactly one package (`System.IO.Hashing`).
+Released on [NuGet](https://www.nuget.org/packages/ActualLab.Kvasar/) and in production: Voxt's
+client-side caches have run on it since its first NuGet release in July 2026. Changes are listed in
+[`docs/CHANGELOG.md`](docs/CHANGELOG.md).
 
-**Durability:** Kvasar buys **atomicity, not durability** — after any crash it reopens at the state
-of some commit that completed, never at a partial or mixed one. It does *not* promise that the most
-recent commit survives; for a regenerable cache a lost write costs one upstream lookup, while a torn
-state costs correctness. That trade is what lets the whole design work with no native code and at
-most one `fsync` per commit. See [`docs/DESIGN-Durability.md`](docs/DESIGN-Durability.md) for the
-commit protocol and its proof.
+```bash
+dotnet add package ActualLab.Kvasar
+```
+
+The library targets **net11.0**, **net10.0** and **net9.0**, is AOT- and trimming-safe, and depends
+on exactly one package (`System.IO.Hashing`).
 
 Known limitations are tracked honestly in [`docs/DESIGN.md`](docs/DESIGN.md) and
 [`docs/TODO.md`](docs/TODO.md), including two worth knowing up front: two distinct keys sharing a
@@ -162,6 +176,7 @@ Build.cmd                          # or: dotnet build ActualLab.Kvasar.slnx -c R
 Run-Tests.cmd                      # full suite
 Run-Benchmarks.cmd                 # vs SQLCipher; run on an idle machine
 Build.cmd -p:UseMultitargeting=true # validate net11.0, net10.0 and net9.0
+Publish.cmd                        # publish to NuGet via the Publish GitHub workflow
 ```
 
 ## Layout
@@ -175,7 +190,8 @@ src/ActualLab.Kvasar/          Library (one dependency: System.IO.Hashing)
 tests/ActualLab.Kvasar.Tests/  Unit, property, concurrency, fuzz, crash-recovery
 tools/ActualLab.Kvasar.CrashWorker/  Child process killed mid-write by the crash tests
 benchmarks/                    Kvasar vs sqlite-net-sqlcipher
-docs/                          SPEC.md (product spec), DESIGN.md (internals), BENCHMARKS.md
+docs/                          SPEC.md (product spec), DESIGN.md (internals),
+                               DESIGN-Durability.md (commit protocol), BENCHMARKS.md, CHANGELOG.md
 ```
 
 ## License
